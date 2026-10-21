@@ -209,3 +209,14 @@ def test_app_with_real_auth_builds(config, storage):
     assert resp.json()["issuer"].startswith("http://localhost:8000")
     resp = TestClient(app.http_app()).post("/mcp", json={})
     assert resp.status_code == 401
+
+
+async def test_rename_account_tool(app, who, storage):
+    r = await call(app, "rename_account", old_alias="work", new_alias="job")
+    assert r == {"ok": True, "alias": "job"}
+    assert {a["alias"] for a in await call(app, "list_accounts")} == {"job", "personal"}
+    r = await call(app, "get_thread", alias="job", thread_id="t1")
+    assert r["messages"][0]["subject"] == "from alice@work.com"
+    # cannot rename another owner's alias
+    with pytest.raises(ToolError, match="no linked account 'secret'"):
+        await call(app, "rename_account", old_alias="secret", new_alias="mine")

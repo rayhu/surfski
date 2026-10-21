@@ -275,6 +275,20 @@ def create_app(
             pass
         return _link(owner, "relink_account", alias, hint)
 
+    @mcp.tool
+    async def rename_account(old_alias: str, new_alias: str) -> dict:
+        """Rename one of your linked accounts' aliases (e.g. 'aj' -> 'ray'). The Google
+        authorization is kept; no relinking needed."""
+        owner = require_owner("rename_account")
+        try:
+            storage.rename_account(owner, old_alias, new_alias)
+        except (AccountNotFound, StorageError, ValueError) as e:
+            raise ToolError(str(e)) from None
+        old, new = old_alias.strip().lower(), new_alias.strip().lower()
+        token_cache.drop(owner, old)
+        write_audit(storage, owner, "rename_account", new, f"renamed from {old}", True)
+        return {"ok": True, "alias": new}
+
     @mcp.tool(annotations={"destructiveHint": True})
     async def unlink_account(alias: str) -> dict:
         """Remove a linked Gmail account and revoke its token at Google."""

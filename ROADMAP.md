@@ -5,10 +5,10 @@ GitHub issue. A ✅ marks shipped items.
 
 ## Phase 1: self-host essentials
 
-- **`rename_account(old_alias, new_alias)`**: rename an alias in place, scoped to the owner, with no re-auth.
+- ✅ **`rename_account(old_alias, new_alias)`**: rename an alias in place, scoped to the owner, with no re-auth.
   You can't safely do this with unlink + relink, because revoking a token at Google can revoke
   the shared grant for that mailbox and kill the new link.
-- **Unescape Gmail snippets**: Gmail returns snippets HTML-escaped (`&#39;`). Decode them in search
+- ✅ **Unescape Gmail snippets**: Gmail returns snippets HTML-escaped (`&#39;`). Decode them in search
   results.
 - **Address aliases and "send from"**: see the [design below](#address-aliases-and-send-from).
 - **Opt-in sending**: see the [design below](#opt-in-sending-design).

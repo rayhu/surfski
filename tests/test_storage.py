@@ -72,3 +72,22 @@ def test_upsert_overwrites(storage):
     acct = storage.get_account(A, "work")
     assert acct.email == "new@w.com" and acct.last_used_at is None
     assert storage.get_refresh_token(A, "work") == "rt2"
+
+
+def test_rename_account(storage):
+    storage.upsert_account(A, "aj", "a@w.com", "rt-a", "s")
+    storage.upsert_account(A, "home", "a@h.com", "rt-h", "s")
+    storage.upsert_account(B, "aj", "b@w.com", "rt-b", "s")
+
+    storage.rename_account(A, "aj", "Work")
+    assert storage.get_refresh_token(A, "work") == "rt-a"  # token kept, alias lowercased
+    with pytest.raises(AccountNotFound):
+        storage.get_account(A, "aj")
+    assert storage.get_account(B, "aj").email == "b@w.com"  # other owner untouched
+
+    with pytest.raises(StorageError, match="already in use"):
+        storage.rename_account(A, "work", "home")
+    with pytest.raises(AccountNotFound):
+        storage.rename_account(A, "nope", "x")
+    with pytest.raises(ValueError):
+        storage.rename_account(A, "work", "bad alias!")

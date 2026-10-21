@@ -204,6 +204,27 @@ class Storage:
             )
         return cur.rowcount > 0
 
+    def rename_account(self, owner: str, old_alias: str, new_alias: str) -> None:
+        owner = owner.lower()
+        old_alias, new_alias = validate_alias(old_alias), validate_alias(new_alias)
+        with self._tx() as c:
+            if not c.execute(
+                "SELECT 1 FROM accounts WHERE owner = ? AND alias = ?", (owner, old_alias)
+            ).fetchone():
+                raise AccountNotFound(
+                    f"no linked account '{old_alias}'. Call list_accounts to see your accounts."
+                )
+            if old_alias == new_alias:
+                return
+            if c.execute(
+                "SELECT 1 FROM accounts WHERE owner = ? AND alias = ?", (owner, new_alias)
+            ).fetchone():
+                raise StorageError(f"alias '{new_alias}' is already in use")
+            c.execute(
+                "UPDATE accounts SET alias = ? WHERE owner = ? AND alias = ?",
+                (new_alias, owner, old_alias),
+            )
+
     # ---- pending links ----
 
     def add_pending_link(

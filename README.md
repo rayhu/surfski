@@ -12,7 +12,7 @@ Workspace mailboxes** for each user, and users never see each other's mailboxes.
 - **Drafts only** today. Claude saves drafts and you send them from Gmail. Opt-in sending is on the
   [roadmap](ROADMAP.md).
 
-Tools: `list_accounts`, `link_account`, `relink_account`, `unlink_account`, `search_threads`,
+Tools: `list_accounts`, `link_account`, `relink_account`, `rename_account`, `unlink_account`, `search_threads`,
 `search_all_accounts`, `get_thread`, `get_message`, `list_labels`, `create_draft`.
 
 ## Why self-host?
