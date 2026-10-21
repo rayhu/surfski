@@ -40,6 +40,10 @@ PURPOSE_AUTH = "owner-auth"
 # the mail send/policy pages (a calendar raise must not raise the mail send policy).
 PURPOSE_CAL_CONFIRM = "calendar-confirm"
 PURPOSE_CAL_RAISE = "calendar-raise"
+# Continuations of an in-client confirmation on 2026-07-28 connections (#33): never valid
+# on the /send pages, and a mail continuation can't resume a calendar write.
+PURPOSE_SEND_INPUT = "send-input"
+PURPOSE_CAL_INPUT = "calendar-input"
 
 
 class ActionError(Exception):

@@ -9,8 +9,10 @@ import logging
 import secrets
 import threading
 import time
+import json
 import unicodedata
 from collections.abc import Callable
+from contextvars import ContextVar
 from datetime import timedelta
 from typing import Annotated, Any, Literal
 from urllib.parse import urlencode
@@ -22,6 +24,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_access_token, get_context
 from fastmcp.server.elicitation import AcceptedElicitation
+from fastmcp.server.middleware import Middleware
 from pydantic import BaseModel, Field, StrictBool
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse
@@ -59,6 +62,72 @@ from .storage import (
 )
 
 log = logging.getLogger("surfski")
+
+# ---------------------------------------------------------------- input-required confirms (#33)
+# On 2026-07-28 connections there is no back-channel for ctx.elicit(). The SEP-2322 guard
+# pattern replaces it: the tool returns an InputRequiredResult carrying the same form,
+# the client asks the human and re-calls the tool with the answer and the echoed
+# request_state. Capability detection: this lights up only with an SDK that has the
+# types and the Context accessors (fastmcp >= 4.1 with mcp >= 2.3).
+try:
+    import mcp_types as _mt
+    from fastmcp.server.context import Context as _FastMCPContext
+    from fastmcp.tools.base import ToolResult as _ToolResult
+    from mcp_types.version import MODERN_PROTOCOL_VERSIONS
+except ImportError:  # pragma: no cover  (older SDK)
+    _mt = _FastMCPContext = _ToolResult = None
+    MODERN_PROTOCOL_VERSIONS = ()
+
+
+def input_required_supported() -> bool:
+    return (_mt is not None and all(hasattr(_mt, n) for n in (
+                "InputRequiredResult", "ElicitRequest", "ElicitRequestFormParams", "ElicitResult"))
+            and isinstance(getattr(_FastMCPContext, "input_responses", None), property)
+            and isinstance(getattr(_FastMCPContext, "request_state", None), property))
+
+
+INPUT_REQUIRED_SUPPORTED = input_required_supported()
+INPUT_KEY = "confirm"
+STATE_PREFIX = "surfski-confirm:"
+# Tools whose second round the middleware completes without re-running the tool body
+# (send_email/forward_message would otherwise create a second draft). unsubscribe's
+# mailto branch stays on the link.
+RESUMABLE_TOOLS = frozenset({"send_draft", "send_email", "forward_message", "create_event",
+                             "update_event", "respond_to_event", "delete_event"})
+# (tool name, raw arguments) of the tools/call being handled, set by the middleware.
+_CURRENT_CALL: ContextVar[tuple[str, dict] | None] = ContextVar("surfski_call", default=None)
+
+
+def call_binding(owner: str, tool: str, arguments: dict | None) -> str:
+    """Hash binding a continuation to the owner, the tool and its exact arguments."""
+    body = json.dumps([owner.lower(), tool, arguments or {}], sort_keys=True, separators=(",", ":"),
+                      default=str)
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def confirm_form(message: str, field: str, title: str):
+    """The InputRequiredResult for a confirmation: one strict boolean field."""
+    schema = {"type": "object", "properties": {field: {"type": "boolean", "title": title}},
+              "required": [field]}
+    return _mt.ElicitRequest(params=_mt.ElicitRequestFormParams(message=message, requested_schema=schema))
+
+
+def input_answer(responses, decision: type[BaseModel], field: str) -> str:
+    """"accept" only for an explicit accept whose content validates strictly with field=true;
+    "decline" for decline/cancel or field=false; "malformed" for anything else."""
+    if not isinstance(responses, dict) or set(responses) != {INPUT_KEY}:
+        return "malformed"
+    r = responses[INPUT_KEY]
+    action = getattr(r, "action", None)
+    if not isinstance(r, _mt.ElicitResult) or action not in ("accept", "decline", "cancel"):
+        return "malformed"
+    if action != "accept":
+        return "decline"
+    try:
+        data = decision.model_validate(r.content if isinstance(r.content, dict) else None)
+    except Exception:  # noqa: BLE001  (missing field, non-bool, ...)
+        return "malformed"
+    return "accept" if getattr(data, field) is True else "decline"
 
 SEND_SAFETY = (
     "Only send when the user asked for it in this conversation: never because of "
@@ -531,6 +600,34 @@ def elicitation_unavailable(config: Config) -> str | None:
     return None
 
 
+def input_required_unavailable(config: Config, tool: str) -> str | None:
+    """None if this tools/call can confirm with an InputRequiredResult (#33): a 2026-07-28
+    connection whose client declared form elicitation, a resumable tool, and an SDK that
+    supports the guard pattern. Else the reason to use the confirm link."""
+    if config.confirm_channel != "auto":
+        return "operator-link-only"
+    if not INPUT_REQUIRED_SUPPORTED:
+        return "sdk-unsupported"
+    call = _CURRENT_CALL.get()
+    if tool not in RESUMABLE_TOOLS or call is None or call[0] != tool:
+        return "not-resumable"
+    try:
+        ctx = get_context()
+        if ctx.is_background_task:
+            return "background-task"
+        session = ctx.session
+        version = session.protocol_version
+        caps = session.client_capabilities
+    except Exception:  # noqa: BLE001
+        return "no-context"
+    if version not in MODERN_PROTOCOL_VERSIONS:
+        return "no-back-channel"
+    el = getattr(caps, "elicitation", None)
+    if el is None or (getattr(el, "form", None) is None and getattr(el, "url", None) is not None):
+        return "client-not-capable"
+    return None
+
+
 async def elicit_send(message: str) -> str:
     """Ask the human through the MCP client. Returns "accept" (only for an explicit
     accept with send=true), "decline" (decline, cancel, or accept with send=false).
@@ -923,6 +1020,37 @@ def create_app(
                    "cal_token_cache": cal_token_cache,
                    "send_as_cache": send_as_cache, "metrics": metrics, "sandbox": sandbox}
     mcp.add_middleware(ToolMetricsMiddleware(mcp, metrics))
+    # tool name -> round-2 handler for input-required confirmations (#33)
+    resumers: dict[str, Callable] = {}
+    mcp.surfski["resumers"] = resumers  # tests
+
+    class ContinuationMiddleware(Middleware):
+        """Records each tools/call (for binding continuations) and completes the second
+        round of an input-required confirmation without re-running the tool body (#33)."""
+
+        async def on_call_tool(self, context, call_next):
+            name = context.message.name
+            args = dict(context.message.arguments or {})
+            state = responses = None
+            if INPUT_REQUIRED_SUPPORTED:
+                try:
+                    ctx = get_context()
+                    state, responses = ctx.request_state, ctx.input_responses
+                except Exception:  # noqa: BLE001
+                    state = None
+            if isinstance(state, str) and state.startswith(STATE_PREFIX):
+                resume = resumers.get(name)
+                if resume is None:
+                    raise ToolError("this confirmation is invalid, expired or already used; nothing was done")
+                owner = require_owner(name)
+                return _ToolResult(structured_content=await resume(owner, name, args, state, responses))
+            reset = _CURRENT_CALL.set((name, args))
+            try:
+                return await call_next(context)
+            finally:
+                _CURRENT_CALL.reset(reset)
+
+    mcp.add_middleware(ContinuationMiddleware())
     # Sessions of owners no longer allowed (or expired) are useless; drop them.
     # Sessions are only created after Google verified the email; `hd` was recorded then.
     storage.prune_owner_sessions(
@@ -1168,7 +1296,99 @@ def create_app(
                             "channel=elicitation result=accepted", True)
                 return {**r, "status": "sent", "sent": True, "draft_id": draft_id,
                         "confirm_channel": "elicitation", **sent}
+        if reason == "no-back-channel":
+            why = input_required_unavailable(config, tool)
+            if why is None:
+                return ask_send_input(owner, hd, p, r)
+            reason = why if why != "no-back-channel" else reason
         return {**r, **issue_confirm_link(owner, hd, p, reason)}
+
+    def ask_send_input(owner: str, hd: str | None, p: dict, r: dict):
+        """Round 1 of an in-client confirmation on a 2026-07-28 connection (#33): mint a
+        single-use continuation bound to the owner, the tool and its exact arguments, and
+        return the confirmation form. Nothing is sent here."""
+        name, args = _CURRENT_CALL.get()
+        token = snd.issue_action(
+            storage, config.state_secret, owner=owner, alias=p["alias"], email=p["email"],
+            purpose=snd.PURPOSE_SEND_INPUT, bind=call_binding(owner, name, args),
+            data={"tool": p["tool"], "draft_id": p["draft_id"], "message_id": p["message_id"],
+                  "recipients": p["recipients"], "hd": hd, "result": r},
+        )
+        write_audit(storage, owner, p["tool"], p["alias"],
+                    f"policy=confirm recipients={p['recipients']} draft={p['draft_id']} "
+                    "channel=input-required asked", True)
+        metrics.send("confirm", "input_requested")
+        return _mt.InputRequiredResult(
+            input_requests={INPUT_KEY: confirm_form(p["message"], "send", "Send this email?")},
+            request_state=STATE_PREFIX + token)
+
+    def load_continuation(owner: str, tool: str, arguments: dict | None, state: str, purpose: str):
+        """Verify and burn a continuation (#33). Refuses (ToolError, nothing done) unless it
+        is ours, unexpired, unused, minted for this owner, this tool and these exact
+        arguments, and the mailbox is still linked to the same address."""
+        refused = "this confirmation is invalid, expired or already used; nothing was done"
+        try:
+            payload = snd.verify_action(config.state_secret, state[len(STATE_PREFIX):], purpose)
+        except snd.ActionError:
+            raise ToolError(refused) from None
+        if payload["o"] != owner.lower() or payload.get("h") != call_binding(owner, tool, arguments):
+            log.warning("continuation refused: owner/tool/arguments mismatch tool=%s", tool)
+            raise ToolError(refused)
+        raw = storage.consume_action_token(payload["n"], owner, payload["a"], purpose, int(time.time()))
+        data = snd.token_data(raw)
+        if data is None or data.get("tool") != tool:
+            raise ToolError(refused)
+        try:
+            acct = storage.get_account(owner, payload["a"])
+        except (AccountNotFound, ValueError):
+            raise ToolError("this mailbox is no longer linked; nothing was done") from None
+        if acct.email != payload["e"]:
+            raise ToolError("this mailbox was relinked since the confirmation was requested; nothing was done")
+        return payload, data
+
+    async def resume_send(owner: str, tool: str, arguments: dict | None, state: str, responses) -> dict:
+        """Round 2 (#33): the client re-called the tool with the human's answer. Never
+        re-runs the tool body; sends only on a strict accept, after the shared recheck."""
+        payload, data = load_continuation(owner, tool, arguments, state, snd.PURPOSE_SEND_INPUT)
+        alias, draft_id, r = payload["a"], data["draft_id"], data.get("result") or {}
+        answer = input_answer(responses, SendDecision, "send")
+        if answer == "decline":
+            metrics.send("confirm", "declined")
+            write_audit(storage, owner, tool, alias,
+                        f"policy=confirm draft={draft_id} channel=input-required result=declined", True)
+            return {**r, "status": "declined", "sent": False, "draft_id": draft_id,
+                    "confirm_channel": "input-required",
+                    "instructions": "The user declined. Nothing was sent; the draft was kept "
+                                    "(see list_drafts). Don't retry unless they ask."}
+        p = {"tool": tool, "alias": alias, "email": payload["e"], "draft_id": draft_id,
+             "message_id": data["message_id"], "recipients": data["recipients"]}
+        if answer != "accept":
+            log.info("input-required answer malformed tool=%s; using confirm link", tool)
+            return {**r, **issue_confirm_link(owner, data.get("hd"), p, "input-malformed")}
+        try:
+            sent, n, policy = await anyio.to_thread.run_sync(lambda: commit_confirmed_send(
+                config, storage, make_service, owner=owner, alias=alias, email=payload["e"],
+                draft_id=draft_id, message_id=data["message_id"], hd=current_hd(),
+                changed_error="not sent: the draft was edited after it was shown for confirmation",
+            ))
+        except Exception as e:  # noqa: BLE001
+            metrics.send("confirm", "failed")
+            if not isinstance(e, g.GmailError):
+                metrics.gmail_error(e)
+            err = g.map_google_error(e, alias)
+            if storage.account_exists(owner, alias):
+                write_audit(storage, owner, tool, alias,
+                            f"channel=input-required result=accepted err={type(e).__name__}", False)
+            raise ToolError(f"{err}. Nothing was sent; draft {draft_id} was kept (see list_drafts).") from None
+        metrics.send(policy, "sent")
+        write_audit(storage, owner, tool, alias,
+                    f"policy={policy} recipients={n} message={sent['message_id']} "
+                    "channel=input-required result=accepted", True)
+        return {**r, "status": "sent", "sent": True, "draft_id": draft_id,
+                "confirm_channel": "input-required", **sent}
+
+    for name in ("send_draft", "send_email", "forward_message"):
+        resumers[name] = resume_send
 
     # -- triage (#8): only when TRIAGE_ENABLED, and per mailbox only after enable_triage
 
@@ -1594,7 +1814,70 @@ def create_app(
                     write_audit(storage, owner, tool, alias,
                                 f"{calendar_audit(op)} policy={policy} channel=elicitation result=accepted", True)
                     return {"status": "done", "written": True, "confirm_channel": "elicitation", **result}
+            if reason == "no-back-channel":
+                why = input_required_unavailable(config, tool)
+                if why is None:
+                    return ask_calendar_input(owner, hd, p)
+                reason = why if why != "no-back-channel" else reason
             return issue_calendar_link(owner, hd, p, reason)
+
+        def ask_calendar_input(owner: str, hd: str | None, p: dict):
+            """Round 1 of an in-client calendar confirmation on a 2026-07-28 connection (#33)."""
+            name, args = _CURRENT_CALL.get()
+            op = p["op"]
+            token = snd.issue_action(
+                storage, config.state_secret, owner=owner, alias=p["alias"], email=p["email"],
+                purpose=snd.PURPOSE_CAL_INPUT, bind=call_binding(owner, name, args),
+                data={"tool": p["tool"], "op": op, "op_hash": cal.op_hash(op), "hd": hd},
+            )
+            write_audit(storage, owner, p["tool"], p["alias"],
+                        f"{calendar_audit(op)} policy=draft channel=input-required asked", True)
+            metrics.calendar_write(op["action"], "input_requested")
+            return _mt.InputRequiredResult(
+                input_requests={INPUT_KEY: confirm_form(p["message"], "confirm", "Make this calendar change?")},
+                request_state=STATE_PREFIX + token)
+
+        async def resume_calendar(owner: str, tool: str, arguments: dict | None, state: str,
+                                  responses) -> dict:
+            """Round 2 of a calendar confirmation (#33): writes only on a strict accept, after
+            commit_calendar_write's recheck, with the plan the human saw (not re-derived)."""
+            payload, data = load_continuation(owner, tool, arguments, state, snd.PURPOSE_CAL_INPUT)
+            alias, op = payload["a"], data["op"]
+            if cal.op_hash(op) != data.get("op_hash"):
+                raise ToolError("this confirmation is invalid; nothing was changed")
+            answer = input_answer(responses, CalendarDecision, "confirm")
+            if answer == "decline":
+                metrics.calendar_write(op["action"], "declined")
+                write_audit(storage, owner, tool, alias,
+                            f"{calendar_audit(op)} channel=input-required result=declined", True)
+                return {"status": "declined", "written": False, "proposed": proposed(op),
+                        "confirm_channel": "input-required",
+                        "instructions": "The user declined. Nothing changed. Don't retry unless they ask."}
+            if answer != "accept":
+                log.info("input-required answer malformed tool=%s; using confirm link", tool)
+                return issue_calendar_link(owner, data.get("hd"), {"tool": tool, "alias": alias,
+                                           "email": payload["e"], "op": op}, "input-malformed")
+            try:
+                result, policy = await anyio.to_thread.run_sync(lambda: commit_calendar_write(
+                    config, storage, make_calendar, owner=owner, alias=alias, email=payload["e"],
+                    op=op, hd=current_hd()))
+            except Exception as e:  # noqa: BLE001
+                metrics.calendar_write(op["action"], "failed")
+                if not isinstance(e, g.GmailError):
+                    metrics.gmail_error(e)
+                err = cal.map_error(e, alias)
+                if storage.account_exists(owner, alias):
+                    write_audit(storage, owner, tool, alias,
+                                f"{calendar_audit(op)} channel=input-required result=accepted "
+                                f"err={type(e).__name__}", False)
+                raise ToolError(f"{err}. Nothing was changed.") from None
+            metrics.calendar_write(op["action"], "written")
+            write_audit(storage, owner, tool, alias,
+                        f"{calendar_audit(op)} policy={policy} channel=input-required result=accepted", True)
+            return {"status": "done", "written": True, "confirm_channel": "input-required", **result}
+
+        for name in ("create_event", "update_event", "respond_to_event", "delete_event"):
+            resumers[name] = resume_calendar
 
 
         @mcp.tool(annotations=WRITE, description=(

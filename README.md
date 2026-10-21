@@ -310,13 +310,13 @@ connector (Settings → Connectors). Nothing else is lost: linked mailboxes are 
 | `SENDING_ENABLED` | no | `true` registers the send tools and `/send/*` pages (default `false`: drafts only) |
 | `SEND_DAILY_CAP` | no | Sends per mailbox in a rolling 24 h, in `confirm` and `auto` (default 20) |
 | `SEND_MAX_RECIPIENTS` | no | Unique to+cc+bcc recipients per message (default 10) |
-| `CONFIRM_CHANNEL` | no | How `confirm` sends are approved: `auto` (default: in the MCP client via elicitation when it supports it, else the confirm link) or `link` (always the confirm link) |
+| `CONFIRM_CHANNEL` | no | How `confirm` sends are approved: `auto` (default: in the MCP client via elicitation when it supports it, or an input-required result on 2026-07-28 connections, else the confirm link) or `link` (always the confirm link) |
 | `ALLOWED_RECIPIENT_DOMAINS` | no | Comma-separated domains; if set, every recipient's domain must match one exactly |
 | `ATTACHMENT_MAX_MB` | no | Largest attachment `get_attachment` will download (default 15, max 25) |
 | `EXTRACT_SANDBOX` | no | `subprocess` (default): extract attachment text in a resource-limited child process; `inprocess`: in a server thread |
 | `EXTRACT_TIMEOUT_S` | no | Wall-clock limit per extraction; the child is killed after it (default 20, 1–120) |
 | `EXTRACT_MEMORY_MB` | no | Address-space limit of the extraction child (default 512, 128–8192; Linux) |
-| `EXTRACT_SANDBOX_STRICT` | no | `true`: refuse to read attachments unless Landlock confines the extraction child (default `false`: degrade to the rlimits and log a warning). Requires `EXTRACT_SANDBOX=subprocess` |
+| `EXTRACT_SANDBOX_STRICT` | no | `true`: refuse to read attachments unless the extraction child reaches the `full` sandbox level, i.e. Landlock filesystem confinement **and** a kernel network block (default `false`: degrade and log a warning). Requires `EXTRACT_SANDBOX=subprocess` |
 | `AUDIT_ON_DELETE` | no | What `delete_my_data` does with the caller's audit rows: `delete` (default) or `pseudonymize` (keep them under a keyed hash) |
 | `TRIAGE_ENABLED` | no | `true` registers the triage tools (default `false`: no triage tools, and `gmail.modify` is never requested) |
 | `TRIAGE_DAILY_CAP` | no | Triage changes (ids touched) per mailbox in a rolling 24 h (default 1000) |
@@ -415,7 +415,9 @@ set -a; source ./local.env; set +a; uv run surfski
     (rlimits only: macOS, kernels before 5.13, Landlock not enabled, or the syscalls blocked by a
     seccomp profile), `none` (`EXTRACT_SANDBOX=inprocess`). Anything below `full` on Linux is logged as
     a warning. Set `EXTRACT_SANDBOX_STRICT=true` to refuse to read attachments (a clear tool error)
-    unless Landlock applied. The server also warns if `DATA_DIR` sits beneath a path the worker may
+    unless the level is `full`: filesystem confinement alone is not enough. Kernels with Landlock
+    enabled (Ubuntu's default) reach `full`; Ubuntu 24.04's 6.8 kernel gives Landlock ABI 4, which
+    blocks TCP on its own, and the seccomp filter covers older ABIs on x86_64 and aarch64. The server also warns if `DATA_DIR` sits beneath a path the worker may
     read. CI checks in the hardened container that the worker reaches `full`, gets EACCES on
     `/data/data.db` and EPERM on `socket()`.
   - **Limits:** the worker still runs as the same uid (a separate uid needs `CAP_SETUID` or a root
@@ -451,8 +453,7 @@ that tells Claude to forward something to an attacker):
   link for the model to leak or open. On accept the server rechecks the policy, the caps, the
   mailbox and the exact draft version (just like pressing **Send** on the link page) before sending;
   on decline or cancel it keeps the draft and returns `sent: false`. If the client doesn't support
-  elicitation, the request fails or times out (5 minutes), or the connection uses the 2026-07-28
-  protocol (which has no channel for server-initiated requests), it falls back to the confirm link
+  elicitation, or the request fails or times out (5 minutes), it falls back to the confirm link
   below, **never** to sending. Client support varies and changes: check your client's MCP
   documentation. **Trust model:** the server can't verify that a human answered; it trusts the client
   to show the prompt to you and not let the model answer it. A client or agent SDK that
@@ -461,6 +462,18 @@ that tells Claude to forward something to an attacker):
   header values to one line, strips bidi and zero-width characters, fences the body excerpt between
   markers and repeats the server's recipient counts after it, but the subject and body are still
   written by whoever wrote the email: read the recipient rows, not the text.
+- **2026-07-28 connections (input required).** That protocol has no channel for server-initiated
+  requests, so the same form goes back as the tool's result instead (an `InputRequiredResult`,
+  SEP-2322): the client asks you and calls the tool again with your answer. Sending happens on that
+  second call, after the same recheck, and only for an explicit accept whose answer is a JSON
+  boolean `true`. The second call carries a continuation that is signed, single-use, expires in 10
+  minutes and is bound to the owner, the tool and its exact arguments (a continuation for another
+  draft or a replayed one is refused, nothing sent); the server never re-runs the tool body, so
+  `send_email` doesn't create a second draft. Decline keeps the draft; a malformed answer gets the
+  confirm link. Covers `send_draft`, `send_email`, `forward_message` with `send=true` and the
+  calendar writes; `unsubscribe` (mailto) uses the link. Same trust model as above. Continuations
+  live in the server's database and the SDK's per-process request-state key, so a restart between
+  the two calls makes the second fail cleanly (nothing sent; ask again).
 - **Owner sign-in before any confirm or approval page.** Opening a link shows nothing about the
   email until you sign in with Google as the mailbox owner (`/send/auth/callback`, which you must
   register on your OAuth client). That sets a session cookie for `/send` pages only (HttpOnly,

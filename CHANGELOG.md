@@ -9,6 +9,14 @@ All notable changes to Surfski are documented here. The format follows
 
 ### Added
 
+- **In-client confirmation on 2026-07-28 connections** (#33): `confirm` sends (`send_draft`,
+  `send_email`, `forward_message` with `send=true`) and draft-policy calendar writes return an
+  `InputRequiredResult` (SEP-2322) with the same sanitized form when the client supports form
+  elicitation, instead of always falling back to the confirm link. The client's second call is
+  completed by a middleware without re-running the tool, with a single-use continuation bound to the
+  owner, the tool and its exact arguments, then the shared recheck. Decline keeps the draft; a
+  malformed answer gets the link; nothing is ever sent without an explicit `true`.
+
 - **Calendar module** (#19), behind `FEATURES=mail,calendar`: `enable_calendar` / `disable_calendar`
   (per-mailbox Google re-consent adding `calendar.readonly` + `calendar.events`), `list_calendars`,
   `list_events`, `get_event`, cross-account `find_free_time` (merged free/busy, working hours, DST-safe),
@@ -25,6 +33,10 @@ All notable changes to Surfski are documented here. The format follows
   `pyproject.toml` and publishes a GitHub Release from the changelog, and `RELEASING.md` (#11).
 
 ### Security
+
+- `EXTRACT_SANDBOX_STRICT=true` now requires the `full` sandbox level (Landlock filesystem confinement
+  and a kernel network block), not filesystem confinement alone. The worker counts Landlock path rules
+  it couldn't add, and the startup probe logs the count (#33 review of #43).
 
 - The attachment extraction worker confines itself with Landlock before parsing: read-only access to
   the Python installation and system libraries only, so a parser exploit can't read `DATA_DIR` (the

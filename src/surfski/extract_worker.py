@@ -10,7 +10,8 @@ imports what parsing needs, then confines itself with Landlock and seccomp (#43,
 `confine.py`: read-only access to the Python installation only, no TCP, no `socket()`),
 then lowers its own resource limits (address space, CPU seconds, open files, processes,
 file size) and only then parses the untrusted bytes. With `"strict": true` in the header
-it refuses to parse ({"ok": false, "error": "sandbox"}) unless Landlock applied. The
+it refuses to parse ({"ok": false, "error": "sandbox"}) unless the level is "full"
+(Landlock filesystem confinement and a kernel-level network block). The
 protection achieved is reported back in "protection". Limits the platform doesn't
 support are skipped and reported back in "skipped". The
 text is cut to max_chars + 1 characters so the parent can still tell it was truncated
@@ -83,7 +84,7 @@ def main(extract: Callable | None = None) -> int:
         if att.detect_method(header["mime_type"], header["filename"]) == "pdf":
             import pypdf  # noqa: F401  (only when needed; before the limits, imports open files)
         protection = confine.confine()
-        if header.get("strict") and not protection["landlock_fs"]:
+        if header.get("strict") and protection["level"] != "full":
             result = {"ok": False, "error": "sandbox", "protection": protection}
             out.write(json.dumps(result))
             out.flush()
