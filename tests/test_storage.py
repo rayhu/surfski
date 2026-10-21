@@ -124,6 +124,11 @@ def test_migration_on_existing_db(tmp_path):
 
     s = Storage(db, cipher)
     assert s.get_account(A, "work").default_from is None
+    assert s.get_account(A, "work").send_policy == "off"
+    s.set_send_policy(A, "work", "confirm")
+    assert s.get_account(A, "work").send_policy == "confirm"
+    with pytest.raises(ValueError):
+        s.set_send_policy(A, "work", "yolo")
     s.set_default_from(A, "work", "Sales@Work.org")
     s.set_address_label(A, "work", "sales@work.org", "sales")
     assert s.get_account(A, "work").default_from == "sales@work.org"

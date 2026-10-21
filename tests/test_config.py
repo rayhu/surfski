@@ -54,3 +54,17 @@ def test_redact_absolute_url_and_quiet_loggers(caplog):
         logging.getLogger("httpx2").info("HTTP Request: GET https://x/?access_token=ya29.Y")
         logging.getLogger("fastmcp").warning("callback /auth/callback?code=4/zzz&state=q")
     assert "ya29.Y" not in caplog.text and "4/zzz" not in caplog.text
+
+
+def test_sending_settings(tmp_path):
+    c = load_config(make_env(tmp_path))
+    assert c.sending_enabled is False and c.send_daily_cap == 20 and c.send_max_recipients == 10
+    assert c.allowed_recipient_domains == frozenset()
+    c = load_config(make_env(tmp_path, SENDING_ENABLED="True", SEND_DAILY_CAP="5", SEND_MAX_RECIPIENTS="3",
+                             ALLOWED_RECIPIENT_DOMAINS=" Example.com, @corp.org ,"))
+    assert c.sending_enabled is True and c.send_daily_cap == 5 and c.send_max_recipients == 3
+    assert c.allowed_recipient_domains == {"example.com", "corp.org"}
+    assert c.send_policy_redirect_uri == "http://localhost:8000/send/policy/callback"
+    for bad in ({"SENDING_ENABLED": "maybe"}, {"SEND_DAILY_CAP": "x"}, {"SEND_MAX_RECIPIENTS": "0"}):
+        with pytest.raises(ConfigError):
+            load_config(make_env(tmp_path, **bad))

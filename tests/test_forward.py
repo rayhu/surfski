@@ -244,3 +244,25 @@ def test_strict_fake_validates_attachments_get():
         svc.users().messages().attachments().get(userId="me", messageId="m1", id="a1", format="full")
     with pytest.raises(TypeError, match="unexpected keyword argument media_body"):
         svc.users().drafts().get(userId="me", id="d", media_body=None)
+
+
+async def test_forward_attached_email_and_filename_crlf(app, who, boxes):
+    msg = original()
+    msg["payload"]["parts"].append({
+        "mimeType": "message/rfc822", "filename": "",
+        "body": {"size": 40, "data": b64("Subject: inner\r\n\r\ninner body")},
+        "parts": [{"mimeType": "text/plain", "body": {"data": b64("inner body")}},
+                  {"mimeType": "image/gif", "filename": "inner.gif", "body": {"size": 3, "data": b64("GIF")}}],
+    })
+    msg["payload"]["parts"][1]["filename"] = "Q1\r\nBcc: x@y.z.pdf"
+    boxes["alice@work.com"].message = msg
+    r = await call(app, "forward_message", alias="work", message_id="m1", to="e@x.com")
+    # The attached email is one attachment; its inner parts are not walked.
+    assert r["attachments"] == ["inline-1.png", "Q1 Bcc: x@y.z.pdf", "attached-message-3.eml"]
+    m = parsed(boxes["alice@work.com"])
+    assert m["Bcc"] is None
+    atts = {a.get_filename(): a for a in m.iter_attachments()}
+    assert atts["attached-message-3.eml"].get_content_type() == "application/octet-stream"
+    assert atts["attached-message-3.eml"].get_content() == b"Subject: inner\r\n\r\ninner body"
+    text = m.get_body(preferencelist=("plain",)).get_content()
+    assert "inner body" not in text

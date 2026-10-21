@@ -11,12 +11,14 @@ Workspace mailboxes** for each user, and users never see each other's mailboxes.
 - Works from claude.ai on the web, desktop and mobile. Any client that speaks MCP Streamable HTTP with OAuth works too.
 - Each Claude user signs in with Google, and only allowlisted addresses get in.
 - Each user links any number of mailboxes under short aliases such as `work`, `personal` or `support`.
-- **Drafts only** today. Claude saves drafts and you send them from Gmail. Opt-in sending is on the
-  [roadmap](ROADMAP.md).
+- **Drafts only** by default. Claude saves drafts and you send them from Gmail. An operator can turn on
+  [opt-in sending](#sending-opt-in), and each mailbox then picks `off`, `confirm` (you click a link to
+  send) or `auto`.
 
 Tools: `list_accounts`, `link_account`, `relink_account`, `rename_account`, `unlink_account`, `search_threads`,
 `search_all_accounts`, `get_thread`, `get_message`, `list_labels`, `create_draft`, `list_drafts`, `get_draft`,
 `update_draft`, `delete_draft`, `list_addresses`, `set_address_label`, `set_default_from`, `forward_message`.
+With `SENDING_ENABLED=true` also: `send_draft`, `send_email`, `set_send_policy` (and `forward_message(send=true)`).
 
 **Send from an alias.** `create_draft` and `update_draft` take `from_address` (a verified "Send mail as"
 address or a label set with `set_address_label`) and `include_signature`. Replies default to the address
@@ -75,6 +77,7 @@ Caddy, nginx or Traefik.
 5. **Clients** → create a **Web application** client with these redirect URIs:
    - `https://<host>/auth/callback`
    - `https://<host>/gmail/callback`
+   - `https://<host>/send/policy/callback` (only needed if you set `SENDING_ENABLED=true`)
 6. If you use Google Workspace, the admin should go to Admin console → Security → API controls →
    Manage third-party app access, add the app by client ID and mark it **Trusted**. Otherwise
    Workspace policy may block mailbox linking.
@@ -166,6 +169,10 @@ If you lose the keys, users simply relink their mailboxes.
 | `TOKEN_ENCRYPTION_KEYS` | no | Per-owner Fernet keys `owner=key,owner=key` |
 | `ALLOWED_CLIENT_REDIRECT_URIS` | no | MCP client redirect allowlist. Defaults to Claude's callbacks, plus localhost when `BASE_URL` is localhost |
 | `RATE_LIMIT_PER_MINUTE` | no | Tool calls per owner per minute (default 60) |
+| `SENDING_ENABLED` | no | `true` registers the send tools and `/send/*` pages (default `false`: drafts only) |
+| `SEND_DAILY_CAP` | no | Sends per mailbox in a rolling 24 h, in `confirm` and `auto` (default 20) |
+| `SEND_MAX_RECIPIENTS` | no | Unique to+cc+bcc recipients per message (default 10) |
+| `ALLOWED_RECIPIENT_DOMAINS` | no | Comma-separated domains; if set, every recipient's domain must match one exactly |
 | `LOG_LEVEL`, `HOST`, `PORT` | no | Logging and bind address |
 
 ## Development
@@ -211,7 +218,34 @@ set -a; source ./local.env; set +a; uv run surfski
   Access tokens live only in memory.
 - Logs never contain tokens, auth codes or message bodies. Audit rows record the tool, alias and a
   short detail only.
+- `forward_message` holds the original's attachments in memory while it builds the draft (up to the
+  20 MB limit, roughly 3× that at peak with the MIME encoding), so give the container ~150 MB of headroom
+  per concurrent forward.
 - See [SECURITY.md](SECURITY.md) to report a vulnerability.
+
+### Sending (opt-in)
+
+The `gmail.compose` scope already lets an app send mail, so "drafts only" is enforced by this
+server's code. Sending is off unless you opt in, and is built to resist prompt injection (an email
+that tells Claude to forward something to an attacker):
+
+- **Operator switch:** without `SENDING_ENABLED=true` the send tools and `/send/*` routes don't exist.
+- **Per-mailbox policy**, shown by `list_accounts`: `off` (default), `confirm` (Claude prepares the
+  draft and returns a one-time link; nothing is sent until you open it, review From/To/Cc/**Bcc**,
+  subject, attachments and the start of the body, and press **Send**), or `auto` (sent directly,
+  within the caps). MCP clients still ask you to approve each send tool call.
+- **Claude can't raise a policy.** `set_send_policy` lowers it immediately but, to raise it, returns
+  a link where you must sign in with Google again as the owner and press **Apply**. Register
+  `https://<host>/send/policy/callback` on your OAuth client for this.
+- **Links** are HMAC-signed (key derived from `STATE_SECRET`, separate from linking), single-use,
+  expire in 10 minutes, and are bound to the owner, alias, mailbox address and the exact draft
+  version: if the draft changes after the link was made, it won't send. Opening a link (GET) never
+  sends or changes anything; pages can't be framed and don't leak the link via Referer.
+- **Caps** apply in `confirm` (re-checked when you press Send) and `auto`: daily sends per mailbox,
+  recipients per message, optional recipient-domain allowlist.
+- **Audit:** each send records alias, policy, recipient count and Gmail message id, never addresses
+  or bodies.
+- Relinking an alias to a different mailbox resets its policy to `off` and voids open links.
 
 ## Hosting this for the public
 

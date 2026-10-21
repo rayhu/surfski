@@ -186,7 +186,11 @@ def _decode_part(part: dict) -> str:
 
 
 def _walk(part: dict):
+    """Depth-first over MIME parts, without descending into attached messages
+    (message/*): an attached email is one attachment, not more body text."""
     yield part
+    if (part.get("mimeType") or "").lower().startswith("message/"):
+        return
     for sub in part.get("parts", []) or []:
         yield from _walk(sub)
 
@@ -214,6 +218,8 @@ def _is_attachment(part: dict) -> bool:
     if part.get("filename"):
         return True
     mime = (part.get("mimeType") or "").lower()
+    if mime.startswith("message/"):
+        return True
     if not mime or mime.startswith(("text/", "multipart/")):
         return False
     has_cid = any(h.get("name", "").lower() == "content-id" for h in part.get("headers", []) or [])
@@ -698,7 +704,11 @@ def op_update_draft(
             prev = [i for i in known if i["address"] == prev_addr]
             new_body, stripped = strip_signature(new_body, prev + known)
             if chosen[0]["address"] != prev_addr:
-                signature_replaced = stripped
+                if stripped:
+                    signature_replaced = True
+                elif prev and signature_text(prev[0]):
+                    # The old sender has a signature but its block wasn't found.
+                    signature_replaced = False
         if include_signature:
             new_body = append_signature(new_body, chosen[0])
     mime = build_mime(
@@ -753,9 +763,13 @@ def _mb(n: int) -> str:
 
 
 def _attachment_name(part: dict, index: int) -> str:
-    if part.get("filename"):
-        return part["filename"]
-    ext = mimetypes.guess_extension(part.get("mimeType") or "") or ".bin"
+    name = re.sub(r"[\r\n]+", " ", part.get("filename") or "").strip()
+    if name:
+        return name
+    mime = (part.get("mimeType") or "").lower()
+    if mime.startswith("message/"):
+        return f"attached-message-{index}.eml"
+    ext = mimetypes.guess_extension(mime) or ".bin"
     return f"inline-{index}{ext}"
 
 
@@ -818,7 +832,9 @@ def op_forward_message(
             continue
         mime_type = (part.get("mimeType") or "application/octet-stream").lower()
         maintype, _, subtype = mime_type.partition("/")
-        if maintype == "multipart" or not subtype:
+        # An attached email goes out as an opaque .eml (octet-stream): the email
+        # package is strict about transfer encodings inside message/rfc822.
+        if maintype in ("multipart", "message") or not subtype:
             maintype, subtype = "application", "octet-stream"
         mime.add_attachment(_decode_b64(data), maintype=maintype, subtype=subtype, filename=name)
         attached.append(name)
@@ -840,6 +856,31 @@ def op_forward_message(
     if skipped:
         out["skipped"] = skipped
     return out
+
+
+def op_draft_for_send(svc, draft_id: str) -> dict:
+    """Everything a send decision needs about a draft (format=full)."""
+    d = svc.users().drafts().get(userId="me", id=draft_id, format="full").execute()
+    msg = d.get("message") or {}
+    payload = msg.get("payload") or {}
+    return {
+        "draft_id": d.get("id", draft_id),
+        "message_id": msg.get("id"),
+        "thread_id": msg.get("threadId"),
+        "headers": headers_map(payload),
+        "body": extract_body(payload),
+        "attachments": [a["filename"] or a["mime_type"] for a in extract_attachments(payload)],
+    }
+
+
+def op_draft_message_id(svc, draft_id: str) -> str | None:
+    d = svc.users().drafts().get(userId="me", id=draft_id, format="minimal").execute()
+    return (d.get("message") or {}).get("id")
+
+
+def op_send_draft(svc, draft_id: str) -> dict:
+    sent = svc.users().drafts().send(userId="me", body={"id": draft_id}).execute()
+    return {"message_id": sent.get("id"), "thread_id": sent.get("threadId")}
 
 
 def op_delete_draft(svc, draft_id: str) -> dict:

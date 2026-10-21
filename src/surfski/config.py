@@ -57,6 +57,15 @@ class Config:
     port: int = 8000
     rate_limit_per_minute: int = 60
     allowed_client_redirect_uris: tuple[str, ...] = CLAUDE_REDIRECT_URIS
+    # Opt-in sending (#2). Off by default: send tools and /send/* routes don't exist.
+    sending_enabled: bool = False
+    send_daily_cap: int = 20
+    send_max_recipients: int = 10
+    allowed_recipient_domains: frozenset[str] = frozenset()
+
+    @property
+    def send_policy_redirect_uri(self) -> str:
+        return f"{self.base_url}/send/policy/callback"
 
     @property
     def gmail_redirect_uri(self) -> str:
@@ -120,6 +129,20 @@ def load_config(env: dict[str, str] | None = None) -> Config:
     else:
         redirects = CLAUDE_REDIRECT_URIS + (LOCAL_REDIRECT_URIS if local else ())
 
+    sending_enabled = env.get("SENDING_ENABLED", "false").strip().lower()
+    if sending_enabled not in ("true", "false", "1", "0", "yes", "no", ""):
+        raise ConfigError("SENDING_ENABLED must be true or false")
+    try:
+        daily_cap = int(env.get("SEND_DAILY_CAP", "20"))
+        max_recipients = int(env.get("SEND_MAX_RECIPIENTS", "10"))
+    except ValueError as e:
+        raise ConfigError("SEND_DAILY_CAP and SEND_MAX_RECIPIENTS must be integers") from e
+    if daily_cap < 1 or max_recipients < 1:
+        raise ConfigError("SEND_DAILY_CAP and SEND_MAX_RECIPIENTS must be at least 1")
+    domains = frozenset(
+        d.strip().lower().lstrip("@") for d in env.get("ALLOWED_RECIPIENT_DOMAINS", "").split(",") if d.strip()
+    )
+
     return Config(
         base_url=base_url,
         google_client_id=env["GOOGLE_CLIENT_ID"].strip(),
@@ -136,4 +159,8 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         port=int(env.get("PORT", "8000")),
         rate_limit_per_minute=int(env.get("RATE_LIMIT_PER_MINUTE", "60")),
         allowed_client_redirect_uris=redirects,
+        sending_enabled=sending_enabled in ("true", "1", "yes"),
+        send_daily_cap=daily_cap,
+        send_max_recipients=max_recipients,
+        allowed_recipient_domains=domains,
     )
