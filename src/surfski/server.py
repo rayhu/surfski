@@ -1039,6 +1039,12 @@ def create_app(
                 except Exception:  # noqa: BLE001
                     state = None
             if isinstance(state, str) and state.startswith(STATE_PREFIX):
+                # This branch BYPASSES FastMCP's tool pipeline: the tool function, its pydantic
+                # argument validation and any later middleware never run. `args` are the raw,
+                # unvalidated client arguments; they are only hashed (call_binding) and compared
+                # with the continuation, never used. Everything acted on comes from the
+                # server-side continuation data. Any future use of `args` here must validate
+                # them first.
                 resume = resumers.get(name)
                 if resume is None:
                     raise ToolError("this confirmation is invalid, expired or already used; nothing was done")
@@ -1387,8 +1393,9 @@ def create_app(
         return {**r, "status": "sent", "sent": True, "draft_id": draft_id,
                 "confirm_channel": "input-required", **sent}
 
-    for name in ("send_draft", "send_email", "forward_message"):
-        resumers[name] = resume_send
+    if config.sending_enabled:  # defense in depth: no send continuation without the send tools
+        for name in ("send_draft", "send_email", "forward_message"):
+            resumers[name] = resume_send
 
     # -- triage (#8): only when TRIAGE_ENABLED, and per mailbox only after enable_triage
 

@@ -49,6 +49,4 @@ async def test_mail_continuation_cannot_resume_calendar(app, who, cals, storage,
     for other in (snd.PURPOSE_SEND_INPUT, snd.PURPOSE_CAL_CONFIRM, snd.PURPOSE_SEND):
         with pytest.raises(snd.ActionError):
             snd.verify_action(secret, token, other)
-    with pytest.raises(ToolError, match="invalid"):  # a calendar continuation on a mail tool
-        await app.surfski["resumers"]["send_draft"](
-            ALICE, "send_draft", dict(CREATE), srv.STATE_PREFIX + token, accept())
+    assert "send_draft" not in app.surfski["resumers"]  # sending disabled on this app
