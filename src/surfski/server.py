@@ -33,6 +33,7 @@ from . import unsubscribe as unsub
 from .audit import install_log_redaction, write_audit
 from .config import Config, ConfigError, load_config
 from .metrics import Metrics, ToolMetricsMiddleware
+from .version import __version__
 from .linking import (
     GMAIL_SCOPES,
     LinkError,
@@ -711,6 +712,7 @@ def create_app(
 
     mcp = FastMCP(
         name="surfski",
+        version=__version__,
         instructions=(INSTRUCTIONS_TRIAGE + " " if config.triage_enabled else "") + (
             INSTRUCTIONS.replace(
                 "Sending is NOT supported: create_draft saves a draft the user sends from Gmail; ",
@@ -2326,7 +2328,8 @@ def main() -> None:
     )
     install_log_redaction()
     mcp = create_app(config)
-    log.info("starting surfski on %s:%s (base_url=%s)", config.host, config.port, config.base_url)
+    log.info("starting surfski %s on %s:%s (base_url=%s)", __version__, config.host, config.port,
+             config.base_url)
     mcp.run(
         transport="http",
         host=config.host,

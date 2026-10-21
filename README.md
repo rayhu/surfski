@@ -179,6 +179,9 @@ When you link a mailbox, sign in **as that mailbox** and tick **both** permissio
 
 ### Upgrade
 
+What changed in each version is in [CHANGELOG.md](CHANGELOG.md); `surfski --version` (or
+`docker compose -p surfski exec app surfski --version`) shows what you run.
+
 ```bash
 git pull && sudo docker compose -p surfski up -d --build
 ```

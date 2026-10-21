@@ -12,10 +12,12 @@ import math
 import threading
 import time
 from collections.abc import Iterable
-from importlib import metadata
+
 
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware
+
+from .version import __version__
 
 # Seconds. Tool calls range from a cached list_accounts (ms) to a 20 MB forward (tens of s).
 LATENCY_BUCKETS = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
@@ -29,13 +31,6 @@ ATTACHMENT_OUTCOMES = frozenset({"ok", "metadata_only", "error"})
 UNSUB_METHODS = frozenset({"one_click", "mailto", "manual", "none"})
 UNSUB_OUTCOMES = frozenset({"preview", "ok", "failed", "manual", "not_available", "draft_created",
                             "sent", "confirmation_required", "declined"})
-
-
-def _version() -> str:
-    try:
-        return metadata.version("surfski")
-    except metadata.PackageNotFoundError:
-        return "unknown"
 
 
 def _bucket(value: str, allowed: Iterable[str]) -> str:
@@ -92,7 +87,7 @@ class Metrics:
         self._counters: dict[str, dict[tuple[str, ...], float]] = {}
         self._hist: dict[tuple[str, ...], list[float]] = {}  # tool -> [bucket counts..., sum, count]
         self.started = time.time()
-        self.version = _version()
+        self.version = __version__
 
     def set_tools(self, names: Iterable[str]) -> None:
         self._tools = frozenset(names)

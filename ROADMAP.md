@@ -97,7 +97,9 @@ See [Calendar module](#calendar-module).
 - ✅ **Metrics endpoint** (#10): Prometheus `/metrics` behind `METRICS_ENABLED` and a Bearer
   `METRICS_TOKEN`; tool calls, latency, Gmail errors, sends, triage, attachments, unsubscribe and
   counts, with no personal data in any label.
-- Versioned releases and a changelog.
+- ✅ **Versioned releases and a changelog** (#11): semver from `pyproject.toml` (`surfski --version`,
+  server info, `surfski_build_info`), `CHANGELOG.md`, and a tag-triggered workflow that checks the
+  version, publishes the GHCR image and creates the GitHub Release from the changelog.
 
 ## Not planned
 
