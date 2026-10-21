@@ -15,16 +15,22 @@ concurrency:
 
 jobs:
   test:
-    name: pytest (Python 3.12)
+    name: pytest (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.14 is the runtime (Docker image, .python-version); 3.12 is the
+        # declared minimum (requires-python) for pip/uv installs.
+        python: ["3.14", "3.12"]
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0 (no floating major tags after v7)
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
           enable-cache: true
       - run: uv sync --frozen
       - run: uv run pytest -q
