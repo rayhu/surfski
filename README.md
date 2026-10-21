@@ -136,7 +136,7 @@ When you link a mailbox, sign in **as that mailbox** and tick **both** permissio
 git pull && sudo docker compose -p surfski up -d --build
 ```
 
-With the prebuilt image, run `sudo docker compose -p surfski pull && sudo docker compose -p surfski up -d` instead.
+With the prebuilt image, run `git pull && sudo docker compose -p surfski pull && sudo docker compose -p surfski up -d` instead. The `git pull` picks up changes to `compose.yaml` and the env reference.
 
 ### Backups
 
