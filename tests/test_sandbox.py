@@ -216,3 +216,107 @@ async def test_tool_uses_sandbox_and_inprocess_still_works(config, storage):
     assert app.surfski["sandbox"].mode == "subprocess"
     app = create_app(replace(config, extract_sandbox="inprocess"), storage=storage, with_auth=False)
     assert app.surfski["sandbox"].mode == "inprocess"
+
+
+# ---------------------------------------------------------------- review hardening
+
+
+def test_flooding_worker_is_killed(monkeypatch):
+    evil_worker(monkeypatch, """
+        chunk = b"A" * 65536
+        while True:
+            sys.stdout.buffer.write(chunk)
+    """)
+    t = time.monotonic()
+    with pytest.raises(att.ExtractError, match=rf"^{TOO_COMPLEX} \(output limit\)$"):
+        Sandbox(timeout_s=20).extract(b"x", "text/plain", "a.txt", charset=None, max_chars=100)
+    assert time.monotonic() - t < 10  # killed at the cap, not at the timeout
+    assert sb.output_cap(100) == 100 * 8 + 4096
+
+
+def test_legit_output_near_the_cap_is_accepted():
+    text = "\x01" * 5000  # worst case JSON escaping (6 bytes per char)
+    ex = Sandbox().extract(text.encode(), "text/plain", "a.txt", charset="utf-8", max_chars=4000)
+    assert ex.text == "\x01" * 4001  # max_chars + 1, so the caller still sees truncation
+
+
+@pytest.mark.parametrize("result", [
+    {"ok": True, "text": 42, "method": "text"},
+    {"ok": True, "text": "x", "method": "evil"},
+    {"ok": True, "text": "x", "method": ["text"]},
+    {"ok": True, "text": "x", "method": "text", "note": {"a": 1}},
+    {"ok": True, "text": "x", "method": "text", "skipped": "RLIMIT_AS"},
+    {"ok": True, "text": "x" * 50, "method": "text"},  # longer than max_chars + 1
+    {"ok": "yes", "text": "x", "method": "text"},
+    {"ok": False, "error": "extract", "message": ["SECRET"]},
+    {"ok": False, "error": "internal", "class": "Not An Identifier SECRET"},
+    [1, 2, 3],
+])
+def test_malformed_worker_json(monkeypatch, result):
+    import json
+    script = f"import sys; sys.stdout.write({json.dumps(json.dumps(result))})"
+    monkeypatch.setattr(sb, "WORKER_ARGV", [sys.executable, "-I", "-B", "-c", script])
+    with pytest.raises(att.ExtractError) as e:
+        Sandbox().extract(b"x", "text/plain", "a.txt", charset=None, max_chars=10)
+    assert str(e.value).startswith(TOO_COMPLEX) and "SECRET" not in str(e.value)
+
+
+def test_child_environment_has_no_secrets(monkeypatch):
+    from surfski.config import SECRET_ENV
+    for k in SECRET_ENV:
+        monkeypatch.setenv(k, f"SECRET-VALUE-{k}")
+    evil_worker(monkeypatch, """
+        import json, os
+        from surfski.attachments import Extracted
+        return Extracted(json.dumps(dict(os.environ)), "text")
+    """)
+    env = __import__("json").loads(
+        Sandbox().extract(b"x", "text/plain", "a.txt", charset=None, max_chars=100_000).text)
+    assert not set(env) & set(SECRET_ENV)
+    assert "SECRET-VALUE" not in str(env)
+    # Only what the parent sets (macOS adds its own __CF_USER_TEXT_ENCODING).
+    assert {k for k in env if not k.startswith("__CF_")} <= {"PATH", "HOME", "LANG", "LC_CTYPE"}
+
+
+def test_scrub_secret_env(monkeypatch):
+    from surfski.config import SECRET_ENV, scrub_secret_env
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", "k")
+    monkeypatch.setenv("METRICS_TOKEN", "m")
+    monkeypatch.setenv("BASE_URL", "https://x")
+    removed = scrub_secret_env()
+    assert set(removed) >= {"TOKEN_ENCRYPTION_KEY", "METRICS_TOKEN"}
+    assert not any(k in os.environ for k in SECRET_ENV) and os.environ["BASE_URL"] == "https://x"
+
+
+HARDEN_PROBE = """
+import os, subprocess, sys
+if sys.argv[1] == "harden":
+    from surfski.sandbox import harden_process
+    assert harden_process()
+os.environ.clear()  # children get no env; the probe reads the parent's *initial* environ
+child = (
+    "import os, sys\\n"
+    "try:\\n"
+    "    data = open(f'/proc/{os.getppid()}/environ', 'rb').read()\\n"
+    "    print('READ', b'PROBE-SECRET' in data)\\n"
+    "except OSError as e:\\n"
+    "    print('DENIED', type(e).__name__)\\n"
+)
+print(subprocess.run([sys.executable, "-I", "-c", child], capture_output=True, text=True).stdout.strip())
+"""
+
+
+@pytest.mark.skipif(not LINUX or os.geteuid() == 0,
+                    reason="PR_SET_DUMPABLE is Linux-only; root bypasses it")
+@pytest.mark.parametrize("mode,expected", [("plain", "READ True"), ("harden", "DENIED PermissionError")])
+def test_child_cannot_read_hardened_parent_environ(mode, expected):
+    import subprocess
+    env = {**os.environ, "PROBE_TOKEN": "PROBE-SECRET"}
+    out = subprocess.run([sys.executable, "-I", "-c", HARDEN_PROBE, mode], capture_output=True,
+                         text=True, env=env)
+    assert out.stdout.strip() == expected, out.stderr
+
+
+def test_harden_process_is_safe_off_linux(monkeypatch):
+    monkeypatch.setattr(sb.sys, "platform", "darwin")
+    assert sb.harden_process() is False

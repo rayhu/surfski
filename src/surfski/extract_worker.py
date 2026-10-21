@@ -5,9 +5,12 @@ JSON object: {"ok": true, "text", "method", "note", "skipped"} or {"ok": false,
 "error": "extract", "message"} for a user-facing ExtractError, or {"ok": false,
 "error": "internal", "class"} for anything else (class name only, never the message).
 
-Before reading any input the worker imports everything it needs and then lowers its
-own resource limits (address space, CPU seconds, open files, processes, file size).
-Limits the platform doesn't support are skipped and reported back in "skipped"."""
+The worker reads the input first (so the header can say whether pypdf is needed), then
+imports what parsing needs, then lowers its own resource limits (address space, CPU
+seconds, open files, processes, file size) and only then parses the untrusted bytes.
+Limits the platform doesn't support are skipped and reported back in "skipped". The
+text is cut to max_chars + 1 characters so the parent can still tell it was truncated
+while bounding the output size."""
 
 from __future__ import annotations
 
@@ -78,12 +81,13 @@ def main(extract: Callable | None = None) -> int:
         _deny_network()
         ex = extract(data, header["mime_type"], header["filename"], charset=header.get("charset"),
                      max_chars=int(header["max_chars"]))
-        result = {"ok": True, "text": ex.text, "method": ex.method, "note": ex.note, "skipped": skipped}
+        text = ex.text[: int(header["max_chars"]) + 1] if ex.text is not None else None
+        result = {"ok": True, "text": text, "method": ex.method, "note": ex.note, "skipped": skipped}
     except att.ExtractError as e:
         result = {"ok": False, "error": "extract", "message": str(e)[:300]}
     except BaseException as e:  # noqa: BLE001  (MemoryError, RecursionError, parser bugs...)
         result = {"ok": False, "error": "internal", "class": type(e).__name__}
-    out.write(json.dumps(result))
+    out.write(json.dumps(result, ensure_ascii=False))
     out.flush()
     return 0
 

@@ -177,6 +177,22 @@ def _per_owner_keys(env: dict[str, str], name: str) -> dict[str, str]:
     return out
 
 
+# Settings that are secrets. After load_config, `scrub_secret_env` removes them from
+# os.environ so nothing later (a library, a subprocess spawned without an explicit env)
+# can pick them up. It does not change /proc/<pid>/environ, which keeps the environment
+# the process started with; PR_SET_DUMPABLE (sandbox.harden_process) protects that.
+SECRET_ENV = ("GOOGLE_CLIENT_SECRET", "JWT_SIGNING_KEY", "STORAGE_ENCRYPTION_KEY",
+              "STORAGE_ENCRYPTION_KEY_OLD", "TOKEN_ENCRYPTION_KEY", "TOKEN_ENCRYPTION_KEY_OLD",
+              "TOKEN_ENCRYPTION_KEYS", "TOKEN_ENCRYPTION_KEYS_OLD", "STATE_SECRET", "METRICS_TOKEN")
+
+
+def scrub_secret_env() -> list[str]:
+    removed = [k for k in SECRET_ENV if k in os.environ]
+    for k in removed:
+        del os.environ[k]
+    return removed
+
+
 def load_config(env: dict[str, str] | None = None) -> Config:
     env = dict(os.environ if env is None else env)
     missing = [k for k in REQUIRED if not env.get(k, "").strip()]

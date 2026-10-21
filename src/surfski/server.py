@@ -31,9 +31,9 @@ from . import gmail as g
 from . import sending as snd
 from . import unsubscribe as unsub
 from .audit import install_log_redaction, write_audit
-from .config import Config, ConfigError, load_config
+from .config import Config, ConfigError, load_config, scrub_secret_env
 from .metrics import Metrics, ToolMetricsMiddleware
-from .sandbox import Sandbox
+from .sandbox import Sandbox, harden_process
 from .version import __version__
 from .linking import (
     GMAIL_SCOPES,
@@ -2329,6 +2329,11 @@ def main() -> None:
         level=config.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
     install_log_redaction()
+    # Secrets live in `config` from here on; FastMCP, google-auth and our code never read
+    # them from the environment again (checked), so drop them from os.environ, and make
+    # /proc/<pid>/environ and memory unreadable to other same-uid processes (#30).
+    scrub_secret_env()
+    harden_process()
     mcp = create_app(config)
     log.info("starting surfski %s on %s:%s (base_url=%s)", __version__, config.host, config.port,
              config.base_url)

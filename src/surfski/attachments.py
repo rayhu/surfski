@@ -50,6 +50,9 @@ S = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 
 
+METHODS = frozenset({"text", "html", "pdf", "docx", "xlsx", "pptx", "none"})
+
+
 class ExtractError(Exception):
     """User-facing extraction failure (safe to display)."""
 

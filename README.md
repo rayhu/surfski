@@ -370,12 +370,22 @@ set -a; source ./local.env; set +a; uv run surfski
   the bytes on stdin and reads JSON from stdout. The child drops its own limits before touching the
   input: address space `EXTRACT_MEMORY_MB` (`RLIMIT_AS`), CPU seconds (`RLIMIT_CPU`), no file data
   writes (`RLIMIT_FSIZE=0`), no new processes (`RLIMIT_NPROC=0`), 16 open files, no core dumps, and
-  Python-level sockets disabled. The parent kills the child's process group after
+  Python-level sockets disabled. Its environment holds only `PATH`, `HOME` and `LANG`, and its stdout
+  is read incrementally and cut off (child killed) past `max_chars × 8 + 4 KB`; results are
+  type-checked before use. The parent kills the child's process group after
   `EXTRACT_TIMEOUT_S` and reaps it. At most 2 extractions run at once. A timeout, OOM or crash
   becomes "the file was too complex to read safely (timeout)" or similar; the child's stderr is
   discarded and only a short class name is reported. The in-process zip, XML and PDF caps stay as
   defense in depth. Cost: a process start per call, measured at about 140 ms (240 ms for PDFs, which load
   pypdf) in the hardened container under Docker Desktop, and 40 ms / 200 ms natively.
+  - *Protecting the server's secrets:* on Linux the server marks itself non-dumpable at startup
+    (`prctl(PR_SET_DUMPABLE, 0)`), so another process of the same uid, such as a compromised
+    worker, can't read its `/proc/<pid>/environ` (where the keys arrived) or its memory, or ptrace
+    it. It also removes the secret settings from `os.environ` once the config is loaded.
+  - **Limit:** the worker still runs as the same uid as the server. A parser exploit could still
+    read files that user can read, including the SQLite database (encrypted refresh tokens) and the
+    OAuth store under `DATA_DIR`. The next step is seccomp, namespaces or a separate uid for the
+    worker ([#43](https://github.com/rayhu/surfski/issues/43)).
   - *Enforced on Linux* (the container): all the rlimits above. *Not enforced without seccomp or
     namespaces:* network access from native code (only Python's `socket` is blocked; the container
     has its normal network), reads of files the server user can read, and creating empty files on

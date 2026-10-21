@@ -68,46 +68,86 @@ class Sandbox:
             "mime_type": mime_type, "filename": filename, "charset": charset, "max_chars": max_chars,
             "memory_mb": self.memory_mb, "cpu_seconds": max(1, math.ceil(self.timeout_s)),
         }).encode() + b"\n"
-        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": "/tmp", "LANG": "C.UTF-8"}
+        cap = output_cap(max_chars)
         start = time.monotonic()
         proc = subprocess.Popen(  # noqa: S603  (fixed argv, no shell)
             WORKER_ARGV, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            env=env, close_fds=True, start_new_session=True, cwd="/",
+            env=worker_env(), close_fds=True, start_new_session=True, cwd="/",
         )
+        chunks: list[bytes] = []
+        state = {"size": 0, "flood": False}
+
+        def feed() -> None:
+            try:
+                proc.stdin.write(header + data)
+            except (BrokenPipeError, OSError):
+                pass
+            finally:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+
+        def drain() -> None:
+            # Read incrementally and stop (killing the child) once it exceeds the cap, so a
+            # flooding worker can't make the server buffer unbounded output.
+            while True:
+                chunk = proc.stdout.read1(65536)
+                if not chunk:
+                    return
+                state["size"] += len(chunk)
+                if state["size"] > cap:
+                    state["flood"] = True
+                    self._kill(proc)
+                    return
+                chunks.append(chunk)
+
+        threads = [threading.Thread(target=feed, daemon=True), threading.Thread(target=drain, daemon=True)]
+        for t in threads:
+            t.start()
+        timed_out = False
         try:
-            out, _ = proc.communicate(header + data, timeout=self.timeout_s)
+            proc.wait(timeout=self.timeout_s)
         except subprocess.TimeoutExpired:
-            self._kill(proc)
-            log.warning("attachment extraction killed: timeout after %.0fs", self.timeout_s)
-            raise att.ExtractError(f"{TOO_COMPLEX} (timeout)") from None
-        except BaseException:
-            self._kill(proc)
-            raise
+            timed_out = True
         finally:
             if proc.poll() is None:
                 self._kill(proc)
+            for t in threads:
+                t.join(timeout=5)
+            proc.stdout.close()
         elapsed = time.monotonic() - start
+        if timed_out:
+            log.warning("attachment extraction killed: timeout after %.0fs", self.timeout_s)
+            raise att.ExtractError(f"{TOO_COMPLEX} (timeout)")
+        if state["flood"]:
+            log.warning("attachment extraction killed: output over %d bytes", cap)
+            raise att.ExtractError(f"{TOO_COMPLEX} (output limit)")
         try:
-            result = json.loads(out.decode() or "null")
-        except (UnicodeDecodeError, ValueError):
+            result = json.loads(b"".join(chunks).decode() or "null")
+        except (UnicodeDecodeError, ValueError, RecursionError):
             result = None
         if not isinstance(result, dict):
             reason = _signal_name(proc.returncode)
             log.warning("attachment extraction failed: %s (%.2fs)", reason, elapsed)
             raise att.ExtractError(f"{TOO_COMPLEX} ({reason})")
-        if not result.get("ok"):
-            if result.get("error") == "extract":
-                raise att.ExtractError(str(result.get("message") or "could not read the file")[:300])
-            cls = str(result.get("class") or "error")
-            cls = cls if cls.isidentifier() and len(cls) <= 40 else "error"
+        if result.get("ok") is not True:
+            if result.get("error") == "extract" and isinstance(result.get("message"), str):
+                raise att.ExtractError(result["message"][:300] or "could not read the file")
+            cls = result.get("class")
+            cls = cls if isinstance(cls, str) and cls.isidentifier() and len(cls) <= 40 else "error"
             log.warning("attachment extraction failed in worker: %s", cls)
             raise att.ExtractError(f"{TOO_COMPLEX} ({cls})")
+        ex = validated(result, max_chars)
+        if ex is None:
+            log.warning("attachment extraction returned a malformed result")
+            raise att.ExtractError(f"{TOO_COMPLEX} (malformed result)")
         for name in result.get("skipped") or ():
             if name not in _logged_skips:
                 _logged_skips.add(name)
                 log.info("extraction sandbox: %s is not supported on this platform; skipped", name)
         log.debug("attachment extracted in subprocess in %.3fs", elapsed)
-        return att.Extracted(result.get("text"), str(result.get("method") or "none"), result.get("note"))
+        return ex
 
     @staticmethod
     def _kill(proc: subprocess.Popen) -> None:
@@ -133,3 +173,51 @@ def _signal_name(code: int | None) -> str:
         return {"SIGKILL": "killed (memory or CPU limit)", "SIGXCPU": "CPU limit",
                 "SIGSEGV": "crashed", "SIGABRT": "crashed"}.get(name, name)
     return "crashed" if code else "no result"
+
+
+def output_cap(max_chars: int) -> int:
+    """Largest stdout accepted from a worker: text is at most max_chars + 1 characters and
+    UTF-8 JSON needs at most 6 bytes per character (\\uXXXX escapes)."""
+    return max_chars * 8 + 4096
+
+
+def worker_env() -> dict[str, str]:
+    """The child's whole environment: no secrets, nothing inherited."""
+    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": "/tmp", "LANG": "C.UTF-8"}
+
+
+def validated(result: dict, max_chars: int) -> att.Extracted | None:
+    """Type-check a worker's success result before trusting it."""
+    text, method, note, skipped = (result.get(k) for k in ("text", "method", "note", "skipped"))
+    if text is not None and not isinstance(text, str):
+        return None
+    if not isinstance(method, str) or method not in att.METHODS:
+        return None
+    if note is not None and not isinstance(note, str):
+        return None
+    if skipped is not None and not (isinstance(skipped, list) and all(isinstance(x, str) for x in skipped)):
+        return None
+    if text is not None and len(text) > max_chars + 1:
+        return None
+    return att.Extracted(text, method, note[:500] if note else note)
+
+
+def harden_process() -> bool:
+    """Linux: mark the server process non-dumpable (prctl PR_SET_DUMPABLE=0), so other
+    processes of the same uid, such as a compromised extraction worker, can't read its
+    /proc/<pid>/environ or memory, or ptrace it. Best effort; returns whether it applied."""
+    if not sys.platform.startswith("linux"):
+        log.info("process hardening (PR_SET_DUMPABLE) is Linux-only; skipped")
+        return False
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        PR_SET_DUMPABLE = 4
+        if libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), "prctl failed")
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not set PR_SET_DUMPABLE=0 (%s); same-uid processes may read this "
+                    "process's environment", type(e).__name__)
+        return False
