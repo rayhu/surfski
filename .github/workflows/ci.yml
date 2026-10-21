@@ -79,3 +79,33 @@ jobs:
             echo "::error::expected 'refusing to start' in container output"
             exit 1
           fi
+      - name: Admin CLI works in the hardened container
+        run: |
+          set -euo pipefail
+          key() { python3 -c "import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"; }
+          {
+            echo "BASE_URL=https://mcp.example.com"
+            echo "GOOGLE_CLIENT_ID=cid.apps.googleusercontent.com"
+            echo "GOOGLE_CLIENT_SECRET=GOCSPX-ci"
+            echo "ALLOWED_USERS=ci@example.com"
+            echo "JWT_SIGNING_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+            echo "STATE_SECRET=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+            echo "STORAGE_ENCRYPTION_KEY=$(key)"
+            echo "TOKEN_ENCRYPTION_KEY=$(key)"
+          } > ci.env
+          docker volume create surfski-ci-data
+          run() {
+            docker run --rm --env-file ci.env -e DATA_DIR=/data -v surfski-ci-data:/data \
+              --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
+              surfski:ci "$@"
+          }
+          run surfski admin list
+          run surfski admin rotate-token-key --dry-run
+          set +e
+          run surfski admin purge-owner --owner ci@example.com
+          code=$?
+          set -e
+          if [ "$code" -ne 1 ]; then
+            echo "::error::purge-owner without --yes should exit 1, got $code"
+            exit 1
+          fi

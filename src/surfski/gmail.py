@@ -1178,8 +1178,18 @@ def check_ids(ids: list[str] | None, what: str) -> list[str]:
     return out
 
 
-def op_modify_labels(svc, kind: str, ids: list[str], add: list[str], remove: list[str]) -> int:
+class Progress:
+    """How many ids a triage op has changed so far. If the op fails partway, the caller
+    keeps that much of the daily-cap reservation (those changes did happen)."""
+
+    def __init__(self) -> None:
+        self.done = 0
+
+
+def op_modify_labels(svc, kind: str, ids: list[str], add: list[str], remove: list[str],
+                     progress: Progress | None = None) -> int:
     """Add/remove label ids. Messages go in one batchModify; threads one modify each."""
+    progress = progress or Progress()
     users = svc.users()
     if kind == "messages":
         body: dict[str, Any] = {"ids": ids}
@@ -1187,7 +1197,8 @@ def op_modify_labels(svc, kind: str, ids: list[str], add: list[str], remove: lis
             body["addLabelIds"] = add
         if remove:
             body["removeLabelIds"] = remove
-        users.messages().batchModify(userId="me", body=body).execute()
+        users.messages().batchModify(userId="me", body=body).execute()  # all or nothing
+        progress.done = len(ids)
     else:
         body = {}
         if add:
@@ -1196,14 +1207,18 @@ def op_modify_labels(svc, kind: str, ids: list[str], add: list[str], remove: lis
             body["removeLabelIds"] = remove
         for tid in ids:
             users.threads().modify(userId="me", id=tid, body=body).execute()
+            progress.done += 1
     return len(ids)
 
 
-def op_trash(svc, kind: str, ids: list[str], untrash: bool = False) -> int:
+def op_trash(svc, kind: str, ids: list[str], untrash: bool = False,
+             progress: Progress | None = None) -> int:
     """Move to Trash (recoverable for 30 days) or back. Never deletes permanently."""
+    progress = progress or Progress()
     res = svc.users().messages() if kind == "messages" else svc.users().threads()
     for i in ids:
         (res.untrash if untrash else res.trash)(userId="me", id=i).execute()
+        progress.done += 1
     return len(ids)
 
 

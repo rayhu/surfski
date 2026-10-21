@@ -1,5 +1,6 @@
-"""SQLite persistence. Every `accounts` query is scoped by owner; there is no
-cross-owner read path."""
+"""SQLite persistence. Every `accounts` query the server makes is scoped by owner;
+the only cross-owner paths are the `admin_*` methods, used by the local admin CLI
+(`surfski admin ...`) and never reachable from a tool or HTTP route."""
 
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 
 ALIAS_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 def scrub_emails(text: str) -> str:
@@ -152,25 +153,73 @@ class Account:
 
 
 class TokenCipher:
-    """Fernet encryption with optional per-owner keys."""
+    """Fernet encryption with optional per-owner keys and, during a key rotation (#7),
+    previous keys that are accepted for decryption only.
 
-    def __init__(self, default_key: str, per_owner: dict[str, str] | None = None):
+    For an owner, the current key is their TOKEN_ENCRYPTION_KEYS entry if any, else the
+    default key; new tokens are always encrypted with it. Decryption tries the current
+    key, then the owner's TOKEN_ENCRYPTION_KEYS_OLD entry, then TOKEN_ENCRYPTION_KEY_OLD.
+    An owner with a per-owner key never falls back to the current default key, so moving
+    an owner onto a per-owner key is an explicit rotation
+    (TOKEN_ENCRYPTION_KEYS_OLD=owner=<default key>)."""
+
+    def __init__(
+        self,
+        default_key: str,
+        per_owner: dict[str, str] | None = None,
+        *,
+        old_default: str | None = None,
+        old_per_owner: dict[str, str] | None = None,
+    ):
         self._default = Fernet(default_key.encode())
-        self._per_owner = {
-            o.lower(): Fernet(k.encode()) for o, k in (per_owner or {}).items()
+        self._per_owner = {o.lower(): Fernet(k.encode()) for o, k in (per_owner or {}).items()}
+        self._old_default = Fernet(old_default.encode()) if old_default else None
+        self._old_per_owner = {
+            o.lower(): Fernet(k.encode()) for o, k in (old_per_owner or {}).items()
         }
+
+    @classmethod
+    def from_config(cls, config) -> TokenCipher:
+        """The one place the server and the admin CLI build their cipher."""
+        return cls(
+            config.token_encryption_key,
+            config.token_encryption_keys,
+            old_default=config.token_encryption_key_old,
+            old_per_owner=config.token_encryption_keys_old,
+        )
 
     def _for(self, owner: str) -> Fernet:
         return self._per_owner.get(owner.lower(), self._default)
+
+    def _chain(self, owner: str) -> MultiFernet:
+        owner = owner.lower()
+        keys = [self._for(owner), self._old_per_owner.get(owner), self._old_default]
+        return MultiFernet([k for k in keys if k is not None])
 
     def encrypt(self, owner: str, plaintext: str) -> bytes:
         return self._for(owner).encrypt(plaintext.encode())
 
     def decrypt(self, owner: str, ciphertext: bytes) -> str:
         try:
-            return self._for(owner).decrypt(ciphertext).decode()
+            return self._chain(owner).decrypt(ciphertext).decode()
         except InvalidToken as e:
             raise StorageError("stored token cannot be decrypted with current key") from e
+
+    def is_current(self, owner: str, ciphertext: bytes) -> bool:
+        try:
+            self._for(owner).decrypt(ciphertext)
+            return True
+        except InvalidToken:
+            return False
+
+
+class KeyRotationError(StorageError):
+    """Some rows can't be decrypted with any configured key; nothing was changed."""
+
+    def __init__(self, affected: list[tuple[str, str]]):
+        self.affected = affected
+        super().__init__(f"{len(affected)} stored token(s) cannot be decrypted with the "
+                         "current or old keys; nothing was changed")
 
 
 class Storage:
@@ -426,6 +475,15 @@ class Storage:
         with self._tx() as c:
             c.execute("DELETE FROM modifications WHERE rowid = ?", (rowid,))
 
+    def settle_modifications(self, rowid: int, done: int) -> None:
+        """Shrink a reservation to the `done` changes that really happened (release it
+        entirely when none did)."""
+        if done <= 0:
+            self.release_modifications(rowid)
+            return
+        with self._tx() as c:
+            c.execute("UPDATE modifications SET n = MIN(n, ?) WHERE rowid = ?", (done, rowid))
+
     def modifications_today(self, owner: str, alias: str, now: int) -> int:
         with self._tx() as c:
             (used,) = c.execute(
@@ -598,6 +656,56 @@ class Storage:
                         f"DELETE FROM {table} WHERE lower(owner) = ?", (owner,)
                     ).rowcount
         return counts, tokens
+
+    # ---- admin (local CLI only, cross-owner) ----
+
+    def admin_list_accounts(self) -> list[Account]:
+        """Every linked mailbox of every owner, without tokens."""
+        with self._tx() as c:
+            rows = c.execute(f"SELECT {ACCOUNT_COLS} FROM accounts ORDER BY owner, alias").fetchall()
+        return [Account(**dict(r)) for r in rows]
+
+    def admin_audit_counts(self, owner: str, since: str) -> list[dict]:
+        """Audit row counts per tool (ok / failed) for one owner since an ISO timestamp."""
+        with self._tx() as c:
+            rows = c.execute(
+                "SELECT tool, SUM(ok = 1) AS ok, SUM(ok = 0) AS failed FROM audit_log "
+                "WHERE lower(owner) = ? AND ts >= ? GROUP BY tool ORDER BY tool",
+                (owner.lower(), since),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def admin_rotate_token_key(self, *, dry_run: bool = False) -> dict[str, int]:
+        """Re-encrypt every stored refresh token with the owner's current key, in one
+        write transaction. BEGIN IMMEDIATE takes the write lock before reading, so a
+        token the running server stores meanwhile can't be overwritten with a stale one.
+        Raises KeyRotationError (listing owner/alias, never ciphertext) and changes
+        nothing if any row can't be decrypted with the current or old keys."""
+        with self._tx() as c:
+            c.execute("BEGIN IMMEDIATE")
+            rows = c.execute(
+                "SELECT owner, alias, refresh_token_enc FROM accounts ORDER BY owner, alias"
+            ).fetchall()
+            updates: list[tuple[bytes, str, str]] = []
+            affected: list[tuple[str, str]] = []
+            current = 0
+            for r in rows:
+                if self.cipher.is_current(r["owner"], r["refresh_token_enc"]):
+                    current += 1
+                    continue
+                try:
+                    plain = self.cipher.decrypt(r["owner"], r["refresh_token_enc"])
+                except StorageError:
+                    affected.append((r["owner"], r["alias"]))
+                    continue
+                updates.append((self.cipher.encrypt(r["owner"], plain), r["owner"], r["alias"]))
+            if affected:
+                raise KeyRotationError(affected)
+            if not dry_run:
+                c.executemany(
+                    "UPDATE accounts SET refresh_token_enc = ? WHERE owner = ? AND alias = ?", updates
+                )
+        return {"total": len(rows), "rotated": len(updates), "already_current": current}
 
     # ---- pending links ----
 

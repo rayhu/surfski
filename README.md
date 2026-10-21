@@ -214,6 +214,62 @@ contains them. Keep the env file in a separate place, such as a password manager
 backup.** Restore with the same keys that were in use when the backup was made. If you lose the
 keys, users simply relink their mailboxes.
 
+### Administration (local CLI)
+
+`surfski` with no arguments (or `surfski serve`) runs the server; that is what the container's
+`CMD` does. The `admin` subcommands work on the database directly and run only from a shell on the
+host or inside the container. There is no network admin endpoint. They never print refresh
+tokens, ciphertext or keys, and they are safe to run while the server is up.
+
+```bash
+sudo docker compose -p surfski exec app surfski admin list
+```
+
+| Command | What it does |
+|---|---|
+| `admin list [--json]` | Every owner with their mailboxes: alias, address, created / last used, send policy, triage |
+| `admin unlink --owner X --alias Y [--revoke]` | Remove one mailbox (as `unlink_account`). `--revoke` also revokes its token at Google |
+| `admin purge-owner --owner X --yes` | Erase all of one owner's data, exactly as their `delete_my_data` would (revokes at Google; audit rows follow `AUDIT_ON_DELETE`). Without `--yes` nothing is deleted |
+| `admin rotate-token-key [--dry-run]` | Re-encrypt every refresh token with the current key (see below) |
+| `admin audit --owner X [--since 7d\|2026-10-01]` | Audit row counts per tool (ok / failed), never details |
+
+Exit codes: `0` success; `1` refused or failed (unknown owner or alias, missing `--yes`, a failed
+revocation at Google, undecryptable rows during rotation); `2` usage or configuration error. When a
+revocation fails, `unlink` and `purge-owner` have still removed the data.
+
+### Rotating encryption keys
+
+**`TOKEN_ENCRYPTION_KEY`** (Gmail refresh tokens in SQLite). While `TOKEN_ENCRYPTION_KEY_OLD` is set,
+the server decrypts with the new key, then the old one, and always encrypts with the new one, so
+it keeps working during the whole rotation:
+
+1. Generate a key: `python3 scripts/gen_secrets.py` and take its `TOKEN_ENCRYPTION_KEY` line.
+2. In `/etc/surfski/env`, move the current value to `TOKEN_ENCRYPTION_KEY_OLD` and put the new key in
+   `TOKEN_ENCRYPTION_KEY`.
+3. Restart: `sudo docker compose -p surfski up -d` (a plain `restart` doesn't reread the env file).
+4. Rotate: `sudo docker compose -p surfski exec app surfski admin rotate-token-key`. It re-encrypts
+   every row in one SQLite write transaction and reports the counts. If any row can't be decrypted
+   with the new or the old key, it changes nothing, lists the affected owner / alias pairs and exits 1
+   (relink or `admin unlink` those, or supply the right old key, then run it again).
+5. Remove `TOKEN_ENCRYPTION_KEY_OLD` and restart again.
+
+Per-owner keys work the same way with `TOKEN_ENCRYPTION_KEYS_OLD=owner=oldkey,…`. Giving an existing
+owner their own `TOKEN_ENCRYPTION_KEYS` entry is a rotation too: set
+`TOKEN_ENCRYPTION_KEYS_OLD=owner=<the default key>` for it (an owner with a per-owner key never falls
+back to the default key on its own). Removing an owner's entry: set `TOKEN_ENCRYPTION_KEYS_OLD` to
+their former key.
+
+**Backups after a rotation:** older backups still need the old key. Keep the old key with the backups
+it protects until they expire, or take a fresh backup right after rotating.
+
+**`STORAGE_ENCRYPTION_KEY`** (FastMCP's OAuth store under `DATA_DIR/oauth`: Claude's client
+registrations and session tokens). Set `STORAGE_ENCRYPTION_KEY_OLD` to the previous key alongside the
+new one and restart: existing entries stay readable and new ones are written with the new key. There
+is no rewrite command, because that file store has no locking and a rewrite could race the running
+server. When you finally remove `STORAGE_ENCRYPTION_KEY_OLD`, entries still under the old key read as
+missing, so Claude users whose connector registration predates the rotation must reconnect the
+connector (Settings → Connectors). Nothing else is lost: linked mailboxes are in SQLite.
+
 ## Configuration reference
 
 | Variable | Required | Meaning |
@@ -228,6 +284,8 @@ keys, users simply relink their mailboxes.
 | `STATE_SECRET` | yes | HMAC key for single-use linking state (≥32 chars) |
 | `DATA_DIR` | no | Default `/var/lib/surfski`; `/data` in the container |
 | `TOKEN_ENCRYPTION_KEYS` | no | Per-owner Fernet keys `owner=key,owner=key` |
+| `TOKEN_ENCRYPTION_KEY_OLD` / `TOKEN_ENCRYPTION_KEYS_OLD` | no | Previous token key(s), accepted for decryption only during a [rotation](#rotating-encryption-keys) |
+| `STORAGE_ENCRYPTION_KEY_OLD` | no | Previous OAuth store key, accepted for reading only during a [rotation](#rotating-encryption-keys) |
 | `ALLOWED_CLIENT_REDIRECT_URIS` | no | MCP client redirect allowlist. Defaults to Claude's callbacks, plus localhost when `BASE_URL` is localhost |
 | `RATE_LIMIT_PER_MINUTE` | no | Tool calls per owner per minute (default 60) |
 | `SENDING_ENABLED` | no | `true` registers the send tools and `/send/*` pages (default `false`: drafts only) |
@@ -283,7 +341,8 @@ set -a; source ./local.env; set +a; uv run surfski
   filesystem, `cap_drop: ALL` and `no-new-privileges`, and uses its own network.
 - **Docker-published ports bypass host firewalls like `ufw`.** Rely on your cloud firewall or
   security group: open 80/443 only.
-- Every `accounts` query is scoped to the caller. Refresh tokens are Fernet-encrypted at rest.
+- Every `accounts` query a tool makes is scoped to the caller; only the local `surfski admin` CLI reads
+  across owners. Refresh tokens are Fernet-encrypted at rest.
   Access tokens live only in memory.
 - Logs never contain tokens, auth codes or message bodies. Audit rows record the tool, alias and a
   short detail only.
@@ -358,7 +417,9 @@ The triage tools (mark read or unread, star, archive, move to Inbox, user labels
   new token carries exactly those scopes. The human has to sign in to Google **as that mailbox** and
   approve. That out-of-band consent is the owner confirmation; a tool call alone can't turn triage on.
   The server checks that Google really granted `gmail.modify` and that the account that signed in is the
-  linked mailbox. If either check fails, nothing changes. `list_accounts` shows `triage: on|off`, and the
+  linked mailbox. If either check fails, nothing changes. Like `link_account`, the consent link is only as safe as the
+  browser it's opened in: an agent that drives a browser signed in to that Google account could click
+  through the consent for `enable_triage` itself, the same exposure as `link_account`. `list_accounts` shows `triage: on|off`, and the
   scope and switch are rechecked before every triage call.
 - **Turning it off:** `disable_triage(alias)` takes effect at once: the server stops using, and stops
   requesting, `gmail.modify` for that mailbox. The stored Google grant still includes it until you
@@ -368,7 +429,8 @@ The triage tools (mark read or unread, star, archive, move to Inbox, user labels
 Guardrails:
 
 - **Caps:** at most 50 ids per call (`messages.batchModify` for messages; one `threads.modify` per
-  thread) and `TRIAGE_DAILY_CAP` changes per mailbox per 24 h.
+  thread) and `TRIAGE_DAILY_CAP` changes per mailbox per 24 h. If a call fails partway through, the
+  changes already made still count against the cap.
 - **No permanent delete.** `trash` moves mail to Trash, where Gmail keeps it for 30 days, and `untrash`
   restores it. There is no `delete` or `batchDelete` tool, by design.
 - **Labels:** `apply_label` / `remove_label` work only on your own labels, not system ones; reading,
@@ -410,6 +472,8 @@ alias, short detail, never bodies or email addresses). Message content is never 
   with the owner replaced by a keyed hash, the alias blanked and any email address in the detail
   replaced by `<email>` (details are written without addresses in the first place). Other users'
   data is untouched.
+- The operator can do the same for a user from the host with
+  `surfski admin purge-owner --owner <address> --yes` (see [Administration](#administration-local-cli)).
 - Not covered: Claude's MCP session tokens for this server (in the encrypted OAuth store under
   `DATA_DIR/oauth`) expire on their own; remove the connector in Claude to end them at once.
   Backups you made earlier still contain the old data.
