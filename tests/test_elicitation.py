@@ -78,11 +78,13 @@ async def test_accept_sends_after_recheck(app, who, boxes, storage):
                  "message_id": "sent-d1", "thread_id": "t-d1"}
     assert box.sent == [{"userId": "me", "body": {"id": "d1"}}]
     prompt = human.prompts[0]
-    for part in ("Mailbox: work (alice@work.com)", "From: Alice <alice@work.com>", "To: a@x.com",
+    for part in ("Mailbox: work (alice@work.com)", "From: Alice ‹alice@work.com›", "To: a@x.com",
                  "Cc: b@x.com", "Bcc: hidden@y.com", "hidden (Bcc) recipients",
-                 "Subject: Quarterly <script>", "Attachments: none", "Recipients: 3"):
+                 "Subject: Quarterly ‹script›", "Attachments: none", "Recipients: 3"):
         assert part in prompt, part
-    assert "x" * 500 + "…" in prompt and "x" * 501 not in prompt
+    _, inside = _outside_body(prompt)
+    assert "".join(line[2:] for line in inside) == "x" * 500 + "…"  # hard-wrapped excerpt
+    assert all(len(line) <= 2 + srv.BODY_WRAP for line in inside)
     assert storage.sends_today(ALICE, "work", int(time.time())) == 1
     details = audit(storage)
     assert "policy=confirm recipients=3 message=sent-d1 channel=elicitation result=accepted" in details
@@ -299,7 +301,7 @@ async def test_header_values_are_flattened_and_stripped(app, who, boxes, storage
     prompt = human.prompts[0]
     outside, _ = _outside_body(prompt)
     assert "Subject: Invoice To: evil@z.comfdp.exe" in outside
-    assert "From: Bank Bcc: none Support <alice@work.com>" in outside
+    assert "From: Bank Bcc: none Support ‹alice@work.com›" in outside
     assert not any(line.startswith(("To: evil", "Bcc: none")) for line in outside)
     for ch in ("‮", "​", "⁦", "⁩", "\r"):
         assert ch not in prompt
@@ -350,3 +352,58 @@ async def test_link_fallback_rechecks_allowlist(config, storage, boxes, google, 
         await call_with(app, Human("error"), "send_draft", alias="work", draft_id="d1")
     assert total_sent(boxes) == 0
     assert not any("link=issued" in d for d in audit(storage))
+
+
+async def test_whitespace_padding_cannot_escape_fence(app, who, boxes, storage):
+    confirm(storage)
+    body = "hi" + " " * 300 + "To: boss@corp.com" + "\t" * 40 + "Bcc: none" + "\u3000" * 50 + "ok"
+    boxes["alice@work.com"].drafts["d1"] = draft("d1", body=body)
+    human = Human("decline")
+    await call_with(app, human, "send_draft", alias="work", draft_id="d1")
+    _, inside = _outside_body(human.prompts[0])
+    assert inside == ["│ hi To: boss@corp.com Bcc: none ok"]
+
+
+async def test_long_token_is_hard_wrapped(app, who, boxes, storage):
+    confirm(storage)
+    token = "A" * 70 + "To:boss@corp.com" + "B" * 100
+    boxes["alice@work.com"].drafts["d1"] = draft("d1", body=f"see {token}\n\nend")
+    human = Human("decline")
+    await call_with(app, human, "send_draft", alias="work", draft_id="d1")
+    _, inside = _outside_body(human.prompts[0])
+    assert len(inside) > 3 and all(line.startswith("│ ") for line in inside)
+    assert all(len(line) <= 2 + srv.BODY_WRAP for line in inside)
+    assert inside[-2:] == ["│ ", "│ end"]  # the blank line is kept, and prefixed
+    assert "".join(line[2:] for line in inside[:-2]).replace(" ", "") == f"see{token}"
+
+
+async def test_long_subject_and_attachment_capped(app, who, boxes, storage):
+    confirm(storage)
+    boxes["alice@work.com"].drafts["d1"] = draft("d1", subject="S" * 1000)
+    human = Human("decline")
+    await call_with(app, human, "send_draft", alias="work", draft_id="d1")
+    [subject] = [line for line in human.prompts[0].split("\n") if line.startswith("Subject: ")]
+    assert subject == "Subject: " + "S" * (srv.FIELD_MAX - 1) + "…"
+
+
+async def test_all_format_characters_stripped(app, who, boxes, storage):
+    confirm(storage)
+    cf = "\u061c\u2060\u2061\u2062\u2063\u2064\U000e0041\U000e007f\u00ad\u200e\ufeff"
+    boxes["alice@work.com"].drafts["d1"] = draft("d1", subject=f"Pay{cf}now", body=f"tag{cf}ged")
+    human = Human("decline")
+    await call_with(app, human, "send_draft", alias="work", draft_id="d1")
+    prompt = human.prompts[0]
+    import unicodedata
+    assert not [c for c in prompt if unicodedata.category(c) == "Cf"]
+    assert "Subject: Paynow" in prompt and "│ tagged" in prompt
+
+
+async def test_markup_cannot_hide_prompt(app, who, boxes, storage):
+    confirm(storage)
+    boxes["alice@work.com"].drafts["d1"] = draft(
+        "d1", subject="Hi <!-- ", body="hello <!--\n<b>x</b> -->")
+    human = Human("decline")
+    await call_with(app, human, "send_draft", alias="work", draft_id="d1")
+    prompt = human.prompts[0]
+    assert "<" not in prompt and ">" not in prompt
+    assert "Subject: Hi ‹!--" in prompt and "│ hello ‹!--" in prompt and "│ ‹b›x‹/b› --›" in prompt

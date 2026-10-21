@@ -8,6 +8,7 @@ import html
 import logging
 import secrets
 import threading
+import textwrap
 import time
 import unicodedata
 from collections.abc import Callable
@@ -208,28 +209,44 @@ def daily_cap_error(config: Config, alias: str) -> g.GmailError:
     )
 
 
-# Bidi overrides/isolates and zero-width characters can reorder or hide text in a prompt.
-_INVISIBLE = dict.fromkeys(
-    [*range(0x200B, 0x2010), *range(0x202A, 0x202F), *range(0x2066, 0x206A), 0xFEFF, 0x00AD]
-)
 _LINE_BREAKS = ("\r\n", "\r", "\x85", "\u2028", "\u2029", "\x0b", "\x0c")
+# Elicitation prompt layout: body lines are hard-wrapped so a client's soft wrap can't
+# start a visual line without the fence prefix; free-text header values are capped.
+BODY_WRAP = 76
+FIELD_MAX = 200
+
+
+def _visible(c: str) -> bool:
+    # Cf = format characters: bidi controls, zero-width, word joiners, tag characters...
+    return unicodedata.category(c) != "Cf"
 
 
 def clean_field(value: str) -> str:
     """One display line from an untrusted header value: no line breaks or other control
-    characters (they could forge extra summary rows), no bidi/zero-width characters."""
-    value = (value or "").translate(_INVISIBLE)
+    characters (they could forge extra summary rows), no format (Cf) characters."""
+    value = "".join(c for c in (value or "") if _visible(c))
     value = "".join(" " if unicodedata.category(c) in ("Cc", "Zl", "Zp") else c for c in value)
     return " ".join(value.split())
 
 
 def clean_body(text: str) -> str:
-    """Untrusted body text, keeping line breaks but nothing that can hide or reorder text."""
-    text = (text or "").translate(_INVISIBLE)
+    """Untrusted body text: line breaks kept, every whitespace run inside a line collapsed
+    to one space (padding can't push text onto its own visual line), no control or
+    format characters."""
+    text = "".join(c for c in (text or "") if _visible(c))
     for br in _LINE_BREAKS:
         text = text.replace(br, "\n")
-    text = text.replace("\t", "    ")
-    return "".join(c for c in text if c == "\n" or unicodedata.category(c) != "Cc")
+    text = "".join(c if c == "\n" or unicodedata.category(c) != "Cc" else " " for c in text)
+    return "\n".join(" ".join(line.split()) for line in text.split("\n"))
+
+
+def _no_markup(value: str) -> str:
+    # A Markdown/HTML-rendering client could hide the rest of the prompt behind "<!--".
+    return value.replace("<", "‹").replace(">", "›")
+
+
+def _cap(value: str, limit: int = FIELD_MAX) -> str:
+    return value if len(value) <= limit else value[: limit - 1] + "…"
 
 
 def confirm_summary(acct, info: dict, recipients: list[str]) -> tuple[list[tuple[str, str]], bool, str]:
@@ -275,11 +292,16 @@ def confirm_message(acct, info: dict, recipients: list[str]) -> str:
     counts = recipient_counts(info)
     bcc_warning = "WARNING: this email has hidden (Bcc) recipients."
     lines = ["Send this email from your Gmail account? It can't be undone.", ""]
-    lines += [f"{k}: {v or '-'}" for k, v in rows]
+    for k, v in rows:
+        if k in ("From", "Subject", "Attachments"):  # free text, not checked addresses
+            v = _cap(v)
+        lines.append(f"{k}: {_no_markup(v) or '-'}")
     if has_bcc:
         lines += [bcc_warning]
     lines += ["", f"Message (first {PREVIEW_CHARS} characters):", BODY_BEGIN]
-    lines += ["│ " + line for line in preview.split("\n")]
+    for line in _no_markup(preview).split("\n"):
+        pieces = textwrap.wrap(line, BODY_WRAP, break_long_words=True, break_on_hyphens=False)
+        lines += ["│ " + piece for piece in pieces or [""]]
     lines += [BODY_END, "",
               f"Summary (from the server): sends to {len(recipients)} recipient(s): "
               f"To {counts['to']}, Cc {counts['cc']}, Bcc {counts['bcc']}."]
