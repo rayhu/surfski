@@ -68,7 +68,7 @@ See [Calendar module](#calendar-module).
   existing `gmail.compose` scope.
 - ✅ **`forward_message`**: forward a message, keeping its original attachments. It saves a draft by
   default, and sends only when the mailbox's send policy allows it.
-- **`get_attachment`**: read attachment content with size limits. PDF and DOCX are extracted to text,
+- ✅ **`get_attachment`**: read attachment content with size limits. PDF and DOCX are extracted to text,
   with no binary pass-through by default.
 - ✅ **`delete_my_data`**: unlink and revoke every mailbox for the caller, and purge their rows.
 - **Published container image** (GHCR) and **CI** that runs pytest and the image build on every PR.

@@ -64,6 +64,7 @@ class Config:
     allowed_recipient_domains: frozenset[str] = frozenset()
     # delete_my_data: "delete" the caller's audit rows, or keep them "pseudonymize"d.
     audit_on_delete: str = "delete"
+    attachment_max_bytes: int = 15 * 1024 * 1024
 
     @property
     def send_auth_redirect_uri(self) -> str:
@@ -145,6 +146,12 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         d.strip().lower().lstrip("@") for d in env.get("ALLOWED_RECIPIENT_DOMAINS", "").split(",") if d.strip()
     )
 
+    try:
+        attachment_mb = float(env.get("ATTACHMENT_MAX_MB", "15"))
+    except ValueError as e:
+        raise ConfigError("ATTACHMENT_MAX_MB must be a number") from e
+    if not 0 < attachment_mb <= 25:
+        raise ConfigError("ATTACHMENT_MAX_MB must be between 0 and 25")
     audit_on_delete = env.get("AUDIT_ON_DELETE", "delete").strip().lower() or "delete"
     if audit_on_delete not in ("delete", "pseudonymize"):
         raise ConfigError("AUDIT_ON_DELETE must be delete or pseudonymize")
@@ -170,4 +177,5 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         send_max_recipients=max_recipients,
         allowed_recipient_domains=domains,
         audit_on_delete=audit_on_delete,
+        attachment_max_bytes=int(attachment_mb * 1024 * 1024),
     )

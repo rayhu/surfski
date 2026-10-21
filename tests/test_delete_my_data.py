@@ -184,7 +184,7 @@ async def test_pseudonymized_audit_has_no_email_anywhere(config, storage, revoke
 
 def test_audit_details_never_store_emails(storage):
     storage.audit(ALICE, "x", "work", "linked bob@x.com and 'carol@y.org'", True)
-    assert storage.audit_rows(ALICE)[-1]["detail"] == "linked <email> and '<email>'"
+    assert storage.audit_rows(ALICE)[-1]["detail"] == "linked <email> and <email>"
 
 
 async def test_no_audit_row_for_account_purged_mid_call(config, storage, who):

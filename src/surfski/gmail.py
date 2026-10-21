@@ -240,6 +240,9 @@ def extract_attachments(payload: dict) -> list[dict]:
                     "filename": part.get("filename") or "",
                     "mime_type": part.get("mimeType"),
                     "size": (part.get("body") or {}).get("size", 0),
+                    # part_id is stable; Gmail may issue a new attachmentId per fetch.
+                    "part_id": part.get("partId"),
+                    "attachment_id": (part.get("body") or {}).get("attachmentId"),
                 }
             )
     return out
@@ -887,6 +890,59 @@ def op_draft_message_id(svc, draft_id: str) -> str | None:
 def op_send_draft(svc, draft_id: str) -> dict:
     sent = svc.users().drafts().send(userId="me", body={"id": draft_id}).execute()
     return {"message_id": sent.get("id"), "thread_id": sent.get("threadId")}
+
+
+def find_attachment(payload: dict, ref: str) -> dict:
+    """Resolve an attachment part by attachmentId, partId or exact filename."""
+    parts = [p for p in _walk(payload) if _is_attachment(p)]
+    ref = (ref or "").strip()
+    for key in (lambda p: (p.get("body") or {}).get("attachmentId"), lambda p: p.get("partId")):
+        hit = [p for p in parts if ref and key(p) == ref]
+        if hit:
+            return hit[0]
+    by_name = [p for p in parts if (p.get("filename") or "") == ref]
+    if not by_name:
+        by_name = [p for p in parts if (p.get("filename") or "").lower() == ref.lower() and ref]
+    if len(by_name) == 1:
+        return by_name[0]
+    listing = "; ".join(
+        f"{p.get('filename') or '(unnamed)'} [part_id {p.get('partId')}, {p.get('mimeType')}, "
+        f"{(p.get('body') or {}).get('size', 0)} bytes]"
+        for p in (by_name or parts)
+    )
+    if by_name:
+        raise GmailError(f"{len(by_name)} attachments are named '{ref}'; pass a part_id instead: {listing}")
+    raise GmailError(f"no attachment '{ref}' in this message. Attachments: {listing or 'none'}")
+
+
+def op_get_attachment_bytes(svc, message_id: str, ref: str, max_bytes: int) -> tuple[dict, bytes]:
+    """(part metadata, raw bytes). The size limit is checked from body.size before
+    anything is downloaded."""
+    users = svc.users()
+    msg = users.messages().get(userId="me", id=message_id, format="full").execute()
+    part = find_attachment(msg.get("payload") or {}, ref)
+    body = part.get("body") or {}
+    size = int(body.get("size") or 0)
+    name = part.get("filename") or ""
+    meta = {"filename": name, "mime_type": part.get("mimeType") or "", "size": size,
+            "part_id": part.get("partId"), "charset": _charset(part) if part.get("headers") else None}
+    if size > max_bytes:
+        raise GmailError(
+            f"attachment is {size / (1024 * 1024):.1f} MB, over this server's "
+            f"{max_bytes / (1024 * 1024):.0f} MB limit; open it in Gmail instead"
+        )
+    data = body.get("data")
+    if not data and body.get("attachmentId"):
+        data = (
+            users.messages().attachments()
+            .get(userId="me", messageId=message_id, id=body["attachmentId"])
+            .execute()
+            .get("data")
+        )
+    raw = _decode_b64(data or "")
+    if len(raw) > max_bytes:  # body.size was wrong
+        raise GmailError("attachment is over this server's size limit; open it in Gmail instead")
+    return meta, raw
 
 
 def op_delete_draft(svc, draft_id: str) -> dict:

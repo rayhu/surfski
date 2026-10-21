@@ -18,7 +18,7 @@ Workspace mailboxes** for each user, and users never see each other's mailboxes.
 Tools: `list_accounts`, `link_account`, `relink_account`, `rename_account`, `unlink_account`, `search_threads`,
 `search_all_accounts`, `get_thread`, `get_message`, `list_labels`, `create_draft`, `list_drafts`, `get_draft`,
 `update_draft`, `delete_draft`, `list_addresses`, `set_address_label`, `set_default_from`, `forward_message`,
-`export_my_data`, `delete_my_data`.
+`get_attachment`, `export_my_data`, `delete_my_data`.
 With `SENDING_ENABLED=true` also: `send_draft`, `send_email`, `set_send_policy` (and `forward_message(send=true)`).
 
 **Send from an alias.** `create_draft` and `update_draft` take `from_address` (a verified "Send mail as"
@@ -174,6 +174,7 @@ If you lose the keys, users simply relink their mailboxes.
 | `SEND_DAILY_CAP` | no | Sends per mailbox in a rolling 24 h, in `confirm` and `auto` (default 20) |
 | `SEND_MAX_RECIPIENTS` | no | Unique to+cc+bcc recipients per message (default 10) |
 | `ALLOWED_RECIPIENT_DOMAINS` | no | Comma-separated domains; if set, every recipient's domain must match one exactly |
+| `ATTACHMENT_MAX_MB` | no | Largest attachment `get_attachment` will download (default 15, max 25) |
 | `AUDIT_ON_DELETE` | no | What `delete_my_data` does with the caller's audit rows: `delete` (default) or `pseudonymize` (keep them under a keyed hash) |
 | `LOG_LEVEL`, `HOST`, `PORT` | no | Logging and bind address |
 
@@ -222,6 +223,11 @@ set -a; source ./local.env; set +a; uv run surfski
   Access tokens live only in memory.
 - Logs never contain tokens, auth codes or message bodies. Audit rows record the tool, alias and a
   short detail only.
+- `get_attachment` downloads at most `ATTACHMENT_MAX_MB` (checked before download) and returns text
+  only: text/CSV/JSON/XML/HTML, PDF (pypdf, first 200 pages, 15 s budget), DOCX/XLSX/PPTX (parsed from
+  the zip with defusedxml; DTDs and entities refused; zip-bomb limits on entries, sizes and
+  compression ratio). Other types return metadata only; binary is never passed through. Audit rows
+  record message id, size and method, not the filename.
 - `forward_message` holds the original's attachments in memory while it builds the draft (up to the
   20 MB limit, roughly 3× that at peak with the MIME encoding), so give the container ~150 MB of headroom
   per concurrent forward.

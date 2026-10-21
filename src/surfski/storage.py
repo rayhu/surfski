@@ -17,11 +17,10 @@ from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 
 ALIAS_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
-EMAIL_RE = re.compile(r"[^\s@<>()\[\],;:\"']+@[^\s@<>()\[\],;:\"']+")
-
-
 def scrub_emails(text: str) -> str:
-    return EMAIL_RE.sub("<email>", text or "")
+    """Redact every whitespace-separated token containing '@' or full-width '＠'.
+    Cruder than an address regex, but nothing address-like can slip through."""
+    return re.sub(r"\S*[@＠]\S*", "<email>", text or "")
 LABEL_RE = ALIAS_RE
 
 SCHEMA = """
