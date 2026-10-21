@@ -200,6 +200,10 @@ If you want to run this as a service for people outside your own team:
 - you need multi-tenant features such as self-signup, data deletion and billing. These are
   tracked in [ROADMAP.md](ROADMAP.md).
 
+One exception: Google Workspace organizations can register their **own Internal OAuth client**
+and use it with a hosted instance. Internal apps don't need verification. See
+[Deployment models](ROADMAP.md#deployment-models).
+
 ## License
 
 [MIT](LICENSE)

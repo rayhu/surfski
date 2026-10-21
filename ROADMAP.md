@@ -3,6 +3,50 @@
 The order of focus is **self-hosting first**, then **multi-tenant hosting later**. Each item becomes a
 GitHub issue. A ✅ marks shipped items.
 
+## Deployment models
+
+Two questions decide what Google requires: **whose server** runs Surfski, and **whose Google OAuth
+client** users grant access to.
+
+| Model | Server | Google OAuth client | Tenant of the hosted service? | Google verification / CASA |
+|---|---|---|---|---|
+| **Self-hosted** | The user's own (VPS, EC2, NAS…) | The user's own GCP project | No. They just use the open-source code | Not needed while the app stays under Google's 100-user cap |
+| **Hosted, bring-your-own OAuth client** (Workspace orgs) | The hosted service | The **customer's**, with user type *Internal* | Yes | Internal apps are exempt from verification. The service still processes their mail, so security and DPA obligations apply |
+| **Hosted, shared OAuth client** | The hosted service | The hosted service's own | Yes | Up to 100 users unverified (invite-only beta). Any public launch needs **OAuth verification + an annual CASA assessment** |
+
+There is no way around restricted scopes for reading mail. `gmail.readonly` (and `gmail.compose`)
+are restricted, so a server that reads other people's mail through **its own** client needs CASA
+once it goes public.
+
+## Hosting path
+
+1. **Now: self-hosting.** Docs and README focus on running your own instance. No CASA.
+2. **Invite-only hosted beta** on the shared client, kept under the 100-user lifetime cap. The point is
+   to validate demand and pricing. Users see the "unverified app" warning, and Google may suspend
+   unverified apps that are offered publicly, so this is not a commercial launch.
+3. **Hosted for Workspace organizations with bring-your-own OAuth client.** Each tenant registers an
+   Internal OAuth client in its own GCP project, and the hosted service uses it for that tenant.
+   This needs no verification or CASA on our side. Personal Gmail accounts aren't supported here,
+   because they have no Internal user type.
+4. **Public self-serve hosting** on the shared client. Do this only once revenue covers it, because
+   it requires Google OAuth verification plus an annual CASA assessment.
+
+### Infrastructure
+
+- **surfski.io** is a static marketing and docs site on Cloudflare Pages (Astro + Starlight, i18n),
+  kept in a separate private repo. It has no auth and no user data.
+- **app.surfski.io** is this Python server: it serves `/mcp`, the OAuth callbacks, the confirmation
+  pages and the future user dashboard, all on one origin. It is deployed only when the hosted beta starts:
+  - on a **dedicated** host, not shared with unrelated workloads. This limits the blast radius and
+    keeps CASA scope small. A small EC2 instance running Docker Compose and Caddy is the starting
+    point, ideally in a **separate AWS account**;
+  - DNS-only (unproxied), so the reverse proxy issues its own certificates and long-lived MCP
+    streams aren't buffered or timed out by a CDN proxy;
+  - later, when Postgres and multiple replicas land, it can move to containers on a managed platform
+    (for example ECS Fargate with RDS).
+- Serverless runtimes (Lambda, Workers) don't fit. The server is Python, holds long-lived SSE
+  streams, and uses local disk today.
+
 ## Phase 1: self-host essentials
 
 - ✅ **`rename_account(old_alias, new_alias)`**: rename an alias in place, scoped to the owner, with no re-auth.
@@ -28,14 +72,27 @@ GitHub issue. A ✅ marks shipped items.
 
 ## Phase 3: multi-tenant hosting
 
-- A tenant model (organization → users) with self-signup and invitations, replacing the env allowlist.
+Follows the [hosting path](#hosting-path) above.
+
+**3a. Invite-only beta** (shared client, at most 100 users)
+- A tenant model (organization → users) with invitations, replacing the env allowlist.
+- `delete_my_data`, data export, and a privacy policy and terms specific to mailbox data.
+- A dedicated host for app.surfski.io (see [Infrastructure](#infrastructure)), with backups and
+  monitoring.
+
+**3b. Bring-your-own OAuth client for Workspace organizations**
+- Per-tenant Google OAuth clients: store each tenant's client ID and secret encrypted, and route a
+  tenant's login and mailbox linking through its own client and redirect URIs.
+- An onboarding guide for the customer's admin: create a GCP project, enable the Gmail API, add an
+  Internal consent screen, create a Web client, and paste the credentials.
 - Per-tenant encryption keys (envelope encryption, optional cloud KMS).
+- A data processing agreement (DPA) template.
+
+**3c. Public self-serve hosting**
+- Self-signup, quotas, abuse controls and billing.
 - **Postgres** for accounts and audit, plus a shared OAuth client store, so it can run more than one replica.
-- Quotas, abuse controls, billing.
-- Data export and deletion, a privacy policy and terms specific to mailbox data, and Google API
-  Services User Data Policy (Limited Use) compliance.
-- **Google OAuth verification + annual CASA assessment** for restricted Gmail scopes. You need this
-  before any public offering, because unverified apps are capped at 100 users over their lifetime.
+- **Google OAuth verification + annual CASA assessment** for restricted Gmail scopes, and Google
+  API Services User Data Policy (Limited Use) compliance.
 - A status page, support and incident process.
 
 ---
