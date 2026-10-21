@@ -32,6 +32,8 @@ def gmail_discovery() -> dict:
 def _validate(path: str, method: dict, kwargs: dict) -> None:
     params = method.get("parameters", {})
     allowed = set(params) | ({"body"} if method.get("request") else set())
+    if method.get("mediaUpload"):
+        allowed |= {"media_body", "media_mime_type"}
     for k in kwargs:
         if k not in allowed:
             raise TypeError(f'Got an unexpected keyword argument {k}')
