@@ -160,3 +160,41 @@ def test_audit_on_delete_config(tmp_path):
     assert load_config(make_env(tmp_path, AUDIT_ON_DELETE="Pseudonymize")).audit_on_delete == "pseudonymize"
     with pytest.raises(ConfigError):
         load_config(make_env(tmp_path, AUDIT_ON_DELETE="keep"))
+
+
+async def test_pseudonymized_audit_has_no_email_anywhere(config, storage, revoker, who):
+    populate(storage)
+    # Legacy rows written before details were scrubbed, with addresses in detail and alias.
+    storage._conn.executemany(
+        "INSERT INTO audit_log (ts, owner, tool, alias, detail, ok) VALUES ('t', ?, 'gmail_callback', ?, ?, 1)",
+        [(ALICE, "a@work.com", "linked a@work.com"), (ALICE, "work", "to <Carol.X+tag@sub.example.co.uk>, x")],
+    )
+    storage._conn.commit()
+    app = create_app(replace(config, audit_on_delete="pseudonymize"), storage=storage,
+                     with_auth=False, http_factory=revoker.factory)
+    await call(app, "delete_my_data", confirm="DELETE")
+    rows = storage._conn.execute(
+        "SELECT owner, alias, detail FROM audit_log WHERE owner LIKE 'deleted-%'").fetchall()
+    assert rows
+    for owner, alias, detail in rows:
+        assert alias is None
+        assert "@" not in owner and "@" not in (detail or ""), detail
+    assert any("<email>" in (d or "") for _, _, d in rows)
+
+
+def test_audit_details_never_store_emails(storage):
+    storage.audit(ALICE, "x", "work", "linked bob@x.com and 'carol@y.org'", True)
+    assert storage.audit_rows(ALICE)[-1]["detail"] == "linked <email> and '<email>'"
+
+
+async def test_no_audit_row_for_account_purged_mid_call(config, storage, who):
+    storage.upsert_account(ALICE, "work", "a@work.com", "rt", "s")
+
+    def factory(owner, alias):
+        storage.purge_owner(owner)  # delete_my_data lands while the Gmail call runs
+        from .fakes import StrictGmail
+        return StrictGmail({"users.labels.list": lambda **kw: {"labels": []}})
+
+    app = create_app(config, storage=storage, with_auth=False, service_factory=factory)
+    assert await call(app, "list_labels", alias="work") == []
+    assert storage.audit_rows(ALICE) == []

@@ -14,7 +14,10 @@ uv run pytest
 - **Tests must not call Google.** Mock the Gmail service and the token endpoints (see `tests/`).
 - **Owner isolation is the core invariant.** Every query on `accounts` must filter by the caller.
   A PR that adds a data path needs a test proving owner A can't reach owner B.
-- **No secrets, tokens, auth codes or message bodies in logs or audit rows.**
+- **No secrets, tokens, auth codes, email addresses or message bodies in logs or audit rows.**
+- **Per-user data lives in columns named `owner`.** `delete_my_data` purges the tables in
+  `Storage.OWNER_TABLES`, and a test checks that list against every table with an `owner` column.
+  A new table keyed by user under another column name would silently escape deletion.
 - Write-capable features (sending, labels, deleting) must be **opt-in** and default to off.
 - Match the existing style. Keep dependencies minimal.
 

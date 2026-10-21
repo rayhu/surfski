@@ -306,10 +306,13 @@ def create_app(
                 err = g.map_google_error(e, acct.alias)
             if "relink" in str(err):
                 token_cache.drop(owner, acct.alias)
-            write_audit(storage, owner, tool, acct.alias, f"{detail} err={type(e).__name__}", False)
+            if storage.account_exists(owner, acct.alias):
+                write_audit(storage, owner, tool, acct.alias, f"{detail} err={type(e).__name__}", False)
             raise ToolError(str(err)) from None
-        storage.touch_account(owner, acct.alias)
-        write_audit(storage, owner, tool, acct.alias, detail, True)
+        # If the account vanished mid-call (delete_my_data / unlink), don't re-create an
+        # audit trail for it.
+        if storage.touch_account(owner, acct.alias):
+            write_audit(storage, owner, tool, acct.alias, detail, True)
         return result
 
     def identities(owner: str, alias: str, svc, refresh: bool = False) -> list[dict]:
@@ -607,14 +610,13 @@ def create_app(
         owner = require_owner("delete_my_data")
         if confirm != "DELETE":
             raise ToolError('nothing deleted: pass confirm="DELETE" to erase all your data')
-        tokens = storage.refresh_tokens_for(owner)
         pseudonym = None
         if config.audit_on_delete == "pseudonymize":
             digest = hmac.new(config.state_secret, b"audit-pseudonym:" + owner.encode(), hashlib.sha256)
             pseudonym = "deleted-" + digest.hexdigest()[:16]
         # Purge first (one transaction), then revoke with the tokens held in memory: the
         # data is gone even if Google is slow or down.
-        counts = storage.purge_owner(owner, pseudonym)
+        counts, tokens = storage.purge_owner(owner, pseudonym)
         token_cache.drop_owner(owner)
         send_as_cache.drop_owner(owner)
         revoked: dict[str, Any] = {}
@@ -1105,7 +1107,7 @@ def create_app(
         except Exception:
             log.exception("gmail link failed unexpectedly")
             return _page("Linking failed", "Unexpected error; ask Claude to start linking again.", 500)
-        write_audit(storage, owner, "gmail_callback", alias, f"linked {email}", True)
+        write_audit(storage, owner, "gmail_callback", alias, "linked", True)
         return _page("Linked ✓", f"Linked {email} as '{alias}'. You can close this tab.")
 
     if config.sending_enabled:

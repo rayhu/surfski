@@ -164,6 +164,8 @@ async def test_link_flow_end_to_end(config, storage, who):
     assert resp.status_code == 200 and "Linked" in resp.text and "alice.work@corp.com" in resp.text
     assert seen["token_form"]["code_verifier"][0]
     assert storage.get_refresh_token(ALICE, "corp") == "rt-new"
+    row = [r for r in storage.audit_rows(ALICE) if r["tool"] == "gmail_callback"][-1]
+    assert row["detail"] == "linked" and "@" not in row["detail"]
 
     # replay is rejected
     resp = web.get("/gmail/callback", params={"code": "c0de", "state": state})

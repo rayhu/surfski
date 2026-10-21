@@ -17,6 +17,11 @@ from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 
 ALIAS_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+EMAIL_RE = re.compile(r"[^\s@<>()\[\],;:\"']+@[^\s@<>()\[\],;:\"']+")
+
+
+def scrub_emails(text: str) -> str:
+    return EMAIL_RE.sub("<email>", text or "")
 LABEL_RE = ALIAS_RE
 
 SCHEMA = """
@@ -265,12 +270,20 @@ class Storage:
             )
         return self.cipher.decrypt(owner, row["refresh_token_enc"])
 
-    def touch_account(self, owner: str, alias: str) -> None:
+    def account_exists(self, owner: str, alias: str) -> bool:
         with self._tx() as c:
-            c.execute(
+            return c.execute(
+                "SELECT 1 FROM accounts WHERE owner = ? AND alias = ?", (owner.lower(), alias)
+            ).fetchone() is not None
+
+    def touch_account(self, owner: str, alias: str) -> bool:
+        """Update last_used_at; False if the account no longer exists."""
+        with self._tx() as c:
+            cur = c.execute(
                 "UPDATE accounts SET last_used_at = ? WHERE owner = ? AND alias = ?",
                 (now_iso(), owner.lower(), alias),
             )
+        return cur.rowcount > 0
 
     def delete_account(self, owner: str, alias: str) -> bool:
         alias = validate_alias(alias)
@@ -490,35 +503,48 @@ class Storage:
 
     # Every table with an owner column. tests/test_delete_my_data.py checks this
     # list against the live schema so a new owner-keyed table can't be forgotten.
+    # That guard only works if the column is literally named `owner`: any new table
+    # holding per-user data must use that name (see CONTRIBUTING.md).
     OWNER_TABLES = ("accounts", "address_labels", "pending_links", "action_tokens",
                     "owner_sessions", "sends", "audit_log")
 
-    def refresh_tokens_for(self, owner: str) -> list[tuple[str, str | None]]:
-        """[(alias, refresh_token or None if it can't be decrypted)]"""
-        out: list[tuple[str, str | None]] = []
-        for a in self.list_accounts(owner):
-            try:
-                out.append((a.alias, self.get_refresh_token(owner, a.alias)))
-            except StorageError:
-                out.append((a.alias, None))
-        return out
+    def purge_owner(
+        self, owner: str, audit_pseudonym: str | None = None
+    ) -> tuple[dict[str, int], list[tuple[str, str | None]]]:
+        """Delete every row of this owner in one transaction and return
+        (counts per table, [(alias, refresh token or None if undecryptable)]). The tokens
+        are read in the same transaction, so a link completing concurrently is either
+        purged and returned for revocation, or created after the purge.
 
-    def purge_owner(self, owner: str, audit_pseudonym: str | None = None) -> dict[str, int]:
-        """Delete every row of this owner in one transaction. With audit_pseudonym the
-        audit rows are kept but re-keyed to it; otherwise they are deleted."""
+        With audit_pseudonym the audit rows are kept, re-keyed to it, with alias blanked
+        and any email address in detail replaced; otherwise they are deleted."""
         owner = owner.lower()
         counts: dict[str, int] = {}
+        tokens: list[tuple[str, str | None]] = []
         with self._tx() as c:
+            for row in c.execute(
+                "SELECT alias, refresh_token_enc FROM accounts WHERE owner = ? ORDER BY alias", (owner,)
+            ).fetchall():
+                try:
+                    tokens.append((row["alias"], self.cipher.decrypt(owner, row["refresh_token_enc"])))
+                except StorageError:
+                    tokens.append((row["alias"], None))
             for table in self.OWNER_TABLES:
                 if table == "audit_log" and audit_pseudonym:
-                    counts[table] = c.execute(
-                        "UPDATE audit_log SET owner = ? WHERE lower(owner) = ?", (audit_pseudonym, owner)
-                    ).rowcount
+                    rows = c.execute(
+                        "SELECT rowid, detail FROM audit_log WHERE lower(owner) = ?", (owner,)
+                    ).fetchall()
+                    for r in rows:
+                        c.execute(
+                            "UPDATE audit_log SET owner = ?, alias = NULL, detail = ? WHERE rowid = ?",
+                            (audit_pseudonym, scrub_emails(r["detail"]), r["rowid"]),
+                        )
+                    counts[table] = len(rows)
                 else:
                     counts[table] = c.execute(
                         f"DELETE FROM {table} WHERE lower(owner) = ?", (owner,)
                     ).rowcount
-        return counts
+        return counts, tokens
 
     # ---- pending links ----
 
@@ -556,7 +582,8 @@ class Storage:
         with self._tx() as c:
             c.execute(
                 "INSERT INTO audit_log (ts, owner, tool, alias, detail, ok) VALUES (?, ?, ?, ?, ?, ?)",
-                (now_iso(), owner, tool, alias, detail[:300], 1 if ok else 0),
+                # Belt and braces: audit details never carry email addresses.
+                (now_iso(), owner, tool, alias, scrub_emails(detail)[:300], 1 if ok else 0),
             )
 
     def audit_rows(self, owner: str) -> list[dict]:

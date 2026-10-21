@@ -264,14 +264,16 @@ that tells Claude to forward something to an attacker):
 What the server stores per Claude user (the "owner"): linked mailboxes (alias, address, encrypted
 refresh token, scopes, timestamps), address labels, default From, send policy, pending link and
 confirmation nonces, send counts for the daily cap, `/send` browser sessions, and audit rows (tool,
-alias, short detail, never bodies or recipients). Message content is never stored.
+alias, short detail, never bodies or email addresses). Message content is never stored.
 
 - **`export_my_data`** returns all of it except tokens.
 - **`delete_my_data(confirm="DELETE")`** erases every row above for the caller in one transaction,
   clears their in-memory caches, then revokes each mailbox's token at Google (best effort; the result
   is reported per alias, and a failed one can be removed at https://myaccount.google.com/permissions).
-  Audit rows are deleted by default; set `AUDIT_ON_DELETE=pseudonymize` to keep them under an
-  unlinkable keyed hash instead. Other users' data is untouched.
+  Audit rows are deleted by default; set `AUDIT_ON_DELETE=pseudonymize` to keep them instead,
+  with the owner replaced by a keyed hash, the alias blanked and any email address in the detail
+  replaced by `<email>` (details are written without addresses in the first place). Other users'
+  data is untouched.
 - Not covered: Claude's MCP session tokens for this server (in the encrypted OAuth store under
   `DATA_DIR/oauth`) expire on their own; remove the connector in Claude to end them at once.
   Backups you made earlier still contain the old data.
