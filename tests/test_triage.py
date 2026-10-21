@@ -2,6 +2,7 @@
 Google re-consent, label/read/star/archive/trash tools, caps, label name validation,
 owner isolation and audit. Gmail is a discovery-validated StrictGmail."""
 
+import time
 from dataclasses import replace
 from urllib.parse import parse_qs, urlparse
 
@@ -36,6 +37,7 @@ class Box:
     def __init__(self):
         self.labels = [dict(lb) for lb in LABELS]
         self.fail = None
+        self.fail_after = None  # per-id calls (threads.modify, trash) fail after this many
         self.svc = None
 
     def service(self):
@@ -49,7 +51,13 @@ class Box:
             self.labels.append(lb)
             return lb
 
-        ok = lambda **kw: {"id": kw.get("id")}  # noqa: E731
+        done = [0]
+
+        def ok(**kw):
+            if self.fail_after is not None and done[0] >= self.fail_after:
+                raise HttpError(httplib2.Response({"status": 500}), b"boom")
+            done[0] += 1
+            return {"id": kw.get("id")}
         self.svc = StrictGmail({
             "users.messages.batchModify": batch,
             "users.threads.modify": ok,
@@ -228,6 +236,32 @@ async def test_daily_cap(config, storage, boxes, accounts, who):
     storage.upsert_account(ALICE, "personal", "alice@gmail.com", "rt", WITH_MODIFY)
     storage.set_triage(ALICE, "personal", True)
     await call(app, "star", alias="personal", message_ids=["m1"])
+
+
+@pytest.mark.parametrize("tool", ["archive", "trash", "apply_label"])
+async def test_partial_failure_keeps_applied_part_of_cap(config, storage, boxes, accounts, who, tool):
+    """A thread loop failing on the 3rd of 5 ids made 2 real changes: they stay counted."""
+    app = make(config, storage, boxes, triage_enabled=True)
+    boxes["alice@work.com"].fail_after = 2
+    extra = {"label": "Receipts"} if tool == "apply_label" else {}
+    with pytest.raises(ToolError):
+        await call(app, tool, alias="work", thread_ids=[f"t{i}" for i in range(5)], **extra)
+    assert storage.modifications_today(ALICE, "work", int(time.time())) == 2
+    # Failing on the very first id releases the whole reservation.
+    boxes["alice@work.com"].fail_after = 0
+    with pytest.raises(ToolError):
+        await call(app, tool, alias="work", thread_ids=[f"t{i}" for i in range(5)], **extra)
+    assert storage.modifications_today(ALICE, "work", int(time.time())) == 2
+
+
+def test_settle_modifications(storage):
+    rid = storage.reserve_modifications(ALICE, "work", 5, 100, 1000)
+    storage.settle_modifications(rid, 3)
+    assert storage.modifications_today(ALICE, "work", 1000) == 3
+    storage.settle_modifications(rid, 9)  # never grows
+    assert storage.modifications_today(ALICE, "work", 1000) == 3
+    storage.settle_modifications(rid, 0)
+    assert storage.modifications_today(ALICE, "work", 1000) == 0
 
 
 # ---------------------------------------------------------------- labels

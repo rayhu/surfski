@@ -67,6 +67,10 @@ class Config:
     storage_encryption_key: str
     token_encryption_key: str
     token_encryption_keys: dict[str, str] = field(default_factory=dict)
+    # Previous keys, accepted for decryption only while a rotation is in progress (#7).
+    token_encryption_key_old: str | None = None
+    token_encryption_keys_old: dict[str, str] = field(default_factory=dict)
+    storage_encryption_key_old: str | None = None
     # Whole Google Workspace domains whose (primary) addresses may use the server (#6).
     allowed_domains: frozenset[str] = frozenset()
     state_secret: bytes = b""
@@ -152,6 +156,20 @@ def parse_allowed_domains(raw: str) -> frozenset[str]:
     return frozenset(out)
 
 
+def _per_owner_keys(env: dict[str, str], name: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for pair in env.get(name, "").split(","):
+        if not pair.strip():
+            continue
+        if "=" not in pair:
+            raise ConfigError(f"{name} must be owner=key,owner=key")
+        owner, key = pair.split("=", 1)
+        owner = owner.strip().lower()
+        _validate_fernet_key(f"{name}[{owner}]", key.strip())
+        out[owner] = key.strip()
+    return out
+
+
 def load_config(env: dict[str, str] | None = None) -> Config:
     env = dict(os.environ if env is None else env)
     missing = [k for k in REQUIRED if not env.get(k, "").strip()]
@@ -181,16 +199,13 @@ def load_config(env: dict[str, str] | None = None) -> Config:
     _validate_fernet_key("STORAGE_ENCRYPTION_KEY", env["STORAGE_ENCRYPTION_KEY"])
     _validate_fernet_key("TOKEN_ENCRYPTION_KEY", env["TOKEN_ENCRYPTION_KEY"])
 
-    per_owner: dict[str, str] = {}
-    for pair in env.get("TOKEN_ENCRYPTION_KEYS", "").split(","):
-        if not pair.strip():
-            continue
-        if "=" not in pair:
-            raise ConfigError("TOKEN_ENCRYPTION_KEYS must be owner=key,owner=key")
-        owner, key = pair.split("=", 1)
-        owner = owner.strip().lower()
-        _validate_fernet_key(f"TOKEN_ENCRYPTION_KEYS[{owner}]", key.strip())
-        per_owner[owner] = key.strip()
+    per_owner = _per_owner_keys(env, "TOKEN_ENCRYPTION_KEYS")
+    per_owner_old = _per_owner_keys(env, "TOKEN_ENCRYPTION_KEYS_OLD")
+    old_keys: dict[str, str | None] = {}
+    for name in ("TOKEN_ENCRYPTION_KEY_OLD", "STORAGE_ENCRYPTION_KEY_OLD"):
+        old_keys[name] = env.get(name, "").strip() or None
+        if old_keys[name]:
+            _validate_fernet_key(name, old_keys[name])
 
     redirect_env = env.get("ALLOWED_CLIENT_REDIRECT_URIS", "").strip()
     if redirect_env:
@@ -254,6 +269,9 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         storage_encryption_key=env["STORAGE_ENCRYPTION_KEY"],
         token_encryption_key=env["TOKEN_ENCRYPTION_KEY"],
         token_encryption_keys=per_owner,
+        token_encryption_key_old=old_keys["TOKEN_ENCRYPTION_KEY_OLD"],
+        token_encryption_keys_old=per_owner_old,
+        storage_encryption_key_old=old_keys["STORAGE_ENCRYPTION_KEY_OLD"],
         state_secret=env["STATE_SECRET"].encode(),
         data_dir=Path(env.get("DATA_DIR") or "/var/lib/surfski"),
         log_level=env.get("LOG_LEVEL", "INFO").upper(),

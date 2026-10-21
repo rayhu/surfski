@@ -16,7 +16,7 @@ from urllib.parse import urlencode
 
 import anyio
 import httpx
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, MultiFernet
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_access_token, get_context
@@ -541,9 +541,81 @@ def build_client_storage(config: Config):
     )
     return FernetEncryptionWrapper(
         key_value=store,
-        fernet=Fernet(config.storage_encryption_key.encode()),
+        fernet=storage_fernet(config),
         raise_on_decryption_error=False,
     )
+
+
+def storage_fernet(config: Config) -> Fernet | MultiFernet:
+    """STORAGE_ENCRYPTION_KEY encrypts new entries; STORAGE_ENCRYPTION_KEY_OLD, while set,
+    is still accepted for reading entries written before a rotation (#7)."""
+    new = Fernet(config.storage_encryption_key.encode())
+    if not config.storage_encryption_key_old:
+        return new
+    return MultiFernet([new, Fernet(config.storage_encryption_key_old.encode())])
+
+
+# ---------------------------------------------------------------- shared with the admin CLI
+
+
+async def unlink_mailbox(storage: Storage, http_factory, owner: str, alias: str, *,
+                         revoke: bool = True) -> bool:
+    """Delete one linked mailbox (labels, pending action links) and, with revoke, revoke
+    its refresh token at Google first (best effort). Returns whether Google confirmed the
+    revocation. Raises AccountNotFound if there is no such mailbox."""
+    acct = storage.get_account(owner, alias)
+    revoked = False
+    if revoke:
+        try:
+            rt = storage.get_refresh_token(owner, acct.alias)
+        except StorageError:
+            rt = None
+        if rt:
+            async with http_factory() as http:
+                revoked = await revoke_token(http, rt)
+    storage.delete_account(owner, acct.alias)
+    return revoked
+
+
+def audit_pseudonym(config: Config, owner: str) -> str | None:
+    if config.audit_on_delete != "pseudonymize":
+        return None
+    digest = hmac.new(config.state_secret, b"audit-pseudonym:" + owner.encode(), hashlib.sha256)
+    return "deleted-" + digest.hexdigest()[:16]
+
+
+async def purge_owner_data(config: Config, storage: Storage, http_factory, owner: str,
+                           tool: str = "delete_my_data") -> dict:
+    """Erase every row of one owner (one transaction), then revoke each mailbox token at
+    Google with the tokens held in memory, so the data is gone even if Google is slow or
+    down. Audit rows follow AUDIT_ON_DELETE. Used by delete_my_data and `admin purge-owner`."""
+    owner = owner.lower()
+    pseudonym = audit_pseudonym(config, owner)
+    counts, tokens = storage.purge_owner(owner, pseudonym)
+    revoked: dict[str, Any] = {}
+    done: dict[str, bool] = {}
+    async with http_factory() as http:
+        for alias, rt in tokens:
+            if rt is None:
+                revoked[alias] = "not revoked: token could not be decrypted"
+                continue
+            if rt not in done:
+                done[rt] = await revoke_token(http, rt)
+            revoked[alias] = done[rt]
+    if pseudonym:
+        write_audit(storage, pseudonym, tool, None,
+                    f"accounts={counts['accounts']} revoked={sum(1 for v in revoked.values() if v is True)}",
+                    True)
+    log.info("%s: purged %d accounts", tool, counts["accounts"])
+    return {
+        "ok": True,
+        "deleted": counts,
+        "revoked_at_google": revoked,
+        "audit_log": "pseudonymized" if pseudonym else "deleted",
+        "note": ("Any mailbox where revocation failed can be disconnected at "
+                 "https://myaccount.google.com/permissions."
+                 if any(v is not True for v in revoked.values()) else ""),
+    }
 
 
 def build_auth(config: Config):
@@ -604,9 +676,7 @@ def create_app(
     unsubscribe_transport: httpx.AsyncBaseTransport | None = None,
     unsubscribe_resolver: unsub.Resolver | None = None,
 ) -> FastMCP:
-    storage = storage or Storage(
-        config.db_path, TokenCipher(config.token_encryption_key, config.token_encryption_keys)
-    )
+    storage = storage or Storage(config.db_path, TokenCipher.from_config(config))
     http_factory = http_factory or (lambda: httpx.AsyncClient(timeout=15))
     token_cache = g.AccessTokenCache()
     send_as_cache = SendAsCache()
@@ -917,10 +987,13 @@ def create_app(
                     raise g.GmailError(
                         f"daily triage cap for '{a.alias}' reached ({used} of {config.triage_daily_cap} "
                         "changes in the last 24 hours); nothing was changed")
+                progress = g.Progress()
                 try:
-                    extra = op(svc, kind, ids)
+                    extra = op(svc, kind, ids, progress)
                 except Exception:
-                    storage.release_modifications(rid)
+                    # Keep the part of the reservation that was really applied (a
+                    # thread loop can fail partway); release only the rest.
+                    storage.settle_modifications(rid, progress.done)
                     raise
                 return {"ok": True, "action": tool, kind: len(ids), **(extra if isinstance(extra, dict) else {})}
 
@@ -929,7 +1002,7 @@ def create_app(
         def label_tool(name: str, doc: str, add: list[str], remove: list[str], ann: dict) -> None:
             async def tool(alias: str, message_ids: TriageIds = None, thread_ids: TriageIds = None) -> dict:
                 return await triage_call(name, alias, message_ids, thread_ids,
-                                         lambda svc, kind, ids: g.op_modify_labels(svc, kind, ids, add, remove))
+                                         lambda svc, kind, ids, p: g.op_modify_labels(svc, kind, ids, add, remove, p))
             mcp.tool(tool, name=name, description=doc + " Up to 50 ids per call. " + TRIAGE_SAFETY,
                      annotations=ann)
 
@@ -948,14 +1021,14 @@ def create_app(
                               "per call. " + TRIAGE_SAFETY)
         async def trash(alias: str, message_ids: TriageIds = None, thread_ids: TriageIds = None) -> dict:
             return await triage_call("trash", alias, message_ids, thread_ids,
-                                     lambda svc, kind, ids: g.op_trash(svc, kind, ids))
+                                     lambda svc, kind, ids, p: g.op_trash(svc, kind, ids, progress=p))
 
         @mcp.tool(annotations=LABEL_ANN,
                   description="Restore messages or threads from Trash. Up to 50 ids per call. "
                               + TRIAGE_SAFETY)
         async def untrash(alias: str, message_ids: TriageIds = None, thread_ids: TriageIds = None) -> dict:
             return await triage_call("untrash", alias, message_ids, thread_ids,
-                                     lambda svc, kind, ids: g.op_trash(svc, kind, ids, untrash=True))
+                                     lambda svc, kind, ids, p: g.op_trash(svc, kind, ids, untrash=True, progress=p))
 
         @mcp.tool(annotations=LABEL_ANN,
                   description="Apply one of your own labels to messages or threads. With create=true "
@@ -963,9 +1036,9 @@ def create_app(
                               "mark_read, star, archive or trash). Up to 50 ids per call. " + TRIAGE_SAFETY)
         async def apply_label(alias: str, label: LabelArg, message_ids: TriageIds = None,
                               thread_ids: TriageIds = None, create: bool = False) -> dict:
-            def op(svc, kind, ids):
+            def op(svc, kind, ids, progress):
                 label_id, created = g.op_resolve_user_label(svc, label, create)
-                g.op_modify_labels(svc, kind, ids, [label_id], [])
+                g.op_modify_labels(svc, kind, ids, [label_id], [], progress)
                 return {"label_id": label_id, "label_created": created}
             return await triage_call("apply_label", alias, message_ids, thread_ids, op)
 
@@ -974,9 +1047,9 @@ def create_app(
                               "per call. " + TRIAGE_SAFETY)
         async def remove_label(alias: str, label: LabelArg, message_ids: TriageIds = None,
                                thread_ids: TriageIds = None) -> dict:
-            def op(svc, kind, ids):
+            def op(svc, kind, ids, progress):
                 label_id, _ = g.op_resolve_user_label(svc, label, False)
-                g.op_modify_labels(svc, kind, ids, [], [label_id])
+                g.op_modify_labels(svc, kind, ids, [], [label_id], progress)
                 return {"label_id": label_id}
             return await triage_call("remove_label", alias, message_ids, thread_ids, op)
 
@@ -1195,14 +1268,9 @@ def create_app(
         owner = require_owner("unlink_account")
         acct = resolve(owner, alias)
         try:
-            rt = storage.get_refresh_token(owner, acct.alias)
-        except StorageError:
-            rt = None
-        revoked = False
-        if rt:
-            async with http_factory() as http:
-                revoked = await revoke_token(http, rt)
-        storage.delete_account(owner, acct.alias)
+            revoked = await unlink_mailbox(storage, http_factory, owner, acct.alias)
+        except AccountNotFound as e:  # removed concurrently
+            raise ToolError(str(e)) from None
         token_cache.drop(owner, acct.alias)
         send_as_cache.drop(owner, acct.alias)
         write_audit(storage, owner, "unlink_account", acct.alias, f"revoked={revoked}", True)
@@ -1220,39 +1288,10 @@ def create_app(
         owner = require_owner("delete_my_data")
         if confirm != "DELETE":
             raise ToolError('nothing deleted: pass confirm="DELETE" to erase all your data')
-        pseudonym = None
-        if config.audit_on_delete == "pseudonymize":
-            digest = hmac.new(config.state_secret, b"audit-pseudonym:" + owner.encode(), hashlib.sha256)
-            pseudonym = "deleted-" + digest.hexdigest()[:16]
-        # Purge first (one transaction), then revoke with the tokens held in memory: the
-        # data is gone even if Google is slow or down.
-        counts, tokens = storage.purge_owner(owner, pseudonym)
+        result = await purge_owner_data(config, storage, http_factory, owner)
         token_cache.drop_owner(owner)
         send_as_cache.drop_owner(owner)
-        revoked: dict[str, Any] = {}
-        done: dict[str, bool] = {}
-        async with http_factory() as http:
-            for alias, rt in tokens:
-                if rt is None:
-                    revoked[alias] = "not revoked: token could not be decrypted"
-                    continue
-                if rt not in done:
-                    done[rt] = await revoke_token(http, rt)
-                revoked[alias] = done[rt]
-        if pseudonym:
-            write_audit(storage, pseudonym, "delete_my_data", None,
-                        f"accounts={counts['accounts']} revoked={sum(1 for v in revoked.values() if v is True)}",
-                        True)
-        log.info("delete_my_data: purged %d accounts", counts["accounts"])
-        return {
-            "ok": True,
-            "deleted": counts,
-            "revoked_at_google": revoked,
-            "audit_log": "pseudonymized" if pseudonym else "deleted",
-            "note": ("Any mailbox where revocation failed can be disconnected at "
-                     "https://myaccount.google.com/permissions."
-                     if any(v is not True for v in revoked.values()) else ""),
-        }
+        return result
 
     @mcp.tool(annotations={"readOnlyHint": True})
     async def export_my_data() -> dict:
