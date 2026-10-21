@@ -17,7 +17,8 @@ Workspace mailboxes** for each user, and users never see each other's mailboxes.
 
 Tools: `list_accounts`, `link_account`, `relink_account`, `rename_account`, `unlink_account`, `search_threads`,
 `search_all_accounts`, `get_thread`, `get_message`, `list_labels`, `create_draft`, `list_drafts`, `get_draft`,
-`update_draft`, `delete_draft`, `list_addresses`, `set_address_label`, `set_default_from`, `forward_message`.
+`update_draft`, `delete_draft`, `list_addresses`, `set_address_label`, `set_default_from`, `forward_message`,
+`export_my_data`, `delete_my_data`.
 With `SENDING_ENABLED=true` also: `send_draft`, `send_email`, `set_send_policy` (and `forward_message(send=true)`).
 
 **Send from an alias.** `create_draft` and `update_draft` take `from_address` (a verified "Send mail as"
@@ -173,6 +174,7 @@ If you lose the keys, users simply relink their mailboxes.
 | `SEND_DAILY_CAP` | no | Sends per mailbox in a rolling 24 h, in `confirm` and `auto` (default 20) |
 | `SEND_MAX_RECIPIENTS` | no | Unique to+cc+bcc recipients per message (default 10) |
 | `ALLOWED_RECIPIENT_DOMAINS` | no | Comma-separated domains; if set, every recipient's domain must match one exactly |
+| `AUDIT_ON_DELETE` | no | What `delete_my_data` does with the caller's audit rows: `delete` (default) or `pseudonymize` (keep them under a keyed hash) |
 | `LOG_LEVEL`, `HOST`, `PORT` | no | Logging and bind address |
 
 ## Development
@@ -256,6 +258,25 @@ that tells Claude to forward something to an attacker):
 - **Audit:** each send records alias, policy, recipient count and Gmail message id, never addresses
   or bodies.
 - Relinking an alias to a different mailbox resets its policy to `off` and voids open links.
+
+## Your data
+
+What the server stores per Claude user (the "owner"): linked mailboxes (alias, address, encrypted
+refresh token, scopes, timestamps), address labels, default From, send policy, pending link and
+confirmation nonces, send counts for the daily cap, `/send` browser sessions, and audit rows (tool,
+alias, short detail, never bodies or recipients). Message content is never stored.
+
+- **`export_my_data`** returns all of it except tokens.
+- **`delete_my_data(confirm="DELETE")`** erases every row above for the caller in one transaction,
+  clears their in-memory caches, then revokes each mailbox's token at Google (best effort; the result
+  is reported per alias, and a failed one can be removed at https://myaccount.google.com/permissions).
+  Audit rows are deleted by default; set `AUDIT_ON_DELETE=pseudonymize` to keep them under an
+  unlinkable keyed hash instead. Other users' data is untouched.
+- Not covered: Claude's MCP session tokens for this server (in the encrypted OAuth store under
+  `DATA_DIR/oauth`) expire on their own; remove the connector in Claude to end them at once.
+  Backups you made earlier still contain the old data.
+- On the sending pages, **Sign out** ends the browser session; sessions of users removed from
+  `ALLOWED_USERS` stop working at once and are deleted at startup.
 
 ## Hosting this for the public
 

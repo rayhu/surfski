@@ -60,6 +60,11 @@ class AccessTokenCache:
         with self._lock:
             self._data.pop((owner, alias), None)
 
+    def drop_owner(self, owner: str) -> None:
+        with self._lock:
+            for key in [k for k in self._data if k[0] == owner]:
+                del self._data[key]
+
 
 def build_service(
     *,

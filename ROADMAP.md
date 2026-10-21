@@ -70,7 +70,7 @@ See [Calendar module](#calendar-module).
   default, and sends only when the mailbox's send policy allows it.
 - **`get_attachment`**: read attachment content with size limits. PDF and DOCX are extracted to text,
   with no binary pass-through by default.
-- **`delete_my_data`**: unlink and revoke every mailbox for the caller, and purge their rows.
+- ✅ **`delete_my_data`**: unlink and revoke every mailbox for the caller, and purge their rows.
 - **Published container image** (GHCR) and **CI** that runs pytest and the image build on every PR.
 - **Backup helper**: a `scripts/backup.sh` that tars the data volume and refuses to include the env file.
 

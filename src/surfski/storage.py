@@ -429,6 +429,25 @@ class Storage:
             )
         return raw
 
+    def delete_owner_session(self, raw: str | None) -> bool:
+        if not raw:
+            return False
+        with self._tx() as c:
+            cur = c.execute(
+                "DELETE FROM owner_sessions WHERE id_hash = ?", (hashlib.sha256(raw.encode()).hexdigest(),)
+            )
+        return cur.rowcount > 0
+
+    def prune_owner_sessions(self, allowed_owners: frozenset[str] | set[str], now: int) -> int:
+        """Drop expired sessions and those of owners no longer allowed."""
+        with self._tx() as c:
+            rows = c.execute("SELECT DISTINCT owner FROM owner_sessions").fetchall()
+            gone = [r["owner"] for r in rows if r["owner"] not in allowed_owners]
+            n = c.execute("DELETE FROM owner_sessions WHERE exp < ?", (now,)).rowcount
+            for o in gone:
+                n += c.execute("DELETE FROM owner_sessions WHERE owner = ?", (o,)).rowcount
+        return n
+
     def get_owner_session(self, raw: str | None, now: int) -> tuple[str, int] | None:
         """(owner, created_at) for a live session, else None."""
         if not raw:
@@ -466,6 +485,40 @@ class Storage:
                 (owner.lower(), alias, now - 86400),
             ).fetchone()
         return n
+
+    # ---- the caller's own data (#3) ----
+
+    # Every table with an owner column. tests/test_delete_my_data.py checks this
+    # list against the live schema so a new owner-keyed table can't be forgotten.
+    OWNER_TABLES = ("accounts", "address_labels", "pending_links", "action_tokens",
+                    "owner_sessions", "sends", "audit_log")
+
+    def refresh_tokens_for(self, owner: str) -> list[tuple[str, str | None]]:
+        """[(alias, refresh_token or None if it can't be decrypted)]"""
+        out: list[tuple[str, str | None]] = []
+        for a in self.list_accounts(owner):
+            try:
+                out.append((a.alias, self.get_refresh_token(owner, a.alias)))
+            except StorageError:
+                out.append((a.alias, None))
+        return out
+
+    def purge_owner(self, owner: str, audit_pseudonym: str | None = None) -> dict[str, int]:
+        """Delete every row of this owner in one transaction. With audit_pseudonym the
+        audit rows are kept but re-keyed to it; otherwise they are deleted."""
+        owner = owner.lower()
+        counts: dict[str, int] = {}
+        with self._tx() as c:
+            for table in self.OWNER_TABLES:
+                if table == "audit_log" and audit_pseudonym:
+                    counts[table] = c.execute(
+                        "UPDATE audit_log SET owner = ? WHERE lower(owner) = ?", (audit_pseudonym, owner)
+                    ).rowcount
+                else:
+                    counts[table] = c.execute(
+                        f"DELETE FROM {table} WHERE lower(owner) = ?", (owner,)
+                    ).rowcount
+        return counts
 
     # ---- pending links ----
 
