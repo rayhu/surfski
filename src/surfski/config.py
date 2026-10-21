@@ -6,6 +6,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from cryptography.fernet import Fernet
@@ -36,7 +37,13 @@ CONSUMER_DOMAINS = frozenset({
     "yahoo.com", "ymail.com", "icloud.com", "me.com", "mac.com", "aol.com", "proton.me",
     "protonmail.com", "gmx.com", "gmx.net", "mail.com", "yandex.com", "qq.com", "163.com",
 })
-_DOMAIN_RE = re.compile(r"^(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+_DOMAIN_RE = re.compile(
+    r"^(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})$"
+)
+
+
+def _is_true(v: Any) -> bool:
+    return v is True or (isinstance(v, str) and v.strip().lower() == "true")
 
 
 class ConfigError(RuntimeError):
@@ -81,14 +88,24 @@ class Config:
     audit_on_delete: str = "delete"
     attachment_max_bytes: int = 15 * 1024 * 1024
 
-    def is_allowed(self, email: str | None) -> bool:
-        """The single allowlist check: the caller's primary address is in ALLOWED_USERS,
-        or its domain exactly matches ALLOWED_DOMAINS (subdomains don't match)."""
+    def is_allowed(self, email: str | None, *, email_verified: Any, hd: str | None) -> bool:
+        """The single allowlist check. Allowed if the caller's primary address is listed in
+        ALLOWED_USERS, or if its domain exactly matches ALLOWED_DOMAINS (no subdomains)
+        AND Google vouches for it: email_verified is true and the hosted-domain claim
+        `hd` equals that domain (so only accounts managed by that Workspace org match,
+        not a personal Google account registered on a company address). Callers must
+        pass both claims; pass what Google returned, or what the server recorded from it."""
         email = (email or "").strip().lower()
-        local, sep, domain = email.rpartition("@")
-        if not sep or not local or not domain:
+        if email.count("@") != 1:
             return False
-        return email in self.allowed_users or domain in self.allowed_domains
+        local, domain = email.split("@")
+        if not local or not domain:
+            return False
+        if email in self.allowed_users:
+            return True
+        if domain not in self.allowed_domains:
+            return False
+        return _is_true(email_verified) and (hd or "").strip().lower() == domain
 
     @property
     def send_auth_redirect_uri(self) -> str:

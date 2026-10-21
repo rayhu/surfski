@@ -86,6 +86,7 @@ def start_link(
     owner: str,
     alias: str,
     login_hint: str | None = None,
+    hd: str | None = None,
     now: float | None = None,
 ) -> LinkStart:
     alias = validate_alias(alias)
@@ -94,7 +95,10 @@ def start_link(
     exp = int(now or time.time()) + STATE_TTL_SECONDS
     verifier, challenge = pkce_pair()
     storage.add_pending_link(nonce, owner, alias, exp, verifier)
-    state = sign_state(state_secret, {"owner": owner, "alias": alias, "nonce": nonce, "exp": exp})
+    payload = {"owner": owner, "alias": alias, "nonce": nonce, "exp": exp}
+    if hd:  # the caller's verified Google hosted domain, rechecked by the callback
+        payload["hd"] = hd.strip().lower()
+    state = sign_state(state_secret, payload)
     params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,

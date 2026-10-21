@@ -432,3 +432,5 @@ def test_wrap_display_units():
     assert srv.wrap_display("aa bb cc", 5) == ["aa bb", "cc"]
     assert srv.wrap_display("abcdefghij", 4) == ["abcd", "efgh", "ij"]
     assert srv.wrap_display("中文字符", 5) == ["中文", "字符"]
+    assert srv.wrap_display("中文", 1) == ["中", "文"]  # narrower than one character: no hang
+    assert srv.wrap_display("ab", 0)[:2] == ["a", "b"]
