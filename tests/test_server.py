@@ -14,30 +14,21 @@ from starlette.testclient import TestClient
 import surfski.server as srv
 from surfski.server import create_app
 
+from .fakes import StrictGmail
+
 ALICE, BOB = "alice@example.com", "bob@example.com"
 
 
-class FakeGmail:
-    """Minimal fake of the googleapiclient Gmail service, tagged by mailbox."""
-
-    def __init__(self, mailbox):
-        self.mailbox = mailbox
-
-    def users(self):
-        return self
-
-    def threads(self):
-        return self
-
-    def list(self, **kw):
-        return SimpleNamespace(execute=lambda: {"threads": [{"id": f"{self.mailbox}-t1"}]})
-
-    def get(self, **kw):
-        return SimpleNamespace(execute=lambda: {
+def FakeGmail(mailbox):
+    """Discovery-validated fake Gmail service whose thread results are tagged by mailbox."""
+    return StrictGmail({
+        "users.threads.list": lambda **kw: {"threads": [{"id": f"{mailbox}-t1"}]},
+        "users.threads.get": lambda **kw: {
             "id": kw["id"],
             "messages": [{"labelIds": ["INBOX"], "snippet": "hi",
-                          "payload": {"headers": [{"name": "Subject", "value": f"from {self.mailbox}"}]}}],
-        })
+                          "payload": {"headers": [{"name": "Subject", "value": f"from {mailbox}"}]}}],
+        },
+    })
 
 
 @pytest.fixture

@@ -3,7 +3,6 @@
 import base64
 import email
 from email import policy
-from types import SimpleNamespace
 
 import httplib2
 import pytest
@@ -12,6 +11,7 @@ from googleapiclient.errors import HttpError
 
 from surfski.server import create_app
 
+from .fakes import StrictGmail
 from .test_server import ALICE, BOB, call, who  # noqa: F401  (fixture re-export)
 
 
@@ -58,61 +58,42 @@ def not_found():
     return HttpError(httplib2.Response({"status": 404}), b"not found")
 
 
-class FakeDrafts:
+class DraftBackend:
+    """Stateful draft store per mailbox, wired into a discovery-validated StrictGmail."""
+
     def __init__(self, store: dict, mailbox: str):
         self.store = store.setdefault(mailbox, {})
-        self.calls: list = []
 
-    def _exec(self, fn):
-        return SimpleNamespace(execute=fn)
+    def _need(self, draft_id):
+        if draft_id not in self.store:
+            raise not_found()
+        return self.store[draft_id]
 
     def list(self, **kw):
-        self.calls.append(("list", kw))
-        ids = sorted(self.store)
-        return self._exec(lambda: {
-            "drafts": [{"id": i, "message": {"id": f"msg-{i}"}} for i in ids],
-            "nextPageToken": "next" if not kw.get("pageToken") else None,
-        })
+        return {
+            "drafts": [{"id": i, "message": {"id": f"msg-{i}"}} for i in sorted(self.store)],
+            "nextPageToken": None if kw.get("pageToken") else "next",
+        }
 
     def get(self, **kw):
-        self.calls.append(("get", kw))
-
-        def run():
-            if kw["id"] not in self.store:
-                raise not_found()
-            return self.store[kw["id"]]
-        return self._exec(run)
+        return self._need(kw["id"])
 
     def update(self, **kw):
-        self.calls.append(("update", kw))
-
-        def run():
-            if kw["id"] not in self.store:
-                raise not_found()
-            self.store[kw["id"]]["_last_update"] = kw["body"]
-            return {"id": kw["id"], "message": {"id": "new-msg"}}
-        return self._exec(run)
+        self._need(kw["id"])["_last_update"] = kw["body"]
+        return {"id": kw["id"], "message": {"id": "new-msg"}}
 
     def delete(self, **kw):
-        self.calls.append(("delete", kw))
+        self._need(kw["id"])
+        del self.store[kw["id"]]
+        return ""
 
-        def run():
-            if kw["id"] not in self.store:
-                raise not_found()
-            del self.store[kw["id"]]
-            return ""
-        return self._exec(run)
-
-
-class FakeGmail:
-    def __init__(self, store, mailbox):
-        self._drafts = FakeDrafts(store, mailbox)
-
-    def users(self):
-        return self
-
-    def drafts(self):
-        return self._drafts
+    def service(self) -> StrictGmail:
+        return StrictGmail({
+            "users.drafts.list": self.list,
+            "users.drafts.get": self.get,
+            "users.drafts.update": self.update,
+            "users.drafts.delete": self.delete,
+        })
 
 
 @pytest.fixture
@@ -121,20 +102,33 @@ def store():
 
 
 @pytest.fixture
-def app(config, storage, store):
+def services():
+    return []
+
+
+@pytest.fixture
+def app(config, storage, store, services):
     storage.upsert_account(ALICE, "work", "alice@work.com", "rt", "s")
     storage.upsert_account(BOB, "secret", "bob@secret.com", "rt", "s")
     store["alice@work.com"] = {"d1": reply_draft("d1"), "d2": reply_draft("d2", Subject="周报")}
     store["bob@secret.com"] = {"b1": reply_draft("b1")}
 
     def factory(owner, alias):
-        return FakeGmail(store, storage.get_account(owner, alias).email)
+        svc = DraftBackend(store, storage.get_account(owner, alias).email).service()
+        services.append(svc)
+        return svc
 
     return create_app(config, storage=storage, with_auth=False, service_factory=factory)
 
 
-async def test_list_drafts(app, who):
+async def test_list_drafts(app, who, services):
+    r = await call(app, "list_drafts", alias="work", max_results=7, page_token="p0")
+    svc = services[-1]
+    assert svc.calls_to("users.drafts.list") == [{"userId": "me", "maxResults": 7, "pageToken": "p0"}]
+    assert all(kw["format"] == "metadata" for kw in svc.calls_to("users.drafts.get"))
+    assert r["next_page_token"] is None
     r = await call(app, "list_drafts", alias="work")
+    assert services[-1].calls_to("users.drafts.list") == [{"userId": "me", "maxResults": 20}]
     assert r["next_page_token"] == "next"
     assert [d["draft_id"] for d in r["drafts"]] == ["d1", "d2"]
     d = r["drafts"][0]
@@ -150,8 +144,9 @@ async def test_list_drafts_max_results_bounded(app, who):
         await call(app, "list_drafts", alias="work", max_results=51)
 
 
-async def test_get_draft(app, who):
+async def test_get_draft(app, who, services):
     r = await call(app, "get_draft", alias="work", draft_id="d1")
+    assert services[-1].calls_to("users.drafts.get") == [{"userId": "me", "id": "d1", "format": "full"}]
     assert r["draft_id"] == "d1" and r["id"] == "msg-d1" and r["thread_id"] == "t-77"
     assert r["body"] == "Let's meet Tuesday." and r["subject"] == "Re: Plan"
     assert r["cc"] == "carol@x.com" and r["label_ids"] == ["DRAFT"]
@@ -246,3 +241,74 @@ async def test_owner_isolation(app, who, store, tool, args):
         await call(app, tool, alias="secret", **args)
     assert set(store["bob@secret.com"]) == {"b1"}
     assert "_last_update" not in store["bob@secret.com"]["b1"]
+
+
+async def test_update_draft_format_full(app, who, services):
+    await call(app, "update_draft", alias="work", draft_id="d1", body="x")
+    svc = services[-1]
+    assert svc.calls_to("users.drafts.get") == [{"userId": "me", "id": "d1", "format": "full"}]
+    assert svc.calls_to("users.drafts.update")[0]["userId"] == "me"
+
+
+@pytest.mark.parametrize("field", ["to", "cc", "subject"])
+async def test_update_draft_rejects_line_breaks(app, who, store, field):
+    value = "bob@x.com\r\nBcc: evil@x.com" if field != "subject" else "Hi\nBcc: evil@x.com"
+    with pytest.raises(ToolError, match=f"'{field}' must not contain line breaks"):
+        await call(app, "update_draft", alias="work", draft_id="d1", **{field: value})
+    assert "_last_update" not in store["alice@work.com"]["d1"]
+
+
+async def test_update_draft_refuses_inline_image(app, who, store):
+    d = store["alice@work.com"]["d1"]
+    d["message"]["payload"] = {
+        "mimeType": "multipart/related",
+        "headers": d["message"]["payload"]["headers"],
+        "parts": [
+            {"mimeType": "text/html", "body": {"data": b64('<p>hi <img src="cid:i1"></p>')}},
+            {"mimeType": "image/png", "filename": "",
+             "headers": [{"name": "Content-ID", "value": "<i1>"}],
+             "body": {"size": 99, "attachmentId": "att1"}},
+        ],
+    }
+    with pytest.raises(ToolError, match="attachments"):
+        await call(app, "update_draft", alias="work", draft_id="d1", body="new")
+    assert "_last_update" not in d
+
+
+async def test_update_draft_flags_flattened_html(app, who, store):
+    d = store["alice@work.com"]["d1"]
+    d["message"]["payload"] = {
+        "mimeType": "multipart/alternative",
+        "headers": d["message"]["payload"]["headers"],
+        "parts": [
+            {"mimeType": "text/plain", "body": {"data": b64("hi there")}},
+            {"mimeType": "text/html", "body": {"data": b64("<p>hi <b>there</b></p>")}},
+        ],
+    }
+    r = await call(app, "update_draft", alias="work", draft_id="d1", subject="New")
+    assert r["flattened_html"] is True
+    m = decode_raw(d["_last_update"]["message"]["raw"])
+    assert m.get_content_type() == "text/plain" and m.get_content().strip() == "hi there"
+    r = await call(app, "update_draft", alias="work", draft_id="d2", subject="plain")
+    assert "flattened_html" not in r
+
+
+async def test_update_draft_explicit_empty_to(app, who):
+    with pytest.raises(ToolError, match="'to' can't be empty"):
+        await call(app, "update_draft", alias="work", draft_id="d1", to="")
+
+
+def test_strict_fake_rejects_unknown_kwargs():
+    svc = StrictGmail({"users.drafts.get": lambda **kw: {}, "users.threads.get": lambda **kw: {}})
+    with pytest.raises(TypeError, match="unexpected keyword argument metadataHeaders"):
+        svc.users().drafts().get(userId="me", id="d1", format="metadata", metadataHeaders=["Subject"])
+    with pytest.raises(TypeError, match="unexpected keyword argument body"):
+        svc.users().drafts().get(userId="me", id="d1", body={})
+    with pytest.raises(TypeError, match='Missing required parameter "id"'):
+        svc.users().drafts().get(userId="me")
+    with pytest.raises(TypeError, match="not an allowed value"):
+        svc.users().drafts().get(userId="me", id="d1", format="bogus")
+    with pytest.raises(AttributeError):
+        svc.users().nope()
+    # threads.get does accept metadataHeaders
+    svc.users().threads().get(userId="me", id="t1", format="metadata", metadataHeaders=["Subject"]).execute()

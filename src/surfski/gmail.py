@@ -190,7 +190,7 @@ def extract_body(payload: dict) -> str:
     plain, html = [], []
     for part in _walk(payload):
         mime = (part.get("mimeType") or "").lower()
-        if part.get("filename"):
+        if _is_attachment(part):
             continue
         if mime == "text/plain":
             plain.append(_decode_part(part))
@@ -203,13 +203,25 @@ def extract_body(payload: dict) -> str:
     return ""
 
 
+def _is_attachment(part: dict) -> bool:
+    """A named part, or a non-text leaf that is inline (Content-ID) or stored
+    out-of-line (body.attachmentId), e.g. an embedded image."""
+    if part.get("filename"):
+        return True
+    mime = (part.get("mimeType") or "").lower()
+    if not mime or mime.startswith(("text/", "multipart/")):
+        return False
+    has_cid = any(h.get("name", "").lower() == "content-id" for h in part.get("headers", []) or [])
+    return has_cid or bool((part.get("body") or {}).get("attachmentId"))
+
+
 def extract_attachments(payload: dict) -> list[dict]:
     out = []
     for part in _walk(payload):
-        if part.get("filename"):
+        if _is_attachment(part):
             out.append(
                 {
-                    "filename": part["filename"],
+                    "filename": part.get("filename") or "",
                     "mime_type": part.get("mimeType"),
                     "size": (part.get("body") or {}).get("size", 0),
                 }
@@ -290,6 +302,12 @@ def _addr_list(value: str | None) -> str | None:
     return ", ".join(cleaned) if cleaned else None
 
 
+def _reject_line_breaks(**fields: str | None) -> None:
+    for name, value in fields.items():
+        if value and ("\r" in value or "\n" in value):
+            raise GmailError(f"'{name}' must not contain line breaks")
+
+
 def build_mime(
     *,
     from_addr: str,
@@ -301,6 +319,7 @@ def build_mime(
     in_reply_to: str | None = None,
     references: str | None = None,
 ) -> EmailMessage:
+    _reject_line_breaks(**{"from": from_addr}, to=to, subject=subject, cc=cc, bcc=bcc)
     m = EmailMessage()
     m["From"] = from_addr
     to_v = _addr_list(to)
@@ -423,9 +442,6 @@ def op_create_draft(
     return {"draft_id": draft.get("id"), "thread_id": thread_id}
 
 
-DRAFT_LIST_HEADERS = ["Subject", "To", "Date"]
-
-
 def op_list_drafts(svc, max_results: int, page_token: str | None) -> dict:
     drafts = svc.users().drafts()
     kwargs: dict[str, Any] = {"userId": "me", "maxResults": max_results}
@@ -435,8 +451,8 @@ def op_list_drafts(svc, max_results: int, page_token: str | None) -> dict:
     out = []
     for d in resp.get("drafts", []) or []:
         full = (
-            drafts.get(userId="me", id=d["id"], format="metadata", metadataHeaders=DRAFT_LIST_HEADERS)
-            .execute()
+            # drafts.get takes no metadataHeaders; format=metadata returns all headers.
+            drafts.get(userId="me", id=d["id"], format="metadata").execute()
         )
         msg = full.get("message") or {}
         h = headers_map(msg.get("payload") or {})
@@ -481,7 +497,19 @@ def op_update_draft(
         raise GmailError(
             "this draft has attachments, which update_draft would drop; edit it in Gmail instead"
         )
+    parts = list(_walk(payload))
+    if body is None and any(
+        (p.get("mimeType") or "").lower().startswith("text/")
+        and (p.get("body") or {}).get("attachmentId")
+        and not (p.get("body") or {}).get("data")
+        for p in parts
+    ):
+        raise GmailError("this draft's body is too large to read back; pass 'body' to replace it")
+    flattened_html = any((p.get("mimeType") or "").lower() == "text/html" for p in parts)
     h = headers_map(payload)
+    _reject_line_breaks(to=to, subject=subject, cc=cc, bcc=bcc)
+    if to is not None and not _addr_list(to):
+        raise GmailError("'to' can't be empty; omit it to keep the current recipients")
     new_to = h.get("to", "") if to is None else to
     if not _addr_list(new_to):
         raise GmailError("the draft has no recipients; pass 'to'")
@@ -500,7 +528,10 @@ def op_update_draft(
         # Without threadId Gmail silently detaches the draft from its thread.
         message["threadId"] = msg["threadId"]
     updated = drafts.update(userId="me", id=draft_id, body={"id": draft_id, "message": message}).execute()
-    return {"draft_id": updated.get("id", draft_id)}
+    out: dict[str, Any] = {"draft_id": updated.get("id", draft_id)}
+    if flattened_html:
+        out["flattened_html"] = True
+    return out
 
 
 def op_delete_draft(svc, draft_id: str) -> dict:

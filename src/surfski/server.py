@@ -458,8 +458,10 @@ def create_app(
         bcc: Annotated[str | None, Field(description="Omit to keep, empty string to clear")] = None,
     ) -> dict:
         """Revise an existing draft. Omitted fields keep their current values; the
-        sender and reply threading are preserved. The draft is saved as plain text.
-        This does NOT send."""
+        sender and reply threading are preserved. The draft is saved as plain text:
+        if the result has flattened_html=true, the draft had HTML formatting that is
+        now gone, so tell the user. Drafts with attachments are refused. This does
+        NOT send."""
         owner = require_owner("update_draft")
 
         def fn(svc, acct):
