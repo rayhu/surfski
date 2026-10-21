@@ -467,8 +467,9 @@ async def test_confirm_link_commit_path(app, who, cals, storage, google):
     assert resp.status_code == 200 and "updated" in resp.text, resp.text
     [(path, kw)] = all_writes(cals)
     assert path == "events.patch" and kw["sendUpdates"] == "all"
-    atts = {a["email"]: a["responseStatus"] for a in kw["body"]["attendees"]}
-    assert atts == {"alice@work.com": "accepted", "boss@partner.org": "accepted"}  # only self changed
+    # Only the self entry is sent, flagged as a partial list.
+    assert kw["body"]["attendeesOmitted"] is True
+    assert [(a["email"], a["responseStatus"]) for a in kw["body"]["attendees"]] == [("alice@work.com", "accepted")]
     again = client.post("/send/calendar/confirm", data={"token": token})
     assert again.status_code == 400 and len(all_writes(cals)) == 1
 

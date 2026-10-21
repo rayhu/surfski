@@ -1719,7 +1719,9 @@ def create_app(
                 if me is None:
                     raise cal.CalendarError("this mailbox isn't an attendee of that event, so there is "
                                             "nothing to answer")
-                body = {"attendees": [dict(x, responseStatus=response) if x is me else x for x in atts]}
+                # Only our own entry: attendeesOmitted keeps Google from treating the list as
+                # the full attendee set, so nobody else's entry can be dropped or overwritten.
+                body = {"attendees": [dict(me, responseStatus=response)], "attendeesOmitted": True}
                 organizer = ((cur.get("organizer") or {}).get("email") or "").lower()
                 ext = (cal.external_attendees([organizer], a.email, CONSUMER_DOMAINS)
                        if notify_organizer and organizer else [])
