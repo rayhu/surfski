@@ -102,6 +102,7 @@ class Config:
     extract_sandbox: str = "subprocess"
     extract_timeout_s: float = 20.0
     extract_memory_mb: int = 512
+    extract_sandbox_strict: bool = False  # refuse to extract unless Landlock confines the worker (#43)
     metrics_token: str = ""
     # Modules served by this deployment (#19): "mail" always, "calendar" opt-in.
     features: frozenset[str] = frozenset({"mail"})
@@ -311,6 +312,11 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         raise ConfigError("EXTRACT_TIMEOUT_S must be between 1 and 120")
     if not 128 <= extract_memory <= 8192:
         raise ConfigError("EXTRACT_MEMORY_MB must be between 128 and 8192")
+    extract_strict = env.get("EXTRACT_SANDBOX_STRICT", "false").strip().lower() or "false"
+    if extract_strict not in ("true", "false"):
+        raise ConfigError("EXTRACT_SANDBOX_STRICT must be true or false")
+    if extract_strict == "true" and extract_sandbox != "subprocess":
+        raise ConfigError("EXTRACT_SANDBOX_STRICT=true requires EXTRACT_SANDBOX=subprocess")
 
     features = frozenset(f.strip().lower() for f in env.get("FEATURES", "mail").split(",") if f.strip())
     features = features or frozenset({"mail"})
@@ -362,6 +368,7 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         extract_sandbox=extract_sandbox,
         extract_timeout_s=extract_timeout,
         extract_memory_mb=extract_memory,
+        extract_sandbox_strict=extract_strict == "true",
         features=features,
         calendar_invite_daily_cap=invite_cap,
     )

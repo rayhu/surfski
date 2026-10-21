@@ -3197,6 +3197,20 @@ def register_calendar_pages(mcp: FastMCP, config: Config, storage: Storage, make
                      "You can close this tab.")
 
 
+def probe_sandbox(config, sandbox: Sandbox, metrics: Metrics) -> dict:
+    """Learn and report the extraction worker's protection level (#43): logs, metrics, and a
+    warning if DATA_DIR sits beneath a path the confined worker may read."""
+    from . import confine
+
+    protection = sandbox.probe()
+    metrics.set_extract_protection(protection)
+    exposed = confine.exposes(config.data_dir) if sandbox.mode == "subprocess" else None
+    if exposed:
+        log.warning("DATA_DIR is beneath %s, which the extraction worker may read; move DATA_DIR "
+                    "out of the Python installation and code directories", exposed)
+    return protection
+
+
 def main() -> None:
     try:
         config = load_config()
@@ -3212,6 +3226,7 @@ def main() -> None:
     scrub_secret_env()
     harden_process()
     mcp = create_app(config)
+    probe_sandbox(config, mcp.surfski["sandbox"], mcp.surfski["metrics"])
     log.info("starting surfski %s on %s:%s (base_url=%s)", __version__, config.host, config.port,
              config.base_url)
     mcp.run(

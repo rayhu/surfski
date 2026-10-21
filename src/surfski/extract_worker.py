@@ -6,9 +6,13 @@ JSON object: {"ok": true, "text", "method", "note", "skipped"} or {"ok": false,
 "error": "internal", "class"} for anything else (class name only, never the message).
 
 The worker reads the input first (so the header can say whether pypdf is needed), then
-imports what parsing needs, then lowers its own resource limits (address space, CPU
-seconds, open files, processes, file size) and only then parses the untrusted bytes.
-Limits the platform doesn't support are skipped and reported back in "skipped". The
+imports what parsing needs, then confines itself with Landlock and seccomp (#43, see
+`confine.py`: read-only access to the Python installation only, no TCP, no `socket()`),
+then lowers its own resource limits (address space, CPU seconds, open files, processes,
+file size) and only then parses the untrusted bytes. With `"strict": true` in the header
+it refuses to parse ({"ok": false, "error": "sandbox"}) unless Landlock applied. The
+protection achieved is reported back in "protection". Limits the platform doesn't
+support are skipped and reported back in "skipped". The
 text is cut to max_chars + 1 characters so the parent can still tell it was truncated
 while bounding the output size."""
 
@@ -20,8 +24,8 @@ from collections.abc import Callable
 
 
 def _deny_network() -> None:
-    """Best effort: Python-level sockets refuse to open. Native code could still call the
-    OS directly; real enforcement needs seccomp or a network namespace."""
+    """Python-level sockets refuse to open, with a clear message. The kernel-level block is
+    Landlock (TCP, ABI 4+) and the seccomp filter on socket() (confine.py)."""
     import socket
 
     def refuse(*_a, **_kw):
@@ -70,6 +74,7 @@ def _read_input() -> tuple[dict, bytes]:
 
 def main(extract: Callable | None = None) -> int:
     from . import attachments as att
+    from . import confine
 
     extract = extract or att.extract_text
     out = sys.stdout
@@ -77,12 +82,19 @@ def main(extract: Callable | None = None) -> int:
         header, data = _read_input()
         if att.detect_method(header["mime_type"], header["filename"]) == "pdf":
             import pypdf  # noqa: F401  (only when needed; before the limits, imports open files)
+        protection = confine.confine()
+        if header.get("strict") and not protection["landlock_fs"]:
+            result = {"ok": False, "error": "sandbox", "protection": protection}
+            out.write(json.dumps(result))
+            out.flush()
+            return 0
         skipped = apply_limits(int(header["memory_mb"]), int(header["cpu_seconds"]))
         _deny_network()
         ex = extract(data, header["mime_type"], header["filename"], charset=header.get("charset"),
                      max_chars=int(header["max_chars"]))
         text = ex.text[: int(header["max_chars"]) + 1] if ex.text is not None else None
-        result = {"ok": True, "text": text, "method": ex.method, "note": ex.note, "skipped": skipped}
+        result = {"ok": True, "text": text, "method": ex.method, "note": ex.note, "skipped": skipped,
+                  "protection": protection}
     except att.ExtractError as e:
         result = {"ok": False, "error": "extract", "message": str(e)[:300]}
     except BaseException as e:  # noqa: BLE001  (MemoryError, RecursionError, parser bugs...)

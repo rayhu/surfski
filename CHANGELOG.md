@@ -26,6 +26,14 @@ All notable changes to Surfski are documented here. The format follows
 
 ### Security
 
+- The attachment extraction worker confines itself with Landlock before parsing: read-only access to
+  the Python installation and system libraries only, so a parser exploit can't read `DATA_DIR` (the
+  SQLite database, the OAuth store) or write anywhere, and no TCP with Landlock ABI 4+. A seccomp
+  filter blocks `socket()`, `io_uring_setup()` and path `truncate()`. The protection level is logged at
+  startup and exported as `surfski_extract_sandbox_info`; `EXTRACT_SANDBOX_STRICT=true` refuses to read
+  attachments when Landlock is unavailable. CI verifies it in the hardened container (#43).
+- README: pending confirmation links stay valid during a token key rotation while the old key is set (#19).
+
 - Confirmation-link data in `action_tokens` (draft ids, PKCE verifiers, proposed calendar events) is
   encrypted with the owner's token key and erased as soon as the link is used or expires (#19).
 

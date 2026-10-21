@@ -33,6 +33,7 @@ UNSUB_OUTCOMES = frozenset({"preview", "ok", "failed", "manual", "not_available"
                             "sent", "confirmation_required", "declined"})
 CAL_ACTIONS = frozenset({"create", "update", "respond", "delete"})
 CAL_OUTCOMES = frozenset({"written", "failed", "declined", "link_issued"})
+SANDBOX_LEVELS = frozenset({"full", "filesystem", "network", "basic", "none", "unknown"})
 
 
 def _bucket(value: str, allowed: Iterable[str]) -> str:
@@ -90,6 +91,7 @@ class Metrics:
         self._hist: dict[tuple[str, ...], list[float]] = {}  # tool -> [bucket counts..., sum, count]
         self.started = time.time()
         self.version = __version__
+        self.extract_protection: tuple[str, str, str] | None = None  # (level, landlock_abi, seccomp)
 
     def set_tools(self, names: Iterable[str]) -> None:
         self._tools = frozenset(names)
@@ -130,6 +132,13 @@ class Metrics:
 
     def calendar_write(self, action: str, outcome: str) -> None:
         self._inc("calendar_writes", (_bucket(action, CAL_ACTIONS), _bucket(outcome, CAL_OUTCOMES)))
+
+    def set_extract_protection(self, protection: dict) -> None:
+        """The extraction sandbox level learned by the startup probe (#43)."""
+        abi = protection.get("landlock_abi")
+        abi_label = str(abi) if isinstance(abi, int) and 0 <= abi < 100 else "other"
+        self.extract_protection = (_bucket(str(protection.get("level")), SANDBOX_LEVELS), abi_label,
+                                   "1" if protection.get("seccomp") is True else "0")
 
     def rate_limited(self) -> None:
         self._inc("rate_limited")
@@ -186,6 +195,11 @@ class Metrics:
         out.append(f"surfski_owners {owners}")
         head("surfski_build_info", "Surfski version.", "gauge")
         out.append("surfski_build_info" + _labels(("version",), (self.version,)) + " 1")
+        if self.extract_protection is not None:
+            head("surfski_extract_sandbox_info", "Attachment extraction sandbox protection level "
+                 "(full = Landlock filesystem + kernel network block).", "gauge")
+            out.append("surfski_extract_sandbox_info" + _labels(
+                ("level", "landlock_abi", "seccomp"), self.extract_protection) + " 1")
         head("surfski_process_start_time_seconds", "Start time of the process (Unix seconds).", "gauge")
         out.append(f"surfski_process_start_time_seconds {_num(round(self.started, 3))}")
         head("surfski_uptime_seconds", "Seconds since the process started.", "gauge")

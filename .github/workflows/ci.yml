@@ -110,6 +110,13 @@ jobs:
           assert ex.text == 'sandbox ok', ex
           print(f'sandboxed extraction ok in {time.monotonic() - t:.3f}s')
           "
+          # Kernel confinement (#43): in the hardened container the worker gets Landlock + seccomp,
+          # can't read /data/data.db (which the server user can) and can't open a socket.
+          echo "host kernel: $(uname -r); LSMs: $(cat /sys/kernel/security/lsm 2>/dev/null || echo '?')"
+          docker run --rm --env-file ci.env -e DATA_DIR=/data -e EXTRACT_SANDBOX_STRICT=true \
+            -v surfski-ci-data:/data -v "$PWD/scripts/ci_sandbox_probe.py:/tmp/probe.py:ro" \
+            --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
+            surfski:ci python -I /tmp/probe.py
           run surfski admin rotate-token-key --dry-run
           set +e
           run surfski admin purge-owner --owner ci@example.com

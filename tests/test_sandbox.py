@@ -320,3 +320,193 @@ def test_child_cannot_read_hardened_parent_environ(mode, expected):
 def test_harden_process_is_safe_off_linux(monkeypatch):
     monkeypatch.setattr(sb.sys, "platform", "darwin")
     assert sb.harden_process() is False
+
+
+# ---------------------------------------------------------------- kernel confinement (#43)
+
+from surfski import confine  # noqa: E402
+
+LANDLOCK_ABI = confine.landlock_abi()
+
+
+def require_landlock():
+    """Skip off Linux. On Linux without Landlock, skip locally but fail in CI, so a runner
+    without Landlock can't go green while enforcing nothing."""
+    if not LINUX:
+        pytest.skip("Landlock and seccomp are Linux-only")
+    if LANDLOCK_ABI == 0:
+        if os.environ.get("CI"):
+            pytest.fail("Landlock is unavailable on this CI runner")
+        pytest.skip("Landlock is unavailable on this kernel")
+
+
+PROBE_BODY = """
+    import errno, json, _socket
+    from surfski.attachments import Extracted
+    paths, port = json.loads(data)
+    res = {}
+    for p in paths:
+        try:
+            open(p, "rb").read(1)
+            res[p] = "read"
+        except OSError as e:
+            res[p] = errno.errorcode.get(e.errno, str(e.errno))
+    try:  # the C-level socket, bypassing the Python monkeypatch
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        try:
+            s.connect(("127.0.0.1", port))
+            res["connect"] = "connected"
+        finally:
+            s.close()
+    except OSError as e:
+        res["connect"] = errno.errorcode.get(e.errno, str(e.errno))
+    return Extracted(json.dumps(res), "text")
+"""
+
+
+def test_confined_worker_cannot_read_data_dir_or_connect(monkeypatch, tmp_path):
+    require_landlock()
+    import json
+    import socket
+    import sqlite3
+
+    data_dir = tmp_path / "data"
+    (data_dir / "oauth").mkdir(parents=True)
+    db = data_dir / "data.db"
+    sqlite3.connect(db).execute("create table t (x)").connection.close()
+    secret = data_dir / "oauth" / "client.json"
+    secret.write_text('{"secret": "x"}')
+    for p in (db, secret):  # the server user can read them: a denial below is the sandbox
+        assert open(p, "rb").read(1)
+    assert confine.exposes(data_dir) is None
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    try:
+        evil_worker(monkeypatch, PROBE_BODY)
+        payload = json.dumps([[str(db), str(secret)], listener.getsockname()[1]]).encode()
+        ex = Sandbox().extract(payload, "text/plain", "a.txt", charset=None, max_chars=10_000)
+    finally:
+        listener.close()
+    res = json.loads(ex.text)
+    assert res[str(db)] == "EACCES" and res[str(secret)] == "EACCES"
+    assert res["connect"] in ("EPERM", "EACCES")  # seccomp (socket) or Landlock (connect)
+
+
+def test_confined_worker_still_reads_pdf_and_docx_strict():
+    require_landlock()
+    box = Sandbox(strict=True)
+    ex = box.extract(make_pdf(["Quarterly numbers"]), "application/pdf", "q.pdf", charset=None,
+                     max_chars=1000)
+    assert "Quarterly numbers" in ex.text
+    ex = box.extract(make_docx(["Hello", "World"]), DOCX, "x.docx", charset=None, max_chars=1000)
+    assert "Hello" in ex.text and "World" in ex.text
+
+
+def test_probe_reports_full_protection(caplog):
+    require_landlock()
+    import logging
+    from surfski.metrics import Metrics
+    from surfski.server import probe_sandbox
+
+    caplog.set_level(logging.INFO, "surfski.sandbox")
+    box = Sandbox()
+    m = Metrics()
+    p = probe_sandbox(type("C", (), {"data_dir": "/nonexistent-data"})(), box, m)
+    assert p["level"] == "full" and p["landlock_fs"] and p["landlock_abi"] == LANDLOCK_ABI
+    assert box.protection == p
+    assert "extraction sandbox protection: full" in caplog.text
+    assert f'surfski_extract_sandbox_info{{level="full",landlock_abi="{LANDLOCK_ABI}"' in m.render(0, 0)
+
+
+STRICT_NO_LANDLOCK = """
+import sys
+from surfski import confine, extract_worker
+confine.landlock_abi = lambda: 0  # simulate a kernel without Landlock
+called = []
+def extract(*a, **k):
+    called.append(1)
+    raise SystemExit("parsed despite strict mode")
+sys.exit(extract_worker.main(extract=extract))
+"""
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_strict_mode_refuses_without_landlock(monkeypatch, caplog, strict):
+    monkeypatch.setattr(sb, "WORKER_ARGV", [sys.executable, "-I", "-B", "-c", STRICT_NO_LANDLOCK])
+    box = Sandbox(strict=strict)
+    with pytest.raises(att.ExtractError) as e:
+        box.extract(b"x", "text/plain", "a.txt", charset=None, max_chars=10)
+    if strict:
+        assert str(e.value) == sb.SANDBOX_UNAVAILABLE
+        assert "EXTRACT_SANDBOX_STRICT" in caplog.text
+    else:  # non-strict: degrades and parses (here the fake parser exits)
+        assert str(e.value).startswith(TOO_COMPLEX)
+
+
+def test_probe_without_landlock_reports_degraded_level(monkeypatch, caplog):
+    import logging
+    script = STRICT_NO_LANDLOCK.replace(
+        "sys.exit(extract_worker.main(extract=extract))",
+        "from surfski.attachments import extract_text\nsys.exit(extract_worker.main(extract=extract_text))")
+    monkeypatch.setattr(sb, "WORKER_ARGV", [sys.executable, "-I", "-B", "-c", script])
+    caplog.set_level(logging.INFO, "surfski.sandbox")
+    box = Sandbox(strict=True)
+    p = box.probe()
+    assert not p["landlock_fs"] and p["level"] in ("network", "basic")
+    assert box.strict is True  # restored after probing
+    assert "EXTRACT_SANDBOX_STRICT is on" in caplog.text
+    from surfski.metrics import Metrics
+    m = Metrics()
+    m.set_extract_protection(p)
+    assert f'surfski_extract_sandbox_info{{level="{p["level"]}"' in m.render(0, 0)
+
+
+def test_probe_inprocess_and_metrics_bucketing():
+    from surfski.metrics import Metrics
+    assert Sandbox(mode="inprocess").probe()["level"] == "none"
+    m = Metrics()
+    assert "surfski_extract_sandbox_info" not in m.render(0, 0)
+    m.set_extract_protection({"level": "SECRET", "landlock_abi": "x", "seccomp": "yes"})
+    assert 'surfski_extract_sandbox_info{level="other",landlock_abi="other",seccomp="0"} 1' in m.render(0, 0)
+
+
+def test_forged_protection_report_is_rejected(monkeypatch):
+    import json
+    result = {"ok": True, "text": "x", "method": "text", "protection": {"level": "SECRET"}}
+    script = f"import sys; sys.stdout.write({json.dumps(json.dumps(result))})"
+    monkeypatch.setattr(sb, "WORKER_ARGV", [sys.executable, "-I", "-B", "-c", script])
+    with pytest.raises(att.ExtractError, match="malformed"):
+        Sandbox().extract(b"x", "text/plain", "a.txt", charset=None, max_chars=10)
+
+
+def test_allowed_paths_never_include_root_or_data(tmp_path):
+    paths = confine.allowed_paths()
+    assert "/" not in paths and all(os.path.isabs(p) and os.path.exists(p) for p in paths)
+    assert confine.exposes(tmp_path / "data") is None
+    assert confine.exposes(os.path.join(sys.prefix, "x", "data.db")) is not None
+
+
+def test_seccomp_filter_program_shape():
+    import struct
+    for machine in ("x86_64", "aarch64"):
+        prog = confine.seccomp_filter(machine)
+        ins = [struct.unpack("=HBBI", prog[i:i + 8]) for i in range(0, len(prog), 8)]
+        assert ins[-1] == (0x06, 0, 0, confine.SECCOMP_RET_ERRNO | confine.EPERM)
+        assert ins[-2] == (0x06, 0, 0, confine.SECCOMP_RET_ALLOW)
+        # every conditional jump that matches lands on the final ERRNO
+        for i, (code, jt, jf, _k) in enumerate(ins):
+            if code in (0x15, 0x35) and i > 1:
+                assert i + 1 + jt == len(ins) - 1 and jf == 0
+        assert 1 + 1 + ins[1][2] == len(ins) - 1  # foreign arch -> ERRNO
+    assert confine.seccomp_filter("riscv64") is None
+
+
+def test_strict_config(tmp_path):
+    assert load_config(make_env(tmp_path)).extract_sandbox_strict is False
+    c = load_config(make_env(tmp_path, EXTRACT_SANDBOX_STRICT="true"))
+    assert c.extract_sandbox_strict and Sandbox.from_config(c).strict
+    for bad in ({"EXTRACT_SANDBOX_STRICT": "maybe"},
+                {"EXTRACT_SANDBOX_STRICT": "true", "EXTRACT_SANDBOX": "inprocess"}):
+        with pytest.raises(ConfigError, match="EXTRACT_SANDBOX_STRICT"):
+            load_config(make_env(tmp_path, **bad))
