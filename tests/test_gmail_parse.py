@@ -35,7 +35,8 @@ def test_multipart_prefers_plain():
     m = g.parse_message({"id": "m1", "threadId": "t1", "payload": payload}, 8000)
     assert m["body"] == "plain body"
     assert m["subject"] == "Hi" and m["from"] == "Bob <bob@x.com>"
-    assert m["attachments"] == [{"filename": "a.pdf", "mime_type": "application/pdf", "size": 1234}]
+    assert m["attachments"] == [{"filename": "a.pdf", "mime_type": "application/pdf", "size": 1234,
+                                 "part_id": None, "attachment_id": "x"}]
 
 
 def test_html_only():
@@ -153,6 +154,6 @@ def test_inline_parts_count_as_attachments():
     }
     assert g.extract_body(payload) == "body"
     assert g.extract_attachments(payload) == [
-        {"filename": "", "mime_type": "image/png", "size": 5},
-        {"filename": "", "mime_type": "image/gif", "size": 7},
+        {"filename": "", "mime_type": "image/png", "size": 5, "part_id": None, "attachment_id": None},
+        {"filename": "", "mime_type": "image/gif", "size": 7, "part_id": None, "attachment_id": "a2"},
     ]
