@@ -914,8 +914,10 @@ def check_attachment_total(pending: list[PendingAttachment], limit: int, label: 
 
 
 def attach_parts(svc, mime: EmailMessage, pending: list[PendingAttachment],
-                    limit: int) -> tuple[list[str], list[dict], int]:
-    """Download and attach each part: (attached names, skipped, bytes attached)."""
+                 limit: int, strict: bool = True) -> tuple[list[str], list[dict], int]:
+    """Download and attach each part: (attached names, skipped, bytes attached). A part
+    with no content fails when `strict` (the draft would silently lose the file, e.g.
+    update_draft rewriting it); forward (strict=False) reports it as skipped."""
     users = svc.users()
     attached: list[str] = []
     skipped: list[dict] = []
@@ -931,6 +933,9 @@ def attach_parts(svc, mime: EmailMessage, pending: list[PendingAttachment],
                 .get("data")
             )
         if not data:
+            if strict:
+                raise GmailError(f"attachment '{p.name}' has no content Gmail can return, so it "
+                                 "would be lost; nothing was saved. Edit this draft in Gmail instead.")
             skipped.append({"filename": p.name, "reason": "no content available"})
             continue
         raw = _decode_b64(data)
@@ -1006,7 +1011,7 @@ def op_forward_message(
         cc=cc,
         bcc=bcc,
     )
-    attached, skipped, total = attach_parts(svc, mime, pending, max_attachment_bytes)
+    attached, skipped, total = attach_parts(svc, mime, pending, max_attachment_bytes, strict=False)
     draft = save_draft(svc, mime)
     out: dict[str, Any] = {
         "draft_id": draft.get("id"),
@@ -1033,6 +1038,7 @@ def op_draft_for_send(svc, draft_id: str) -> dict:
         "raw_headers": payload.get("headers", []) or [],
         "body": extract_body(payload),
         "attachments": [a["filename"] or a["mime_type"] for a in extract_attachments(payload)],
+        "attachment_bytes": sum(int(a["size"] or 0) for a in extract_attachments(payload)),
     }
 
 

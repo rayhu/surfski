@@ -282,7 +282,7 @@ async def test_body_cannot_forge_summary(app, who, boxes, storage):
     assert [line for line in outside if line.startswith("To:")] == ["To: a@x.com"]
     assert not any("x@y.com" in line for line in outside)
     assert [line for line in outside if line.startswith("Summary")] == [
-        "Summary (from the server): sends to 3 recipient(s): To 1, Cc 1, Bcc 1."]
+        "Summary (from the server): sends to 3 recipient(s): To 1, Cc 1, Bcc 1; no attachments."]
     after_end = human.prompts[0].split(srv.BODY_END + "\n")[-1]
     assert "hidden (Bcc) recipients" in after_end
     assert "‮" not in human.prompts[0] and " " not in human.prompts[0]

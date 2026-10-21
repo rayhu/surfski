@@ -226,6 +226,8 @@ _LINE_BREAKS = ("\r\n", "\r", "\x85", "\u2028", "\u2029", "\x0b", "\x0c")
 BODY_WRAP = 76
 BODY_PREFIX = "│ "
 FIELD_MAX = 200
+# Each attachment name in a confirmation prompt is capped at this many display columns.
+ATTACHMENT_NAME_COLS = 60
 
 
 def _visible(c: str) -> bool:
@@ -301,6 +303,34 @@ def _cap(value: str, limit: int = FIELD_MAX) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "…"
 
 
+def cap_display(text: str, cols: int) -> str:
+    """At most `cols` display columns, with an ellipsis when cut."""
+    if display_width(text) <= cols:
+        return text
+    out, w = "", 0
+    for c in text:
+        if w + char_width(c) > cols - 1:
+            break
+        out, w = out + c, w + char_width(c)
+    return out + "…"
+
+
+def human_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.0f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
+def attachment_summary(info: dict) -> tuple[str, list[str]]:
+    """("N attachment(s), X", one sanitized, capped name per file). Never truncated as a
+    list: a long decoy name can't push a real attachment out of view."""
+    names = [cap_display(clean_field(n) or "(unnamed)", ATTACHMENT_NAME_COLS) for n in info["attachments"]]
+    n = len(names)
+    return f"{n} attachment{'s' if n != 1 else ''}, {human_size(int(info.get('attachment_bytes') or 0))}", names
+
+
 def confirm_summary(acct, info: dict, recipients: list[str]) -> tuple[list[tuple[str, str]], bool, str]:
     """(rows, has_bcc, body preview) describing a draft for the human who confirms it.
     Row values are single sanitized lines; the preview keeps line breaks."""
@@ -313,7 +343,7 @@ def confirm_summary(acct, info: dict, recipients: list[str]) -> tuple[list[tuple
     rows = [("Mailbox", f"{acct.alias} ({acct.email})"), ("From", h.get("from", "")),
             ("To", joined["to"]), ("Cc", joined["cc"]), ("Bcc", joined["bcc"]),
             ("Subject", h.get("subject", "")),
-            ("Attachments", ", ".join(info["attachments"]) or "none"),
+            ("Attachments", attachment_summary(info)[0] if info["attachments"] else "none"),
             ("Recipients", f"{len(recipients)}: " + ", ".join(recipients))]
     rows = [(k, clean_field(v)) for k, v in rows]
     body = clean_body(info["body"])
@@ -344,8 +374,14 @@ def confirm_message(acct, info: dict, recipients: list[str]) -> str:
     counts = recipient_counts(info)
     bcc_warning = "WARNING: this email has hidden (Bcc) recipients."
     lines = ["Send this email from your Gmail account? It can't be undone.", ""]
+    att_count, att_names = attachment_summary(info)
     for k, v in rows:
-        if k in ("From", "Subject", "Attachments"):  # free text, not checked addresses
+        if k == "Attachments" and att_names:
+            # One fenced line per file, every file listed: never "a, b, …" truncation.
+            lines.append(f"Attachments ({att_count}):")
+            lines += [BODY_PREFIX + _no_markup(name) for name in att_names]
+            continue
+        if k in ("From", "Subject"):  # free text, not checked addresses
             v = _cap(v)
         lines.append(f"{k}: {_no_markup(v) or '-'}")
     if has_bcc:
@@ -356,7 +392,8 @@ def confirm_message(acct, info: dict, recipients: list[str]) -> str:
         lines += [BODY_PREFIX + piece for piece in wrap_display(line, budget)]
     lines += [BODY_END, "",
               f"Summary (from the server): sends to {len(recipients)} recipient(s): "
-              f"To {counts['to']}, Cc {counts['cc']}, Bcc {counts['bcc']}."]
+              f"To {counts['to']}, Cc {counts['cc']}, Bcc {counts['bcc']}; "
+              + (f"{att_count}." if att_names else "no attachments.")]
     if has_bcc:
         lines += [bcc_warning]
     lines += ["Check every field above. If you didn't ask for this email, decline: nothing is sent."]
@@ -1789,7 +1826,10 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
 
     def summary_html(acct, info: dict, recipients: list[str]) -> str:
         rows, has_bcc, preview = confirm_summary(acct, info, recipients)
-        dl = "".join(f"<dt>{e(k)}</dt><dd>{e(v) or '&mdash;'}</dd>" for k, v in rows)
+        _, names = attachment_summary(info)
+        files = ("<ul class='files'>" + "".join(f"<li>{e(n)}</li>" for n in names) + "</ul>") if names else ""
+        dl = "".join(f"<dt>{e(k)}</dt><dd>{e(v) or '&mdash;'}{files if k == 'Attachments' else ''}</dd>"
+                     for k, v in rows)
         bcc = "<p class='warn'>This email has hidden (Bcc) recipients.</p>" if has_bcc else ""
         return (f"<dl>{dl}</dl>{bcc}<p>Message (first {PREVIEW_CHARS} characters):</p>"
                 f"<pre>{e(preview)}</pre>")

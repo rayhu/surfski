@@ -14,8 +14,10 @@ from fastmcp.exceptions import ToolError
 from googleapiclient.errors import HttpError
 
 import surfski.gmail as g
+import surfski.server as srv
 from surfski.server import create_app
 
+from . import test_sending as ts
 from .fakes import StrictGmail
 from .test_elicitation import Human, call_with
 from .test_send_from import IDENTITIES
@@ -390,7 +392,9 @@ async def test_attachment_names_shown_for_confirmation(app, who, boxes, storage)
                         attachments=[PDF_REF, CSV_REF])
     assert r["status"] == "declined"
     [prompt] = human.prompts
-    assert "Attachments: 报告 Q1.pdf, data.csv" in prompt
+    size = srv.human_size(len(PDF) + len(CSV))
+    assert f"Attachments (2 attachments, {size}):\n│ 报告 Q1.pdf\n│ data.csv\n" in prompt
+    assert f"Bcc 0; 2 attachments, {size}." in prompt
     # the link channel's page uses the same summary source
     info = g.op_draft_for_send(boxes["alice@work.com"].service(), r["draft_id"])
     assert info["attachments"] == ["报告 Q1.pdf", "data.csv"]
@@ -420,3 +424,73 @@ async def test_forward_cross_mailbox_refused(app, who, boxes):
         await call(app, "forward_message", alias="work", message_id="m1", to="erin@x.com",
                    attachments=[{"message_id": "p1", "part_id": "1"}])
     assert boxes["alice@work.com"].writes == []
+
+
+# ---------------------------------------------------------------- confirmation summaries (review)
+
+
+def many_attachments_draft(box, n=20):
+    decoy = "invoice " + "x" * 190 + ".pdf"
+    parts = [{"partId": "0", "mimeType": "text/plain", "body": {"data": b64("hi")}}]
+    names = [decoy] + [f"file-{i}-" + "y" * 80 + ".xlsx" for i in range(1, n - 1)] + ["payroll.xlsx"]
+    for i, name in enumerate(names, 1):
+        parts.append({"partId": str(i), "mimeType": "application/octet-stream", "filename": name,
+                      "body": {"size": 1000, "attachmentId": f"a{i}"}})
+    box.drafts["dm"] = {"id": "dm", "message": {"id": "msg-dm", "threadId": "t-dm", "payload": {
+        "mimeType": "multipart/mixed", "headers": hdrs(From="alice@work.com", To="erin@x.com", Subject="Files"),
+        "parts": parts}}}
+    return names
+
+
+async def test_every_attachment_listed_in_prompt(app, who, boxes, storage):
+    storage.set_send_policy(ALICE, "work", "confirm")
+    names = many_attachments_draft(boxes["alice@work.com"])
+    human = Human("decline")
+    await call_with(app, human, "send_draft", alias="work", draft_id="dm")
+    lines = human.prompts[0].split("\n")
+    head = lines.index("Attachments (20 attachments, 20 KB):")
+    listed = lines[head + 1: head + 21]
+    assert len(listed) == 20 and all(line.startswith("│ ") for line in listed)
+    assert listed[-1] == "│ payroll.xlsx"  # can't be hidden behind a long decoy name
+    for line, name in zip(listed, names):
+        assert srv.display_width(line[2:]) <= srv.ATTACHMENT_NAME_COLS
+        assert line[2:] == name or (line.endswith("…") and name.startswith(line[2:-1]))
+    assert lines[head + 21].startswith("Recipients:")
+    assert any(line.endswith("Bcc 0; 20 attachments, 20 KB.") for line in lines)
+
+
+async def test_confirm_page_shows_count_and_every_name(config, storage, boxes, who):
+    storage.upsert_account(ALICE, "work", "alice@work.com", "rt", "s")
+    storage.set_send_policy(ALICE, "work", "confirm")
+    names = many_attachments_draft(boxes["alice@work.com"])
+    google = ts.Google()
+
+    def factory(owner, alias):
+        return boxes[storage.get_account(owner, alias).email].service()
+
+    app = create_app(replace(config, sending_enabled=True, confirm_channel="link"), storage=storage,
+                     with_auth=False, service_factory=factory, http_factory=google.factory)
+    r = await call(app, "send_draft", alias="work", draft_id="dm")
+    client = ts.web(app)
+    ts.sign_in(client, google, ts.token_of(r["confirm_url"]))
+    page = client.get("/send/confirm?token=" + ts.token_of(r["confirm_url"])).text
+    assert "20 attachments, 20 KB" in page and page.count("<li>") == 20
+    assert "payroll.xlsx" in page and boxes["alice@work.com"].sent == []
+    assert names[0][:20] in page
+
+
+async def test_update_fails_instead_of_dropping_unreadable_attachment(app, who, boxes):
+    box = boxes["alice@work.com"]
+    box.drafts["d1"] = {"id": "d1", "message": {"id": "dm1", "threadId": "t9", "payload": {
+        "mimeType": "multipart/mixed", "headers": hdrs(From="alice@work.com", To="bob@x.com", Subject="S"),
+        "parts": [
+            {"partId": "0", "mimeType": "text/plain", "body": {"data": b64("hi")}},
+            {"partId": "1", "mimeType": "application/pdf", "filename": "ghost.pdf", "body": {"size": 0}},
+        ]}}}
+    with pytest.raises(ToolError, match="'ghost.pdf' has no content.*nothing was saved"):
+        await call(app, "update_draft", alias="work", draft_id="d1", body="new")
+    assert box.writes == []
+    # forward keeps reporting such a part as skipped
+    box.messages["m1"]["payload"]["parts"][1]["body"] = {"size": 0}
+    r = await call(app, "forward_message", alias="work", message_id="m1", to="erin@x.com")
+    assert r["skipped"] == [{"filename": "报告 Q1.pdf", "reason": "no content available"}]
