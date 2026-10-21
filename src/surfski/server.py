@@ -39,7 +39,8 @@ INSTRUCTIONS = (
     "Search, read and draft email across the caller's linked Gmail accounts. "
     "Each account has an alias (e.g. 'work', 'personal'). If the user hasn't named an "
     "account, call list_accounts first. Sending is NOT supported: create_draft saves a "
-    "draft the user sends from Gmail. To add a mailbox, call link_account and give the "
+    "draft the user sends from Gmail; list_drafts, get_draft, update_draft and delete_draft "
+    "manage existing drafts. To add a mailbox, call link_account and give the "
     "user the returned URL to open."
 )
 
@@ -418,6 +419,71 @@ def create_app(
 
         detail = "reply" if reply_to_message_id else "new"
         return await gmail_call(owner, alias, "create_draft", detail, fn)
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    async def list_drafts(
+        alias: str,
+        max_results: Annotated[int, Field(ge=1, le=50)] = 20,
+        page_token: str | None = None,
+    ) -> dict:
+        """List drafts in one linked account (newest first): draft id, message id,
+        subject, recipients, date and snippet. Use next_page_token for more."""
+        owner = require_owner("list_drafts")
+        return await gmail_call(
+            owner, alias, "list_drafts", f"max={max_results}",
+            lambda svc, a: g.op_list_drafts(svc, max_results, page_token),
+        )
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    async def get_draft(
+        alias: str,
+        draft_id: str,
+        max_body_chars: Annotated[int, Field(ge=0, le=200_000)] = 20000,
+    ) -> dict:
+        """Read one draft (same shape as get_message, plus draft_id)."""
+        owner = require_owner("get_draft")
+        return await gmail_call(
+            owner, alias, "get_draft", f"draft={draft_id}",
+            lambda svc, a: g.op_get_draft(svc, draft_id, max_body_chars),
+        )
+
+    @mcp.tool
+    async def update_draft(
+        alias: str,
+        draft_id: str,
+        to: Annotated[str | None, Field(description="Comma-separated recipients; omit to keep")] = None,
+        subject: Annotated[str | None, Field(description="Omit to keep the current subject")] = None,
+        body: Annotated[str | None, Field(description="Plain-text body; omit to keep")] = None,
+        cc: Annotated[str | None, Field(description="Omit to keep, empty string to clear")] = None,
+        bcc: Annotated[str | None, Field(description="Omit to keep, empty string to clear")] = None,
+    ) -> dict:
+        """Revise an existing draft. Omitted fields keep their current values; the
+        sender and reply threading are preserved. The draft is saved as plain text.
+        This does NOT send."""
+        owner = require_owner("update_draft")
+
+        def fn(svc, acct):
+            r = g.op_update_draft(
+                svc, draft_id=draft_id, default_from=acct.email,
+                to=to, subject=subject, body=body, cc=cc, bcc=bcc,
+            )
+            r["gmail_url"] = g.gmail_drafts_url(acct.email)
+            return r
+
+        fields = ",".join(
+            k for k, v in (("to", to), ("subject", subject), ("body", body), ("cc", cc), ("bcc", bcc))
+            if v is not None
+        )
+        return await gmail_call(owner, alias, "update_draft", f"draft={draft_id} fields={fields}", fn)
+
+    @mcp.tool(annotations={"destructiveHint": True})
+    async def delete_draft(alias: str, draft_id: str) -> dict:
+        """Permanently delete a draft (it does not go to Trash)."""
+        owner = require_owner("delete_draft")
+        return await gmail_call(
+            owner, alias, "delete_draft", f"draft={draft_id}",
+            lambda svc, a: g.op_delete_draft(svc, draft_id),
+        )
 
     # -- HTTP routes
 

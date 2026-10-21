@@ -423,5 +423,90 @@ def op_create_draft(
     return {"draft_id": draft.get("id"), "thread_id": thread_id}
 
 
+DRAFT_LIST_HEADERS = ["Subject", "To", "Date"]
+
+
+def op_list_drafts(svc, max_results: int, page_token: str | None) -> dict:
+    drafts = svc.users().drafts()
+    kwargs: dict[str, Any] = {"userId": "me", "maxResults": max_results}
+    if page_token:
+        kwargs["pageToken"] = page_token
+    resp = drafts.list(**kwargs).execute()
+    out = []
+    for d in resp.get("drafts", []) or []:
+        full = (
+            drafts.get(userId="me", id=d["id"], format="metadata", metadataHeaders=DRAFT_LIST_HEADERS)
+            .execute()
+        )
+        msg = full.get("message") or {}
+        h = headers_map(msg.get("payload") or {})
+        out.append(
+            {
+                "draft_id": full.get("id", d["id"]),
+                "message_id": msg.get("id"),
+                "thread_id": msg.get("threadId"),
+                "subject": h.get("subject", ""),
+                "to": h.get("to", ""),
+                "date": h.get("date", ""),
+                # Gmail returns snippets HTML-escaped (e.g. "&#39;").
+                "snippet": unescape(msg.get("snippet") or ""),
+            }
+        )
+    return {"drafts": out, "next_page_token": resp.get("nextPageToken")}
+
+
+def op_get_draft(svc, draft_id: str, max_body_chars: int) -> dict:
+    d = svc.users().drafts().get(userId="me", id=draft_id, format="full").execute()
+    return {"draft_id": d.get("id", draft_id), **parse_message(d.get("message") or {}, max_body_chars)}
+
+
+def op_update_draft(
+    svc,
+    *,
+    draft_id: str,
+    default_from: str,
+    to: str | None,
+    subject: str | None,
+    body: str | None,
+    cc: str | None,
+    bcc: str | None,
+) -> dict:
+    """Rebuild a draft's MIME. None keeps the current value; "" clears cc/bcc.
+    From, threadId, In-Reply-To and References are always preserved."""
+    drafts = svc.users().drafts()
+    current = drafts.get(userId="me", id=draft_id, format="full").execute()
+    msg = current.get("message") or {}
+    payload = msg.get("payload") or {}
+    if extract_attachments(payload):
+        raise GmailError(
+            "this draft has attachments, which update_draft would drop; edit it in Gmail instead"
+        )
+    h = headers_map(payload)
+    new_to = h.get("to", "") if to is None else to
+    if not _addr_list(new_to):
+        raise GmailError("the draft has no recipients; pass 'to'")
+    mime = build_mime(
+        from_addr=h.get("from") or default_from,
+        to=new_to,
+        subject=h.get("subject", "") if subject is None else subject,
+        body=extract_body(payload) if body is None else body,
+        cc=h.get("cc") if cc is None else cc,
+        bcc=h.get("bcc") if bcc is None else bcc,
+        in_reply_to=h.get("in-reply-to") or None,
+        references=h.get("references") or None,
+    )
+    message: dict[str, Any] = {"raw": encode_raw(mime)}
+    if msg.get("threadId"):
+        # Without threadId Gmail silently detaches the draft from its thread.
+        message["threadId"] = msg["threadId"]
+    updated = drafts.update(userId="me", id=draft_id, body={"id": draft_id, "message": message}).execute()
+    return {"draft_id": updated.get("id", draft_id)}
+
+
+def op_delete_draft(svc, draft_id: str) -> dict:
+    svc.users().drafts().delete(userId="me", id=draft_id).execute()
+    return {"ok": True}
+
+
 def gmail_drafts_url(email: str) -> str:
     return f"https://mail.google.com/mail/u/{parseaddr(email)[1] or email}/#drafts"
