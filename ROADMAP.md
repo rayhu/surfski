@@ -85,7 +85,9 @@ See [Calendar module](#calendar-module).
   `TOKEN_ENCRYPTION_KEY` by re-encrypting existing rows.
 - **Mailbox triage, opt-in**: `mark_read`, `star`, `archive`, `apply_label`. It needs `gmail.modify`,
   which is requested by relinking only for mailboxes that turn it on.
-- **Attachments on drafts**: attach files from existing messages when drafting, replying or forwarding.
+- ✅ **Attachments on drafts** (#16): `create_draft`, `update_draft`, `send_email` and `forward_message`
+  attach files from existing messages in the same mailbox (`{message_id, part_id}`). `update_draft` now
+  keeps a draft's attachments and can add or remove them. 20 MB total.
 - ✅ **`unsubscribe`** (#17): parse `List-Unsubscribe` and `List-Unsubscribe-Post` (one-click, RFC 8058),
   and run it only after confirmation. The one-click POST is SSRF-hardened; mailto goes through the send
   policy; plain web links are returned, never opened.

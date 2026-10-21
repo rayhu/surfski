@@ -134,7 +134,7 @@ async def test_forward_body_attachments_and_from(app, who, boxes, services, stor
     assert r == {
         "draft_id": "fwd1", "gmail_url": "https://mail.google.com/mail/u/alice@work.com/#drafts",
         "from": "sales@work.org", "from_source": "reply",  # original was sent to the sales alias
-        "attachments": ["inline-1.png", "Q1 报告.pdf"],
+        "attachments": ["inline-1.png", "Q1 报告.pdf"], "attachment_bytes": len(PNG) + len(PDF),
     }
     box = boxes["alice@work.com"]
     created = box.created[-1]

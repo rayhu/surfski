@@ -451,3 +451,32 @@ async def test_owner_isolation(app, who, boxes, net, storage):
     r = await call(app, "unsubscribe", alias="secret", message_id="m-oc")
     assert r["method"] == "one_click" and boxes["alice@work.com"].svc is None
 
+
+
+async def test_idn_host_uses_punycode_for_dns_and_sni(net):
+    DNS["xn--bcher-kva.example"] = [PUBLIC]
+    try:
+        r = await post(net, "https://bücher.example/u")
+    finally:
+        del DNS["xn--bcher-kva.example"]
+    assert r["status"] == 200
+    [req] = net.requests
+    assert req.extensions["sni_hostname"] == "xn--bcher-kva.example"
+    assert req.headers["host"] == "xn--bcher-kva.example"
+
+
+async def test_no_keepalive_pool(net, monkeypatch):
+    # Pinned requests share one pool keyed by IP; keep-alive would let a later hop for a
+    # different hostname reuse an earlier TLS connection. The client must disable it.
+    seen = {}
+    real = httpx.AsyncClient
+
+    class Spy(real):
+        def __init__(self, *a, **kw):
+            seen.update(kw)
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(unsub.httpx, "AsyncClient", Spy)
+    await post(net, "https://news.example.com/u")
+    assert seen["limits"].max_keepalive_connections == 0
+    assert seen["trust_env"] is False and seen["follow_redirects"] is False

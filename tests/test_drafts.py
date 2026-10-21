@@ -180,21 +180,6 @@ async def test_update_draft_keeps_body_and_clears_cc(app, who, store):
     assert m.get_content().strip() == "Let's meet Tuesday."
 
 
-async def test_update_draft_refuses_attachments(app, who, store):
-    d = store["alice@work.com"]["d1"]
-    d["message"]["payload"] = {
-        "mimeType": "multipart/mixed",
-        "headers": d["message"]["payload"]["headers"],
-        "parts": [
-            {"mimeType": "text/plain", "body": {"data": b64("hi")}},
-            {"mimeType": "application/pdf", "filename": "a.pdf", "body": {"size": 9, "attachmentId": "x"}},
-        ],
-    }
-    with pytest.raises(ToolError, match="attachments"):
-        await call(app, "update_draft", alias="work", draft_id="d1", body="new")
-    assert "_last_update" not in d
-
-
 async def test_update_draft_without_recipients_needs_to(app, who, store):
     store["alice@work.com"]["d3"] = reply_draft("d3", To="")
     with pytest.raises(ToolError, match="pass 'to'"):
@@ -256,23 +241,6 @@ async def test_update_draft_rejects_line_breaks(app, who, store, field):
     with pytest.raises(ToolError, match=f"'{field}' must not contain line breaks"):
         await call(app, "update_draft", alias="work", draft_id="d1", **{field: value})
     assert "_last_update" not in store["alice@work.com"]["d1"]
-
-
-async def test_update_draft_refuses_inline_image(app, who, store):
-    d = store["alice@work.com"]["d1"]
-    d["message"]["payload"] = {
-        "mimeType": "multipart/related",
-        "headers": d["message"]["payload"]["headers"],
-        "parts": [
-            {"mimeType": "text/html", "body": {"data": b64('<p>hi <img src="cid:i1"></p>')}},
-            {"mimeType": "image/png", "filename": "",
-             "headers": [{"name": "Content-ID", "value": "<i1>"}],
-             "body": {"size": 99, "attachmentId": "att1"}},
-        ],
-    }
-    with pytest.raises(ToolError, match="attachments"):
-        await call(app, "update_draft", alias="work", draft_id="d1", body="new")
-    assert "_last_update" not in d
 
 
 async def test_update_draft_flags_flattened_html(app, who, store):
