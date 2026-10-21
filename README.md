@@ -170,6 +170,8 @@ If you lose the keys, users simply relink their mailboxes.
 
 ## Development
 
+The runtime is **Python 3.14**: the Docker image and `.python-version` both use it. Python 3.12 and newer is supported for pip and uv installs, and CI tests 3.14 and 3.12.
+
 ```bash
 uv sync
 ```
