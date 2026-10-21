@@ -1,8 +1,8 @@
-# Bonobo
+# Surfski
 
-**Many Gmail inboxes, one Claude connector.**
+**Many Gmail inboxes, one Claude connector.** · [surfski.io](https://surfski.io)
 
-Bonobo is a small, self-hosted **remote MCP server** (`bonobo-mcp`). You add it to Claude once as a custom connector.
+Surfski is a small, self-hosted **remote MCP server**. You add it to Claude once as a custom connector.
 After that, Claude can search, read and draft email across **several Gmail / Google
 Workspace mailboxes** for each user, and users never see each other's mailboxes.
 
@@ -74,18 +74,18 @@ Caddy, nginx or Traefik.
 ### 2. Configure
 
 ```bash
-git clone <this repo> /opt/bonobo && cd /opt/bonobo
+git clone <this repo> /opt/surfski && cd /opt/surfski
 ```
 
 ```bash
-sudo install -d -m 700 /etc/bonobo && sudo install -m 600 deploy/env.example /etc/bonobo/env
+sudo install -d -m 700 /etc/surfski && sudo install -m 600 deploy/env.example /etc/surfski/env
 ```
 
 ```bash
 python3 scripts/gen_secrets.py
 ```
 
-Paste the four generated secrets into `/etc/bonobo/env`, then fill in `BASE_URL`,
+Paste the four generated secrets into `/etc/surfski/env`, then fill in `BASE_URL`,
 `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and `ALLOWED_USERS`. The server **refuses to start**
 if any secret is missing or malformed.
 
@@ -96,7 +96,7 @@ if any secret is missing or malformed.
 ### 3. Run
 
 ```bash
-sudo docker compose -p bonobo up -d --build
+sudo docker compose -p surfski up -d --build
 ```
 
 ```bash
@@ -117,12 +117,12 @@ When you link a mailbox, sign in **as that mailbox** and tick **both** permissio
 ### Upgrade
 
 ```bash
-git pull && sudo docker compose -p bonobo up -d --build
+git pull && sudo docker compose -p surfski up -d --build
 ```
 
 ### Backups
 
-Back up the `bonobo_bonobo-data` volume, for example with a nightly `tar` from a throwaway
+Back up the `surfski_surfski-data` volume, for example with a nightly `tar` from a throwaway
 container. **The backup is useless without `TOKEN_ENCRYPTION_KEY` and `STORAGE_ENCRYPTION_KEY`.
 Keep the env file in a separate place, such as a password manager, never in the same backup.**
 If you lose the keys, users simply relink their mailboxes.
@@ -138,7 +138,7 @@ If you lose the keys, users simply relink their mailboxes.
 | `STORAGE_ENCRYPTION_KEY` | yes | Fernet key for the OAuth client store |
 | `TOKEN_ENCRYPTION_KEY` | yes | Fernet key for stored Gmail refresh tokens |
 | `STATE_SECRET` | yes | HMAC key for single-use linking state (≥32 chars) |
-| `DATA_DIR` | no | Default `/var/lib/bonobo`; `/data` in the container |
+| `DATA_DIR` | no | Default `/var/lib/surfski`; `/data` in the container |
 | `TOKEN_ENCRYPTION_KEYS` | no | Per-owner Fernet keys `owner=key,owner=key` |
 | `ALLOWED_CLIENT_REDIRECT_URIS` | no | MCP client redirect allowlist. Defaults to Claude's callbacks, plus localhost when `BASE_URL` is localhost |
 | `RATE_LIMIT_PER_MINUTE` | no | Tool calls per owner per minute (default 60) |
@@ -161,7 +161,7 @@ For a local run, set `BASE_URL=http://localhost:8000` and add `http://localhost:
 and `/gmail/callback` to your OAuth client:
 
 ```bash
-set -a; source ./local.env; set +a; uv run bonobo-mcp
+set -a; source ./local.env; set +a; uv run surfski
 ```
 
 ### Library notes

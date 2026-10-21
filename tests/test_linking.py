@@ -3,7 +3,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from bonobo_mcp.linking import (
+from surfski.linking import (
     LinkError,
     consume_state,
     sign_state,

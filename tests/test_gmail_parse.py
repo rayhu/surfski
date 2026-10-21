@@ -4,7 +4,7 @@ from email import policy
 
 import pytest
 
-from bonobo_mcp import gmail as g
+from surfski import gmail as g
 
 
 def b64(s: str, enc="utf-8") -> str:

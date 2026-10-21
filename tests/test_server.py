@@ -11,8 +11,8 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from starlette.testclient import TestClient
 
-import bonobo_mcp.server as srv
-from bonobo_mcp.server import create_app
+import surfski.server as srv
+from surfski.server import create_app
 
 ALICE, BOB = "alice@example.com", "bob@example.com"
 

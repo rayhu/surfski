@@ -1,11 +1,11 @@
-name: bonobo
+name: surfski
 
 services:
   app:
     build: .
-    image: bonobo:latest
+    image: surfski:latest
     restart: unless-stopped
-    env_file: /etc/bonobo/env
+    env_file: /etc/surfski/env
     environment:
       # Inside the container the app must listen on all interfaces; only the
       # host loopback port below is published.
@@ -15,7 +15,7 @@ services:
     ports:
       - "127.0.0.1:38000:8000"
     volumes:
-      - bonobo-data:/data
+      - surfski-data:/data
     read_only: true
     tmpfs:
       - /tmp
@@ -33,4 +33,4 @@ services:
     # Own default network only: no shared networks with other stacks, never mount docker.sock.
 
 volumes:
-  bonobo-data:
+  surfski-data:

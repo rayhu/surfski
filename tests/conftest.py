@@ -1,8 +1,8 @@
 import pytest
 from cryptography.fernet import Fernet
 
-from bonobo_mcp.config import load_config
-from bonobo_mcp.storage import Storage, TokenCipher
+from surfski.config import load_config
+from surfski.storage import Storage, TokenCipher
 
 KEY_A = Fernet.generate_key().decode()
 KEY_B = Fernet.generate_key().decode()

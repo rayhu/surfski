@@ -33,7 +33,7 @@ from .linking import (
 )
 from .storage import AccountNotFound, Storage, StorageError, TokenCipher, validate_alias
 
-log = logging.getLogger("bonobo_mcp")
+log = logging.getLogger("surfski")
 
 INSTRUCTIONS = (
     "Search, read and draft email across the caller's linked Gmail accounts. "
@@ -165,11 +165,11 @@ def create_app(
     make_service = service_factory or default_service_factory
 
     mcp = FastMCP(
-        name="bonobo",
+        name="surfski",
         instructions=INSTRUCTIONS,
         auth=build_auth(config) if with_auth else None,
     )
-    mcp.bonobo = {"storage": storage, "config": config}  # handy for tests/ops
+    mcp.surfski = {"storage": storage, "config": config}  # handy for tests/ops
 
     # -- identity
 
@@ -477,7 +477,7 @@ def main() -> None:
     )
     install_log_redaction()
     mcp = create_app(config)
-    log.info("starting bonobo-mcp on %s:%s (base_url=%s)", config.host, config.port, config.base_url)
+    log.info("starting surfski on %s:%s (base_url=%s)", config.host, config.port, config.base_url)
     mcp.run(
         transport="http",
         host=config.host,

@@ -5,7 +5,7 @@ import stat
 import pytest
 from cryptography.fernet import Fernet
 
-from bonobo_mcp.storage import AccountNotFound, Storage, StorageError, TokenCipher
+from surfski.storage import AccountNotFound, Storage, StorageError, TokenCipher
 
 A, B = "alice@example.com", "bob@example.com"
 

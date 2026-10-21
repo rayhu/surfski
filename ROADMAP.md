@@ -19,7 +19,7 @@ GitHub issue. A ✅ marks shipped items.
 ## Phase 2: self-host polish
 
 - `ALLOWED_DOMAINS`: allow a whole Workspace domain as well as individual addresses.
-- **Admin CLI** (`bonobo-mcp admin …`): list owners and aliases, force-unlink, rotate
+- **Admin CLI** (`surfski admin …`): list owners and aliases, force-unlink, rotate
   `TOKEN_ENCRYPTION_KEY` by re-encrypting existing rows.
 - **Labels and archive** (needs `gmail.modify`). This would be opt-in, like sending.
 - **Attachment download** with size limits, text extraction for PDFs and docs, and no binary pass-through by default.

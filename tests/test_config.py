@@ -1,7 +1,7 @@
 import pytest
 
-from bonobo_mcp.audit import redact
-from bonobo_mcp.config import CLAUDE_REDIRECT_URIS, ConfigError, load_config
+from surfski.audit import redact
+from surfski.config import CLAUDE_REDIRECT_URIS, ConfigError, load_config
 from tests.conftest import make_env
 
 
@@ -44,7 +44,7 @@ def test_redact():
 def test_redact_absolute_url_and_quiet_loggers(caplog):
     import logging
 
-    from bonobo_mcp.audit import install_log_redaction
+    from surfski.audit import install_log_redaction
 
     out = redact("HTTP Request: GET https://oauth2.googleapis.com/tokeninfo?access_token=ya29.X")
     assert "ya29.X" not in out and "oauth2.googleapis.com/tokeninfo" in out

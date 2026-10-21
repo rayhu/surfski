@@ -7,7 +7,7 @@ import re
 
 from .storage import Storage
 
-log = logging.getLogger("bonobo_mcp.audit")
+log = logging.getLogger("surfski.audit")
 
 
 def write_audit(

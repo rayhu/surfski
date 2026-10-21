@@ -51,7 +51,7 @@ class Config:
     token_encryption_key: str
     token_encryption_keys: dict[str, str] = field(default_factory=dict)
     state_secret: bytes = b""
-    data_dir: Path = Path("/var/lib/bonobo")
+    data_dir: Path = Path("/var/lib/surfski")
     log_level: str = "INFO"
     host: str = "127.0.0.1"
     port: int = 8000
@@ -130,7 +130,7 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         token_encryption_key=env["TOKEN_ENCRYPTION_KEY"],
         token_encryption_keys=per_owner,
         state_secret=env["STATE_SECRET"].encode(),
-        data_dir=Path(env.get("DATA_DIR") or "/var/lib/bonobo"),
+        data_dir=Path(env.get("DATA_DIR") or "/var/lib/surfski"),
         log_level=env.get("LOG_LEVEL", "INFO").upper(),
         host=env.get("HOST", "127.0.0.1"),
         port=int(env.get("PORT", "8000")),
