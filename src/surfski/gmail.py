@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import base64
 import calendar
+import io
+import mimetypes
 import re
 import threading
 import time
@@ -23,6 +25,7 @@ from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseUpload
 
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 SUMMARY_HEADERS = ["Subject", "From", "Date"]
@@ -480,9 +483,9 @@ def signature_text(identity: dict) -> str:
     return html_to_text(identity.get("signature") or "")
 
 
-def strip_signature(body: str, candidates: list[dict]) -> str:
+def strip_signature(body: str, candidates: list[dict]) -> tuple[str, bool]:
     """Remove one trailing '-- \n<signature>' block whose signature belongs to one of
-    the candidate identities (checked in order)."""
+    the candidate identities (checked in order). Returns (body, stripped)."""
     trimmed = body.rstrip()
     for ident in candidates:
         sig = signature_text(ident)
@@ -490,10 +493,10 @@ def strip_signature(body: str, candidates: list[dict]) -> str:
             continue
         block = f"-- \n{sig}"
         if trimmed == block:
-            return ""
+            return "", True
         if trimmed.endswith("\n" + block):
-            return trimmed[: -len(block)].rstrip()
-    return body
+            return trimmed[: -len(block)].rstrip(), True
+    return body, False
 
 
 def append_signature(body: str, identity: dict) -> str:
@@ -685,6 +688,7 @@ def op_update_draft(
     prev_addr = parseaddr(from_value)[1].lower()
     chosen = choose_from(prev_addr) if choose_from else None
     new_body = (extract_body(payload) if body is None else body).replace("\r\n", "\n")
+    signature_replaced: bool | None = None
     if chosen:
         from_value = from_header(chosen[0])
         if chosen[0]["address"] != prev_addr or include_signature:
@@ -692,7 +696,9 @@ def op_update_draft(
             # identity's) so a sender switch doesn't leave the old signature behind.
             known = known_identities or []
             prev = [i for i in known if i["address"] == prev_addr]
-            new_body = strip_signature(new_body, prev + known)
+            new_body, stripped = strip_signature(new_body, prev + known)
+            if chosen[0]["address"] != prev_addr:
+                signature_replaced = stripped
         if include_signature:
             new_body = append_signature(new_body, chosen[0])
     mime = build_mime(
@@ -713,8 +719,126 @@ def op_update_draft(
     out: dict[str, Any] = {"draft_id": updated.get("id", draft_id)}
     if chosen:
         out["from"], out["from_source"] = chosen[0]["address"], chosen[1]
+    if signature_replaced is not None:
+        out["signature_replaced"] = signature_replaced
     if flattened_html:
         out["flattened_html"] = True
+    return out
+
+
+FORWARD_MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+# Above this encoded size the draft is uploaded as message/rfc822 media instead of
+# a JSON 'raw' field (Gmail recommends media upload for messages over ~5 MB).
+RAW_JSON_LIMIT = 4 * 1024 * 1024
+
+
+def forward_subject(subject: str) -> str:
+    subject = (subject or "").strip()
+    if re.match(r"^\s*(fwd?|转发)\s*[:：]", subject, re.I):
+        return subject
+    return f"Fwd: {subject}" if subject else "Fwd:"
+
+
+def forward_header_block(h: dict[str, str]) -> str:
+    lines = ["---------- Forwarded message ---------"]
+    for name in ("From", "Date", "Subject", "To", "Cc"):
+        value = h.get(name.lower(), "")
+        if value or name != "Cc":
+            lines.append(f"{name}: {value}")
+    return "\n".join(lines)
+
+
+def _mb(n: int) -> str:
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
+def _attachment_name(part: dict, index: int) -> str:
+    if part.get("filename"):
+        return part["filename"]
+    ext = mimetypes.guess_extension(part.get("mimeType") or "") or ".bin"
+    return f"inline-{index}{ext}"
+
+
+def op_forward_message(
+    svc,
+    *,
+    message_id: str,
+    choose_from: Callable[[list[str]], tuple[dict, str]],
+    to: str,
+    note: str | None,
+    cc: str | None,
+    bcc: str | None,
+    include_signature: bool = False,
+    max_attachment_bytes: int = FORWARD_MAX_ATTACHMENT_BYTES,
+) -> dict:
+    """Save a forward of message_id as a new draft (new thread), re-attaching the
+    original's attachments."""
+    users = svc.users()
+    orig = users.messages().get(userId="me", id=message_id, format="full").execute()
+    payload = orig.get("payload") or {}
+    h = headers_map(payload)
+    parts = [p for p in _walk(payload) if _is_attachment(p)]
+    sizes = [(_attachment_name(p, i), int((p.get("body") or {}).get("size") or 0)) for i, p in enumerate(parts, 1)]
+    total = sum(n for _, n in sizes)
+    if total > max_attachment_bytes:
+        listing = ", ".join(f"{name} ({_mb(n)})" for name, n in sizes)
+        raise GmailError(
+            f"attachments total {_mb(total)}, over the {_mb(max_attachment_bytes)} forward limit: "
+            f"{listing}. Forward it from Gmail instead."
+        )
+
+    identity, source = choose_from(recipient_addresses(h))
+    intro = (note or "").strip()
+    if include_signature:
+        intro = append_signature(intro, identity)
+    original_body = extract_body(payload).replace("\r\n", "\n")
+    text = "\n\n".join(x for x in (intro, forward_header_block(h), original_body) if x)
+
+    mime = build_mime(
+        from_addr=from_header(identity),
+        to=to,
+        subject=forward_subject(h.get("subject", "")),
+        body=text,
+        cc=cc,
+        bcc=bcc,
+    )
+    attached, skipped = [], []
+    for (name, _), part in zip(sizes, parts):
+        pbody = part.get("body") or {}
+        data = pbody.get("data")
+        if not data and pbody.get("attachmentId"):
+            data = (
+                users.messages().attachments()
+                .get(userId="me", messageId=message_id, id=pbody["attachmentId"])
+                .execute()
+                .get("data")
+            )
+        if not data:
+            skipped.append({"filename": name, "reason": "no content available"})
+            continue
+        mime_type = (part.get("mimeType") or "application/octet-stream").lower()
+        maintype, _, subtype = mime_type.partition("/")
+        if maintype == "multipart" or not subtype:
+            maintype, subtype = "application", "octet-stream"
+        mime.add_attachment(_decode_b64(data), maintype=maintype, subtype=subtype, filename=name)
+        attached.append(name)
+
+    raw_bytes = mime.as_bytes()
+    drafts = users.drafts()
+    if len(raw_bytes) * 4 // 3 > RAW_JSON_LIMIT:
+        media = MediaIoBaseUpload(io.BytesIO(raw_bytes), mimetype="message/rfc822", resumable=True)
+        draft = drafts.create(userId="me", body={"message": {}}, media_body=media).execute()
+    else:
+        raw = base64.urlsafe_b64encode(raw_bytes).decode()
+        draft = drafts.create(userId="me", body={"message": {"raw": raw}}).execute()
+    out: dict[str, Any] = {
+        "draft_id": draft.get("id"),
+        "from": identity["address"],
+        "from_source": source,
+        "attachments": attached,
+    }
+    if skipped:
+        out["skipped"] = skipped
     return out
 
 

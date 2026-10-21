@@ -2,6 +2,7 @@
 from_address on create_draft/update_draft. Gmail is a discovery-validated StrictGmail."""
 
 import base64
+import copy
 import email
 from email import policy
 
@@ -45,6 +46,7 @@ def parse(body: dict):
 class Mailbox:
     def __init__(self, address: str):
         self.address = address
+        self.identities = copy.deepcopy(IDENTITIES[address])
         self.created: list[dict] = []
         self.updated: list[dict] = []
         self.drafts: dict[str, dict] = {}
@@ -62,7 +64,7 @@ class Mailbox:
     def send_as(self, **kw):
         if self.send_as_error:
             raise self.send_as_error
-        return {"sendAs": IDENTITIES[self.address]}
+        return {"sendAs": self.identities}
 
     def create(self, **kw):
         self.created.append(kw["body"])
@@ -334,7 +336,7 @@ async def test_switching_identity_replaces_signature(app, who, boxes):
     sig_draft(box, "s1", "张三 <sales@work.org>", "Hello\r\n\r\n-- \r\n张三\r\nSales & Support\r\n")
     r = await call(app, "update_draft", alias="work", draft_id="s1", from_address="alice@work.com",
                    include_signature=True)
-    assert r["from"] == "alice@work.com"
+    assert r["from"] == "alice@work.com" and r["signature_replaced"] is True
     assert parse(box.updated[-1]).get_content().rstrip() == "Hello\n\n-- \nAlice Wong"
     # switching back without include_signature drops the old block and adds none
     await call(app, "update_draft", alias="work", draft_id="s1", from_address="sales@work.org")
@@ -370,3 +372,22 @@ async def test_stored_default_not_silently_dropped_when_send_as_fails(app, who, 
     with pytest.raises(ToolError, match="couldn't read the send-as addresses"):
         await call(app, "create_draft", alias="work", to="c@x.com", subject="s", body="b")
     assert boxes["alice@work.com"].created == []
+
+
+async def test_signature_edited_in_gmail_after_draft(app, who, boxes, services):
+    box = boxes["alice@work.com"]
+    await call(app, "list_addresses", alias="work")  # cache: Alice's signature is "Alice Wong"
+    sig_draft(box, "e1", "Alice <alice@work.com>", "Hi\n\n-- \nAlice Wong")
+    # Later, both signatures are edited in Gmail.
+    box.identities[0]["signature"] = "Alice Wong, CEO"
+    box.identities[1]["signature"] = "Sales v2"
+    n = send_as_calls(services)
+    r = await call(app, "update_draft", alias="work", draft_id="e1", from_address="sales@work.org",
+                   include_signature=True)
+    assert send_as_calls(services) == n + 1  # served from cache, then refreshed on the identity switch
+    # The draft's old block no longer matches any current signature: not stripped, flagged.
+    assert r["signature_replaced"] is False
+    assert parse(box.updated[-1]).get_content().rstrip() == "Hi\n\n-- \nAlice Wong\n\n-- \nSales v2"
+    # Same identity (no switch): no refresh and no signature_replaced flag.
+    r = await call(app, "update_draft", alias="work", draft_id="e1", subject="x")
+    assert "signature_replaced" not in r

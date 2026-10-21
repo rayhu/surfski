@@ -66,7 +66,7 @@ See [Calendar module](#calendar-module).
 - ✅ **Draft management**: `list_drafts`, `get_draft`, `update_draft`, `delete_draft`. Today Claude can
   create a draft but can't revise one, and "fix the draft you just wrote" is a common request. Uses the
   existing `gmail.compose` scope.
-- **`forward_message`**: forward a message, keeping its original attachments. It saves a draft by
+- ✅ **`forward_message`**: forward a message, keeping its original attachments. It saves a draft by
   default, and sends only when the mailbox's send policy allows it.
 - **`get_attachment`**: read attachment content with size limits. PDF and DOCX are extracted to text,
   with no binary pass-through by default.

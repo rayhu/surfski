@@ -629,8 +629,9 @@ def create_app(
         """Revise an existing draft. Omitted fields keep their current values; the
         sender and reply threading are preserved. The draft is saved as plain text:
         if the result has flattened_html=true, the draft had HTML formatting that is
-        now gone, so tell the user. Drafts with attachments are refused. This does
-        NOT send."""
+        now gone, so tell the user. If signature_replaced=false, the sender changed but
+        the old signature wasn't recognised (e.g. edited since), so warn the user it may
+        still be in the body. Drafts with attachments are refused. This does NOT send."""
         owner = require_owner("update_draft")
 
         def fn(svc, acct):
@@ -642,7 +643,13 @@ def create_app(
                 def choose(current_from: str):
                     labels = storage.get_address_labels(owner, acct.alias)
                     if from_address:
-                        return g.match_identity(ids, from_address, labels)
+                        picked = g.match_identity(ids, from_address, labels)
+                        if picked[0]["address"] != current_from:
+                            # Identity switch: refetch so signatures edited in Gmail
+                            # since the cache was filled are the ones stripped/added.
+                            ids[:] = identities(owner, acct.alias, svc, refresh=True)
+                            picked = g.match_identity(ids, from_address, labels)
+                        return picked
                     for i in ids:
                         if i["address"] == current_from and g.is_verified(i):
                             return i, "current"
@@ -663,6 +670,45 @@ def create_app(
             if v is not None
         )
         return await gmail_call(owner, alias, "update_draft", f"draft={draft_id} fields={fields}", fn)
+
+    @mcp.tool
+    async def forward_message(
+        alias: str,
+        message_id: str,
+        to: Annotated[str, Field(description="Comma-separated recipient addresses")],
+        note: Annotated[str | None, Field(description="Plain-text note above the forwarded message")] = None,
+        cc: str | None = None,
+        bcc: str | None = None,
+        from_address: Annotated[
+            str | None, Field(description="Send-as address or label (see list_addresses)")
+        ] = None,
+        include_signature: Annotated[
+            bool, Field(description="Append the From identity's Gmail signature after the note")
+        ] = False,
+    ) -> dict:
+        """Forward a message: saves a DRAFT (new thread) with the note, the standard
+        'Forwarded message' header block, the original plain-text body and the
+        original attachments (inline images become regular attachments; 20 MB total
+        limit). Sending is not supported yet: the user sends it from Gmail. Without
+        from_address it is sent from the address the original was sent to, else the
+        mailbox default."""
+        owner = require_owner("forward_message")
+
+        def fn(svc, acct):
+            r = g.op_forward_message(
+                svc,
+                message_id=message_id,
+                choose_from=create_chooser(
+                    owner, acct, svc, from_address,
+                    strict=bool(from_address or include_signature or acct.default_from),
+                ),
+                to=to, note=note, cc=cc, bcc=bcc, include_signature=include_signature,
+            )
+            r["gmail_url"] = g.gmail_drafts_url(acct.email)
+            return r
+
+        detail = f"message={message_id}" + (" from=explicit" if from_address else "")
+        return await gmail_call(owner, alias, "forward_message", detail, fn)
 
     @mcp.tool(annotations={"destructiveHint": True})
     async def delete_draft(alias: str, draft_id: str) -> dict:
