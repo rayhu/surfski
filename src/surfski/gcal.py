@@ -12,6 +12,8 @@ from datetime import date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+UTC = ZoneInfo("UTC")
+
 from . import gmail as g
 
 MAX_WINDOW_DAYS = 31
@@ -31,6 +33,9 @@ def map_error(exc: Exception, alias: str) -> g.GmailError:
     """Gmail's mapping, reworded for Calendar; a 403 usually means a missing scope."""
     from googleapiclient.errors import HttpError
 
+    if isinstance(exc, HttpError) and getattr(exc.resp, "status", None) == 412:
+        return CalendarError("the event changed after it was shown for confirmation (Google refused the "
+                             "stale version); nothing was changed. Ask again to re-confirm.")
     if isinstance(exc, HttpError) and getattr(exc.resp, "status", None) == 403:
         return CalendarError(
             f"Google denied calendar access for '{alias}' (permission, sharing or Workspace "
@@ -74,6 +79,16 @@ def parse_day(value: str, field: str) -> date:
         return date.fromisoformat((value or "").strip())
     except ValueError:
         raise CalendarError(f"{field} {value!r} must be a date YYYY-MM-DD for an all-day event") from None
+
+
+def utc(dt: datetime) -> datetime:
+    """All interval arithmetic happens in UTC: subtracting two datetimes that share a
+    ZoneInfo is wall-clock arithmetic in Python and is wrong across DST changes."""
+    return dt.astimezone(UTC)
+
+
+def minutes_between(a: datetime, b: datetime) -> int:
+    return int((utc(b) - utc(a)).total_seconds() // 60)
 
 
 def iso(dt: datetime, tz: ZoneInfo) -> str:
@@ -135,9 +150,9 @@ def public_event(ev: dict, cal_zone: str | None, max_description: int = MAX_DESC
 
 
 def merge_busy(intervals: list[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
-    """Union of busy intervals (sorted, overlapping or touching blocks joined)."""
+    """Union of busy intervals (sorted, overlapping or touching blocks joined), in UTC."""
     merged: list[tuple[datetime, datetime]] = []
-    for s, e in sorted((s, e) for s, e in intervals if e > s):
+    for s, e in sorted((utc(s), utc(e)) for s, e in intervals if utc(e) > utc(s)):
         if merged and s <= merged[-1][1]:
             merged[-1] = (merged[-1][0], max(merged[-1][1], e))
         else:
@@ -160,9 +175,11 @@ def parse_hours(value: str | None) -> tuple[time, time] | None:
 def free_slots(window_start: datetime, window_end: datetime, busy: list[tuple[datetime, datetime]],
                duration: timedelta, tz: ZoneInfo, hours: tuple[time, time] | None = None,
                include_weekends: bool = True) -> list[tuple[datetime, datetime]]:
-    """Free blocks of at least `duration` inside the window. With working hours, each
-    local day in `tz` contributes its own [start, end) wall-clock segment, so DST
-    changes shift the UTC instants, not the local hours."""
+    """Free blocks of at least `duration` inside the window, as UTC datetimes. With
+    working hours, each local day in `tz` contributes its own [start, end) wall-clock
+    segment, so DST changes shift the UTC instants, not the local hours. Every comparison
+    and subtraction is done in UTC (real elapsed time)."""
+    window_start, window_end = utc(window_start), utc(window_end)
     if hours is None:
         segments = [(window_start, window_end)]
     else:
@@ -170,8 +187,8 @@ def free_slots(window_start: datetime, window_end: datetime, busy: list[tuple[da
         day, last = window_start.astimezone(tz).date(), window_end.astimezone(tz).date()
         while day <= last:
             if include_weekends or day.weekday() < 5:
-                s = max(datetime.combine(day, hours[0], tzinfo=tz), window_start)
-                e = min(datetime.combine(day, hours[1], tzinfo=tz), window_end)
+                s = max(utc(datetime.combine(day, hours[0], tzinfo=tz)), window_start)
+                e = min(utc(datetime.combine(day, hours[1], tzinfo=tz)), window_end)
                 if s < e:
                     segments.append((s, e))
             day += timedelta(days=1)
@@ -250,9 +267,9 @@ def time_body(start: str, end: str, tz: str | None, all_day: bool) -> tuple[dict
         return {"date": s.isoformat()}, {"date": e.isoformat()}, {"start": s.isoformat(), "end": e.isoformat(),
                                                                   "time_zone": "all day"}
     s, e = parse_when(start, "start", tz), parse_when(end, "end", tz)
-    if e <= s:
+    if utc(e) <= utc(s):
         raise CalendarError("end must be after start")
-    if e - s > timedelta(days=MAX_WINDOW_DAYS):
+    if utc(e) - utc(s) > timedelta(days=MAX_WINDOW_DAYS):
         raise CalendarError(f"an event can't be longer than {MAX_WINDOW_DAYS} days")
     out_tz = zone(tz) if tz else None
     sb = {"dateTime": s.isoformat(timespec="seconds")}
@@ -328,6 +345,14 @@ def op_freebusy(svc, tmin: datetime, tmax: datetime) -> tuple[list[tuple[datetim
     return busy, errors
 
 
+def _if_match(request, op: dict):
+    """Make Google refuse (412) the write if the event changed since the version the
+    human saw, closing the gap between the commit-time etag check and the write."""
+    if op.get("etag"):
+        request.headers["If-Match"] = op["etag"]
+    return request
+
+
 def execute(svc, op: dict) -> dict:
     """Run a checked write plan. Returns a small result (event id, link)."""
     action, cal = op["action"], op["calendar_id"]
@@ -342,9 +367,10 @@ def execute(svc, op: dict) -> dict:
               "sendUpdates": op["send_updates"]}
         if op.get("conference"):
             kw["conferenceDataVersion"] = 1
-        ev = events.patch(**kw).execute()
+        ev = _if_match(events.patch(**kw), op).execute()
     elif action == "delete":
-        events.delete(calendarId=cal, eventId=op["event_id"], sendUpdates=op["send_updates"]).execute()
+        _if_match(events.delete(calendarId=cal, eventId=op["event_id"], sendUpdates=op["send_updates"]),
+                  op).execute()
         return {"event_id": op["event_id"], "deleted": True}
     else:  # pragma: no cover
         raise CalendarError(f"unknown calendar action {action}")

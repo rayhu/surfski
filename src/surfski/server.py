@@ -625,7 +625,10 @@ def invite_cap_error(config: Config, alias: str) -> cal.CalendarError:
 
 
 def check_op_attendees(config: Config, op: dict) -> None:
-    cal.check_attendees(op["attendees"], op["external"], max_attendees=config.send_max_recipients,
+    """Attendee count on the final list; ALLOWED_RECIPIENT_DOMAINS on everyone the write can
+    email (attendees, plus removed attendees who get a cancellation), as for mail."""
+    cal.check_attendees(op["attendees"], op["attendees"] + op.get("removed", []),
+                        max_attendees=config.send_max_recipients,
                         allowed_domains=config.allowed_recipient_domains)
 
 
@@ -1377,7 +1380,7 @@ def create_app(
             owner = require_owner("list_events")
             tmin = early(cal.parse_when, time_min, "time_min", time_zone)
             tmax = early(cal.parse_when, time_max, "time_max", time_zone)
-            if tmax <= tmin:
+            if cal.utc(tmax) <= cal.utc(tmin):
                 raise ToolError("time_max must be after time_min")
             return await cal_call(
                 owner, alias, "list_events", f"max={max_results}",
@@ -1413,9 +1416,9 @@ def create_app(
             owner = require_owner("find_free_time")
             ws = early(cal.parse_when, window_start, "window_start", time_zone)
             we = early(cal.parse_when, window_end, "window_end", time_zone)
-            if we <= ws:
+            if cal.utc(we) <= cal.utc(ws):
                 raise ToolError("window_end must be after window_start")
-            if we - ws > timedelta(days=cal.MAX_WINDOW_DAYS):
+            if cal.utc(we) - cal.utc(ws) > timedelta(days=cal.MAX_WINDOW_DAYS):
                 raise ToolError(f"the window can be at most {cal.MAX_WINDOW_DAYS} days")
             hours = early(cal.parse_hours, working_hours)
             if hours and not time_zone:
@@ -1466,7 +1469,7 @@ def create_app(
                 "duration_minutes": duration_minutes,
                 "mailboxes": [a.alias for a in selected],
                 "free": [{"start": cal.iso(a, out_tz), "end": cal.iso(b, out_tz),
-                          "minutes": int((b - a).total_seconds() // 60)} for a, b in slots[:cal.MAX_FREE_SLOTS]],
+                          "minutes": cal.minutes_between(a, b)} for a, b in slots[:cal.MAX_FREE_SLOTS]],
                 "truncated": len(slots) > cal.MAX_FREE_SLOTS,
                 "complete": not errors,
             }
@@ -1479,10 +1482,11 @@ def create_app(
         # ---- writes
 
         def plan(action: str, calendar_id: str, *, event_id=None, etag=None, body=None, send_updates="none",
-                 conference=False, attendees=(), external=(), count_invite=False, view=None) -> dict:
+                 conference=False, attendees=(), external=(), count_invite=False, view=None,
+                 removed=()) -> dict:
             return {"action": action, "calendar_id": calendar_id, "event_id": event_id, "etag": etag,
                     "body": body, "send_updates": send_updates, "conference": conference,
-                    "attendees": list(attendees), "external": list(external),
+                    "attendees": list(attendees), "external": list(external), "removed": list(removed),
                     "count_invite": count_invite, "view": view or {}}
 
         def proposed(op: dict) -> dict:
@@ -1691,10 +1695,15 @@ def create_app(
                 others = [x for x in att if x != a.email]
                 ext = cal.external_attendees(att, a.email, CONSUMER_DOMAINS)
                 added_ext = [x for x in ext if x not in prev]
-                su = "all" if notify_attendees and others else "none"
+                removed = [x for x in prev if x not in att and x != a.email]
+                su = "all" if notify_attendees and (others or removed) else "none"
+                # Removed attendees get a cancellation email when Google notifies.
+                removed_ext = (cal.external_attendees(removed, a.email, CONSUMER_DOMAINS)
+                               if su == "all" else [])
                 return plan("update", calendar_id, event_id=event_id, etag=cur.get("etag"), body=body,
                             send_updates=su, conference=add_meet, attendees=others, external=ext,
-                            count_invite=bool(added_ext) or (su == "all" and bool(ext)),
+                            removed=removed if su == "all" else [],
+                            count_invite=bool(added_ext) or bool(removed_ext) or (su == "all" and bool(ext)),
                             view={**view, "title": summary if summary is not None else cur.get("summary") or "",
                                   "location": location if location is not None else cur.get("location") or "",
                                   "description": description or "", "attendees": att})
@@ -1738,14 +1747,14 @@ def create_app(
             return await cal_write("respond_to_event", alias, build)
 
         @mcp.tool(annotations=WRITE, description=(
-            "Delete an event (Google keeps it in the calendar's trash for 30 days). With "
-            "notify_attendees the attendees get a cancellation email. Follows the calendar_policy "
+            "Delete an event (Google keeps it in the calendar's trash for 30 days). By default nobody "
+            "is emailed; with notify_attendees=true the attendees get a cancellation email. Follows the calendar_policy "
             "like create_event. " + CALENDAR_SAFETY))
         async def delete_event(
             alias: str,
             event_id: EventId,
             calendar_id: CalId = "primary",
-            notify_attendees: NotifyFlag = True,
+            notify_attendees: NotifyFlag = False,
         ) -> dict:
             def build(svc, a):
                 cur = cal.op_get_raw(svc, calendar_id, event_id)
@@ -2761,7 +2770,9 @@ def create_app(
             token_cache.drop(owner, alias)
             cal_token_cache.drop(owner, alias)
             send_as_cache.drop(owner, alias)
-            if tokens.get("expires_in"):
+            # Seed the Gmail cache only with a token that carries Gmail scopes alone: a token
+            # from an enable_calendar exchange also carries calendar access (least privilege).
+            if tokens.get("expires_in") and not any(sc in scopes.split() for sc in CALENDAR_SCOPES):
                 token_cache.put(owner, alias, tokens["access_token"], time.time() + int(tokens["expires_in"]))
         except LinkError as e:
             log.info("gmail link failed: %s", e)

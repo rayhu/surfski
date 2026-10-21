@@ -67,10 +67,12 @@ class _Resource:
 
 class StrictService(_Resource):
     api, version = "gmail", "v1"
+    pass_headers = False  # True: handlers also get `_headers` (the request's HTTP headers)
 
     def __init__(self, handlers: dict[str, Callable[..., Any]] | None = None):
         self.handlers: dict[str, Callable[..., Any]] = dict(handlers or {})
         self.calls: list[tuple[str, dict]] = []
+        self.requests: list[tuple[str, SimpleNamespace]] = []
         super().__init__(self, "", discovery(self.api, self.version))
 
     def _method(self, path: str, method: dict):
@@ -80,7 +82,11 @@ class StrictService(_Resource):
             handler = self.handlers.get(path)
             if handler is None:
                 raise AssertionError(f"no fake handler for {path}")
-            return SimpleNamespace(execute=lambda: handler(**kwargs))
+            # Like googleapiclient's HttpRequest: callers may set .headers before execute().
+            req = SimpleNamespace(headers={})
+            req.execute = lambda: handler(**kwargs, **({"_headers": req.headers} if self.pass_headers else {}))
+            self.requests.append((path, req))
+            return req
 
         return call
 
@@ -96,3 +102,4 @@ class StrictCalendar(StrictService):
     """Calendar v3, e.g. StrictCalendar({"events.list": ...}).events().list(...)."""
 
     api, version = "calendar", "v3"
+    pass_headers = True

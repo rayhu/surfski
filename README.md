@@ -523,15 +523,19 @@ same linked mailboxes, aliases, owner isolation and encrypted tokens.
     Google as the owner and presses Confirm. The link is single-use, expires in 10 minutes and is bound
     to a hash of the exact change. At commit the server rechecks the allowlist, that the mailbox is
     still linked to the same address with calendar on, that the event wasn't edited since (etag), and
-    the caps.
+    the caps; patches and deletes also send `If-Match: <etag>`, so an edit that lands in between makes
+    Google refuse the write. The pending change (title, attendees, description) is stored encrypted with
+    the owner's token key and dropped as soon as the link is used or expires.
   - `auto`: written directly, within the caps. `set_calendar_policy(alias, "auto")` only returns a link
     where the owner re-authenticates and presses Apply; lowering to `draft` applies at once. Calendar
     links have their own purposes, so they can never be used on the mail send pages.
-- **Attendees are treated like recipients:** at most `SEND_MAX_RECIPIENTS` attendees; attendees outside
-  the mailbox's domain (everyone but the mailbox on gmail.com and other public domains) must match
-  `ALLOWED_RECIPIENT_DOMAINS` if it's set; and writes that involve them count against
-  `CALENDAR_INVITE_DAILY_CAP`. Google only emails attendees (`sendUpdates=all`) when
-  `notify_attendees` / `notify_organizer` is true; otherwise `sendUpdates=none`.
+- **Attendees are treated like recipients:** at most `SEND_MAX_RECIPIENTS` attendees; if
+  `ALLOWED_RECIPIENT_DOMAINS` is set, every attendee the write can email (including removed attendees
+  who get a cancellation) must match it, as for mail; and writes that involve attendees outside the
+  mailbox's domain (everyone but the mailbox on gmail.com and other public domains), including
+  cancellations to them, count against `CALENDAR_INVITE_DAILY_CAP`. Google only emails attendees
+  (`sendUpdates=all`) when `notify_attendees` / `notify_organizer` is true; otherwise
+  `sendUpdates=none`. `delete_event` emails nobody unless `notify_attendees=true`.
 - **Audit and metrics** record the action and counts (`action=create attendees=2 external=1
   notify=all`), never titles, attendees, locations or calendar ids. `surfski_calendar_writes_total`
   counts writes by action and outcome. `export_my_data` includes the capability flags, and
@@ -596,10 +600,16 @@ or the address.
 What the server stores per Claude user (the "owner"): linked mailboxes (alias, address, encrypted
 refresh token, scopes, timestamps), address labels, default From, send policy, pending link and
 confirmation nonces, send counts for the daily cap, `/send` browser sessions, and audit rows (tool,
-alias, short detail, never bodies or email addresses). Message content is never stored.
+alias, short detail, never bodies or email addresses). Message content is never stored. With the
+[calendar module](#calendar-opt-in) also: each mailbox's calendar flag and policy, counts of calendar
+writes with external attendees (for the daily cap), and pending calendar confirmations. A pending
+confirmation holds the proposed change (title, time, attendees, location, description) encrypted with
+your token key, and only until the link is used or expires (10 minutes); like every confirmation
+link's data, it is then erased, and the empty row is deleted a day later.
 
 - **`export_my_data`** returns all of it except tokens.
-- **`delete_my_data(confirm="DELETE")`** erases every row above for the caller in one transaction,
+- **`delete_my_data(confirm="DELETE")`** erases every row above for the caller (including pending
+  calendar confirmations and calendar write counts) in one transaction,
   clears their in-memory caches, then revokes each mailbox's token at Google (best effort; the result
   is reported per alias, and a failed one can be removed at https://myaccount.google.com/permissions).
   Audit rows are deleted by default; set `AUDIT_ON_DELETE=pseudonymize` to keep them instead,

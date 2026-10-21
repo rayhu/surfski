@@ -55,12 +55,23 @@ class Cal:
         self.busy: list[dict] = []
         self.fb_errors: list[dict] | None = None
         self.services: list[StrictCalendar] = []
+        self.race_after_gets: int | None = None  # someone edits e1 after this many reads
+        self.gets = 0
 
     def service(self):
         def get(**kw):
             if kw["eventId"] not in self.events:
                 raise HttpError(httplib2.Response({"status": 404}), b"nope")
-            return copy.deepcopy(self.events[kw["eventId"]])
+            out = copy.deepcopy(self.events[kw["eventId"]])
+            self.gets += 1
+            if self.race_after_gets is not None and self.gets >= self.race_after_gets:
+                self.events[kw["eventId"]]["etag"] = '"raced"'
+            return out
+
+        def precondition(kw):
+            want = kw["_headers"].get("If-Match")
+            if want is not None and want != self.events[kw["eventId"]]["etag"]:
+                raise HttpError(httplib2.Response({"status": 412}), b"Precondition Failed")
 
         def insert(**kw):
             ev = dict(kw["body"], id="new1", etag='"n"', htmlLink="https://calendar.google.com/e/new1")
@@ -68,6 +79,7 @@ class Cal:
             return ev
 
         def patch(**kw):
+            precondition(kw)
             ev = self.events[kw["eventId"]]
             ev.update(copy.deepcopy(kw["body"]))
             ev["etag"] = '"patched"'
@@ -87,7 +99,7 @@ class Cal:
             "events.get": get,
             "events.insert": insert,
             "events.patch": patch,
-            "events.delete": lambda **kw: self.events.pop(kw["eventId"]) and "",
+            "events.delete": lambda **kw: precondition(kw) or (self.events.pop(kw["eventId"]) and ""),
             "freebusy.query": fb,
         })
         self.services.append(svc)
@@ -555,8 +567,10 @@ async def test_attendee_count_and_allowlist(config, storage, cals, google, accou
         await call(app, "create_event", **{**CREATE, "attendees": ["a@work.com", "b@work.com", "c@work.com"]})
     with pytest.raises(ToolError, match="attendee domain\\(s\\) not allowed by this server: evil.com"):
         await call(app, "create_event", **{**CREATE, "attendees": ["x@evil.com"]})
-    # Internal attendees don't need the allowlist; listed external domains pass.
-    await call(app, "create_event", **{**CREATE, "attendees": ["bob@work.com", "x@partner.org"]})
+    # Like mail, the allowlist applies to every attendee, including the mailbox's own domain.
+    with pytest.raises(ToolError, match="not allowed by this server: work.com"):
+        await call(app, "create_event", **{**CREATE, "attendees": ["bob@work.com", "x@partner.org"]})
+    await call(app, "create_event", **{**CREATE, "attendees": ["x@partner.org"]})
     with pytest.raises(ToolError, match="invalid attendee"):
         await call(app, "create_event", **{**CREATE, "attendees": ["not an address"]})
     assert len(all_writes(cals)) == 1
@@ -632,3 +646,75 @@ async def test_metrics_know_calendar_tools(app, who):
     m = app.surfski["metrics"]
     assert "list_events" in m._tools and "find_free_time" in m._tools
     assert ("list_calendars", "ok") in m._counters["tool_calls"]
+
+
+# ---------------------------------------------------------------- review follow-ups
+
+
+def test_free_slots_spring_forward_real_duration():
+    tz = ZoneInfo(TZ)  # 2026-03-08 02:00 PST -> 03:00 PDT: 00:00-06:00 local is 5 real hours
+    ws, we = datetime(2026, 3, 8, 0, tzinfo=tz), datetime(2026, 3, 8, 6, tzinfo=tz)
+    [(a, b)] = cal.free_slots(ws, we, [], timedelta(minutes=30), tz)
+    assert cal.minutes_between(a, b) == 300
+    assert (cal.iso(a, tz), cal.iso(b, tz)) == ("2026-03-08T00:00:00-08:00", "2026-03-08T06:00:00-07:00")
+    # A 330-minute meeting doesn't fit, although the wall clock says 6 hours.
+    assert cal.free_slots(ws, we, [], timedelta(minutes=330), tz) == []
+
+
+def test_free_slots_fall_back_day_duration():
+    tz = ZoneInfo(TZ)  # 2026-11-01 02:00 PDT -> 01:00 PST: the local day has 25 hours
+    ws, we = datetime(2026, 11, 1, tzinfo=tz), datetime(2026, 11, 2, tzinfo=tz)
+    busy_ = [(datetime(2026, 11, 1, 1, 30, tzinfo=tz), datetime(2026, 11, 1, 1, 30, fold=1, tzinfo=tz))]
+    slots = cal.free_slots(ws, we, busy_, timedelta(minutes=30), tz)
+    assert [cal.minutes_between(a, b) for a, b in slots] == [90, 22 * 60 + 30]
+    assert sum(cal.minutes_between(a, b) for a, b in slots) + 60 == 25 * 60
+
+
+async def test_find_free_time_minutes_across_spring_forward(app, who, cals):
+    r = await call(app, "find_free_time", aliases=["work"], window_start="2026-03-08T00:00:00",
+                   window_end="2026-03-08T06:00:00", duration_minutes=30, time_zone=TZ)
+    assert [(f["start"], f["end"], f["minutes"]) for f in r["free"]] == [
+        ("2026-03-08T00:00:00-08:00", "2026-03-08T06:00:00-07:00", 300)]
+
+
+async def test_if_match_refuses_a_racing_edit(app, who, cals, storage):
+    storage.set_calendar_policy(ALICE, "work", "auto")
+    cals["alice@work.com"].race_after_gets = 2  # edited right after the commit-time recheck
+    with pytest.raises(ToolError, match="event changed after it was shown.*re-confirm"):
+        await call(app, "update_event", alias="work", event_id="e1", summary="moved")
+    [(path, _)] = all_writes(cals)
+    req = [r for s_ in cals["alice@work.com"].services for p, r in s_.requests if p == "events.patch"][0]
+    assert path == "events.patch" and req.headers == {"If-Match": '"1"'}
+    assert cals["alice@work.com"].events["e1"]["summary"] == "Secret board meeting"
+
+
+async def test_delete_defaults_to_no_email_and_cancellations_count(config, storage, cals, google, accounts, who):
+    app = make(config, storage, cals, google.factory, calendar_invite_daily_cap=1)
+    storage.set_calendar_policy(ALICE, "work", "auto")
+    cals["alice@work.com"].events["e2"] = dict(copy.deepcopy(cals["alice@work.com"].events["e1"]), id="e2")
+    await call(app, "delete_event", alias="work", event_id="e1")
+    [(_, kw)] = all_writes(cals)
+    assert kw["sendUpdates"] == "none" and storage.invites_today(ALICE, "work", int(datetime.now().timestamp())) == 0
+    # Removing the external attendee with notifications emails them a cancellation: counted.
+    await call(app, "update_event", alias="work", event_id="e2", attendees=["alice@work.com"])
+    assert all_writes(cals)[-1][1]["sendUpdates"] == "all"
+    assert storage.invites_today(ALICE, "work", int(datetime.now().timestamp())) == 1
+
+
+async def test_pending_event_encrypted_and_dropped_after_use(app, who, cals, storage, google):
+    r = await call(app, "create_event", **CREATE)
+    raw = [row[0] for row in storage._conn.execute("SELECT data FROM action_tokens")]
+    assert raw and all(d and "Lunch" not in d and "bob@work.com" not in d for d in raw)
+    token = token_of(r["confirm_url"])
+    client = web(app)
+    sign_in(client, google, token)
+    assert client.post("/send/calendar/confirm", data={"token": token}).status_code == 200
+    rows = list(storage._conn.execute("SELECT used, data FROM action_tokens"))
+    assert rows and all(d is None for used, d in rows if used)
+
+
+async def test_calendar_grant_never_seeds_gmail_token_cache(config, storage, cals, accounts, who):
+    app = make(config, storage, cals, linker())
+    _, q = await start_enable(app)
+    assert callback(app, q).status_code == 200
+    assert app.surfski["token_cache"].get(ALICE, "mailonly") is None

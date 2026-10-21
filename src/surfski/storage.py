@@ -310,7 +310,7 @@ class Storage:
                     (owner, alias),
                 )
                 c.execute(
-                    "UPDATE action_tokens SET used = 1 WHERE owner = ? AND alias = ?", (owner, alias)
+                    "UPDATE action_tokens SET used = 1, data = NULL WHERE owner = ? AND alias = ?", (owner, alias)
                 )
             c.execute(
                 """INSERT INTO accounts (owner, alias, email, refresh_token_enc, scopes, created_at)
@@ -385,7 +385,7 @@ class Storage:
                 "DELETE FROM address_labels WHERE owner = ? AND alias = ?", (owner.lower(), alias)
             )
             c.execute(
-                "UPDATE action_tokens SET used = 1 WHERE owner = ? AND alias = ?", (owner.lower(), alias)
+                "UPDATE action_tokens SET used = 1, data = NULL WHERE owner = ? AND alias = ?", (owner.lower(), alias)
             )
         return cur.rowcount > 0
 
@@ -419,7 +419,7 @@ class Storage:
                 )
             # Links name the old alias; kill them rather than let them dangle.
             c.execute(
-                "UPDATE action_tokens SET used = 1 WHERE owner = ? AND alias = ?", (owner, old_alias)
+                "UPDATE action_tokens SET used = 1, data = NULL WHERE owner = ? AND alias = ?", (owner, old_alias)
             )
 
     # ---- send-from settings (always owner-scoped) ----
@@ -571,15 +571,34 @@ class Storage:
                 (policy, owner, alias),
             )
 
+    # Action-token data (draft ids, PKCE verifiers, proposed calendar events) is encrypted
+    # with the owner's token key, and dropped as soon as the token is used or expires.
+
+    def _seal(self, owner: str, data: str) -> str:
+        return self.cipher.encrypt(owner, data).decode()
+
+    def _open(self, owner: str, sealed: str | None) -> str | None:
+        if sealed is None:
+            return None
+        try:
+            return self.cipher.decrypt(owner, sealed.encode())
+        except StorageError:
+            return None  # e.g. written before encryption, or the key was rotated away
+
+    def _expire_action_tokens(self, c) -> None:
+        now = int(datetime.now(UTC).timestamp())
+        c.execute("UPDATE action_tokens SET data = NULL WHERE exp < ? AND data IS NOT NULL", (now,))
+        c.execute("DELETE FROM action_tokens WHERE exp < ?", (now - 86400,))
+
     def add_action_token(
         self, nonce: str, owner: str, alias: str, purpose: str, exp: int, data: str
     ) -> None:
         with self._tx() as c:
-            c.execute("DELETE FROM action_tokens WHERE exp < strftime('%s','now') - 86400")
+            self._expire_action_tokens(c)
             c.execute(
                 "INSERT INTO action_tokens (nonce, owner, alias, purpose, exp, used, data) "
                 "VALUES (?, ?, ?, ?, ?, 0, ?)",
-                (nonce, owner.lower(), alias, purpose, exp, data),
+                (nonce, owner.lower(), alias, purpose, exp, self._seal(owner.lower(), data)),
             )
 
     def peek_action_token(self, nonce: str, owner: str, alias: str, purpose: str, now: int) -> str | None:
@@ -590,7 +609,7 @@ class Storage:
                 "AND purpose = ? AND used = 0 AND exp >= ?",
                 (nonce, owner.lower(), alias, purpose, now),
             ).fetchone()
-        return row["data"] if row else None
+        return self._open(owner.lower(), row["data"]) if row else None
 
     def consume_action_token(self, nonce: str, owner: str, alias: str, purpose: str, now: int) -> str | None:
         """Atomically mark a matching, unused, unexpired token used; returns its data."""
@@ -602,8 +621,9 @@ class Storage:
             ).fetchone()
             if not row:
                 return None
-            cur = c.execute("UPDATE action_tokens SET used = 1 WHERE nonce = ? AND used = 0", (nonce,))
-            return row["data"] if cur.rowcount == 1 else None
+            cur = c.execute("UPDATE action_tokens SET used = 1, data = NULL WHERE nonce = ? AND used = 0",
+                            (nonce,))
+            return self._open(owner.lower(), row["data"]) if cur.rowcount == 1 else None
 
     def create_owner_session(self, owner: str, ttl: int, now: int, hd: str | None = None) -> str:
         """New browser session for /send pages. Returns the raw id (cookie value);
