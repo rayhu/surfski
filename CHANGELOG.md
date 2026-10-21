@@ -15,6 +15,11 @@ All notable changes to Surfski are documented here. The format follows
 
 ### Security
 
+- Attachment text extraction runs in a short-lived subprocess with a wall-clock timeout and rlimits
+  (address space, CPU, no file writes, no new processes, few open files) and at most 2 at a time;
+  timeouts, OOM and crashes become a clean tool error. Configure with `EXTRACT_SANDBOX`,
+  `EXTRACT_TIMEOUT_S` and `EXTRACT_MEMORY_MB` (#30).
+- The Docker actions in the CI and release workflows are pinned to full commit SHAs (#30).
 - Log redaction also hides `Authorization: …` headers and `Bearer <token>` values (#11).
 
 ## [0.1.0] - unreleased

@@ -33,6 +33,7 @@ from . import unsubscribe as unsub
 from .audit import install_log_redaction, write_audit
 from .config import Config, ConfigError, load_config
 from .metrics import Metrics, ToolMetricsMiddleware
+from .sandbox import Sandbox
 from .version import __version__
 from .linking import (
     GMAIL_SCOPES,
@@ -684,6 +685,7 @@ def create_app(
     send_as_cache = SendAsCache()
     limiter = RateLimiter(config.rate_limit_per_minute)
     metrics = Metrics()
+    sandbox = Sandbox.from_config(config)
 
     def service_scopes(owner: str, alias: str) -> list[str]:
         """Scopes asked for when refreshing: gmail.modify only while the operator switch
@@ -725,7 +727,7 @@ def create_app(
     )
     # handy for tests/ops
     mcp.surfski = {"storage": storage, "config": config, "token_cache": token_cache,
-                   "send_as_cache": send_as_cache, "metrics": metrics}
+                   "send_as_cache": send_as_cache, "metrics": metrics, "sandbox": sandbox}
     mcp.add_middleware(ToolMetricsMiddleware(mcp, metrics))
     # Sessions of owners no longer allowed (or expired) are useless; drop them.
     # Sessions are only created after Google verified the email; `hd` was recorded then.
@@ -1488,8 +1490,8 @@ def create_app(
         def fn(svc, acct):
             meta, raw = g.op_get_attachment_bytes(svc, message_id, attachment, config.attachment_max_bytes)
             try:
-                ex = att.extract_text(raw, meta["mime_type"], meta["filename"],
-                                      charset=meta["charset"], max_chars=max_chars)
+                ex = sandbox.extract(raw, meta["mime_type"], meta["filename"],
+                                     charset=meta["charset"], max_chars=max_chars)
             except att.ExtractError as e:
                 metrics.attachment(att.detect_method(meta["mime_type"], meta["filename"]), "error")
                 raise g.GmailError(f"couldn't read '{meta['filename'] or 'attachment'}': {e}") from None

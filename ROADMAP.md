@@ -72,7 +72,8 @@ See [Calendar module](#calendar-module).
 - ✅ **`forward_message`**: forward a message, keeping its original attachments. It saves a draft by
   default, and sends only when the mailbox's send policy allows it.
 - ✅ **`get_attachment`**: read attachment content with size limits. PDF and DOCX are extracted to text,
-  with no binary pass-through by default.
+  with no binary pass-through by default. Since #30 it runs in a sandboxed subprocess with rlimits
+  and a timeout.
 - ✅ **`delete_my_data`**: unlink and revoke every mailbox for the caller, and purge their rows.
 - **Published container image** (GHCR) and **CI** that runs pytest and the image build on every PR.
 - ✅ **Backup helper**: a `scripts/backup.sh` that tars the data volume and refuses to include the env file.

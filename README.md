@@ -303,6 +303,9 @@ connector (Settings → Connectors). Nothing else is lost: linked mailboxes are 
 | `CONFIRM_CHANNEL` | no | How `confirm` sends are approved: `auto` (default: in the MCP client via elicitation when it supports it, else the confirm link) or `link` (always the confirm link) |
 | `ALLOWED_RECIPIENT_DOMAINS` | no | Comma-separated domains; if set, every recipient's domain must match one exactly |
 | `ATTACHMENT_MAX_MB` | no | Largest attachment `get_attachment` will download (default 15, max 25) |
+| `EXTRACT_SANDBOX` | no | `subprocess` (default): extract attachment text in a resource-limited child process; `inprocess`: in a server thread |
+| `EXTRACT_TIMEOUT_S` | no | Wall-clock limit per extraction; the child is killed after it (default 20, 1–120) |
+| `EXTRACT_MEMORY_MB` | no | Address-space limit of the extraction child (default 512, 128–8192; Linux) |
 | `AUDIT_ON_DELETE` | no | What `delete_my_data` does with the caller's audit rows: `delete` (default) or `pseudonymize` (keep them under a keyed hash) |
 | `TRIAGE_ENABLED` | no | `true` registers the triage tools (default `false`: no triage tools, and `gmail.modify` is never requested) |
 | `TRIAGE_DAILY_CAP` | no | Triage changes (ids touched) per mailbox in a rolling 24 h (default 1000) |
@@ -362,6 +365,23 @@ set -a; source ./local.env; set +a; uv run surfski
   the zip with defusedxml; DTDs and entities refused; zip-bomb limits on entries, sizes and
   compression ratio). Other types return metadata only; binary is never passed through. Audit rows
   record message id, size and method, not the filename.
+- **Extraction runs in a sandboxed subprocess** (`EXTRACT_SANDBOX=subprocess`, the default): each call
+  starts a fresh `python -I -B -m surfski.extract_worker` (never a fork of the threaded server), sends
+  the bytes on stdin and reads JSON from stdout. The child drops its own limits before touching the
+  input: address space `EXTRACT_MEMORY_MB` (`RLIMIT_AS`), CPU seconds (`RLIMIT_CPU`), no file data
+  writes (`RLIMIT_FSIZE=0`), no new processes (`RLIMIT_NPROC=0`), 16 open files, no core dumps, and
+  Python-level sockets disabled. The parent kills the child's process group after
+  `EXTRACT_TIMEOUT_S` and reaps it. At most 2 extractions run at once. A timeout, OOM or crash
+  becomes "the file was too complex to read safely (timeout)" or similar; the child's stderr is
+  discarded and only a short class name is reported. The in-process zip, XML and PDF caps stay as
+  defense in depth. Cost: a process start per call, measured at about 140 ms (240 ms for PDFs, which load
+  pypdf) in the hardened container under Docker Desktop, and 40 ms / 200 ms natively.
+  - *Enforced on Linux* (the container): all the rlimits above. *Not enforced without seccomp or
+    namespaces:* network access from native code (only Python's `socket` is blocked; the container
+    has its normal network), reads of files the server user can read, and creating empty files on
+    the `/tmp` tmpfs. On macOS (development), `RLIMIT_AS` and some others aren't supported; they are
+    skipped with a log line, and the timeout still applies. `EXTRACT_SANDBOX=inprocess` turns the
+    sandbox off (not recommended).
 - `forward_message`, and drafts with `attachments`, hold the attachments in memory while the draft is
   built (up to the 20 MB limit, roughly 3× that at peak with the MIME encoding). Give the container
   ~150 MB of headroom per concurrent call.

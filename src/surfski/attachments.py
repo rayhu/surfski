@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from defusedxml import ElementTree as SafeET
 from defusedxml.common import DefusedXmlException
 
-from .gmail import html_to_text
+from .htmltext import html_to_text
 
 # Zip (DOCX/XLSX/PPTX) limits.
 ZIP_MAX_ENTRIES = 2000
