@@ -4,7 +4,6 @@ and re-calls the tool with the answer; the middleware completes that second roun
 single-use continuation bound to the owner, the tool and its exact arguments."""
 
 import time
-from dataclasses import replace
 
 import mcp_types as mt
 import pytest
@@ -202,3 +201,13 @@ def test_resumable_tools_and_answer_parsing():
         assert srv.input_answer(bad, srv.SendDecision, "send") == "malformed", bad
     assert srv.input_answer(accept(value=False), srv.SendDecision, "send") == "decline"
     assert srv.input_answer({"confirm": mt.ElicitResult(action="cancel")}, srv.SendDecision, "send") == "decline"
+
+
+async def test_no_send_resumers_when_sending_disabled(config, storage, accounts, who):  # noqa: F811
+    from surfski.server import create_app
+    off = create_app(config, storage=storage, with_auth=False)
+    assert not config.sending_enabled
+    assert not {"send_draft", "send_email", "forward_message"} & set(off.surfski["resumers"])
+    # The middleware refuses any continuation for a tool without a resumer (sealed requestState
+    # can't be forged in-test, so this checks the registry the middleware dispatches on).
+    assert "forward_message" in {t.name for t in await off.list_tools()}

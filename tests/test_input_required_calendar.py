@@ -49,6 +49,19 @@ async def test_mail_continuation_cannot_resume_calendar(app, who, cals, storage,
     for other in (snd.PURPOSE_SEND_INPUT, snd.PURPOSE_CAL_CONFIRM, snd.PURPOSE_SEND):
         with pytest.raises(snd.ActionError):
             snd.verify_action(secret, token, other)
-    with pytest.raises(ToolError, match="invalid"):  # a calendar continuation on a mail tool
-        await app.surfski["resumers"]["send_draft"](
-            ALICE, "send_draft", dict(CREATE), srv.STATE_PREFIX + token, accept())
+    assert "send_draft" not in app.surfski["resumers"]  # sending disabled on this app
+
+
+async def test_calendar_continuation_rejected_by_send_resumer(config, storage, cals, google, accounts,  # noqa: F811
+                                                             who, minted):  # noqa: F811
+    from .test_calendar import make
+    both = make(config, storage, cals, google.factory, sending_enabled=True)
+    async with Client(both, mode=MODERN, elicitation_handler=Human()) as c:
+        first = await c.session.call_tool("create_event", CREATE, allow_input_required=True)
+    assert isinstance(first, mt.InputRequiredResult)
+    [(purpose, token)] = minted
+    assert purpose == snd.PURPOSE_CAL_INPUT
+    resume = both.surfski["resumers"]["send_draft"]  # registered: sending is on
+    with pytest.raises(ToolError, match="invalid"):
+        await resume(ALICE, "send_draft", dict(CREATE), srv.STATE_PREFIX + token, accept())
+    assert all_writes(cals) == []

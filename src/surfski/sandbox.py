@@ -182,8 +182,9 @@ class Sandbox:
                p["level"], p["landlock_abi"], "restricted" if p.get("landlock_fs") else "open",
                "blocked" if p.get("landlock_net") else "open", "on" if p["seccomp"] else "off")
         if p.get("rules_failed"):
-            log.debug("extraction sandbox: %d Landlock path rule(s) could not be added; those paths "
-                      "are unreadable by the worker", p["rules_failed"])
+            # WARNING: an unreadable library path can make extraction fail with no other clue.
+            log.warning("extraction sandbox: %d Landlock path rule(s) could not be added; those paths "
+                        "are unreadable by the worker, which may break extraction", p["rules_failed"])
         if p["level"] == "full":
             log.info(*msg)
         elif self.strict:

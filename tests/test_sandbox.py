@@ -553,9 +553,10 @@ def test_rules_failed_is_reported_and_type_checked(monkeypatch, caplog):
     result = {"ok": True, "text": "probe", "method": "text", "protection": {**base, "rules_failed": 3}}
     script = f"import sys; sys.stdout.write({json.dumps(json.dumps(result))})"
     monkeypatch.setattr(sb, "WORKER_ARGV", [sys.executable, "-I", "-B", "-c", script])
-    caplog.set_level(logging.DEBUG, "surfski.sandbox")
+    caplog.set_level(logging.WARNING, "surfski.sandbox")
     assert Sandbox().probe()["rules_failed"] == 3
-    assert "3 Landlock path rule(s) could not be added" in caplog.text
+    [rec] = [r for r in caplog.records if "3 Landlock path rule(s) could not be added" in r.getMessage()]
+    assert rec.levelno == logging.WARNING
 
 
 def test_confine_counts_rule_failures(monkeypatch):

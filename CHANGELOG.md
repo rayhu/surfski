@@ -34,6 +34,10 @@ All notable changes to Surfski are documented here. The format follows
 
 ### Security
 
+- Follow-ups from the #33 review: send continuations are only resumable when `SENDING_ENABLED` is on,
+  and Landlock path rules the extraction worker couldn't add are logged as a warning (they can make
+  extraction fail) instead of at debug.
+
 - `EXTRACT_SANDBOX_STRICT=true` now requires the `full` sandbox level (Landlock filesystem confinement
   and a kernel network block), not filesystem confinement alone. The worker counts Landlock path rules
   it couldn't add, and the startup probe logs the count (#33 review of #43).
