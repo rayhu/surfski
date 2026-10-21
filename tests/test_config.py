@@ -68,3 +68,11 @@ def test_sending_settings(tmp_path):
     for bad in ({"SENDING_ENABLED": "maybe"}, {"SEND_DAILY_CAP": "x"}, {"SEND_MAX_RECIPIENTS": "0"}):
         with pytest.raises(ConfigError):
             load_config(make_env(tmp_path, **bad))
+
+
+def test_confirm_channel(tmp_path):
+    assert load_config(make_env(tmp_path)).confirm_channel == "auto"
+    assert load_config(make_env(tmp_path, CONFIRM_CHANNEL=" LINK ")).confirm_channel == "link"
+    assert load_config(make_env(tmp_path, CONFIRM_CHANNEL="")).confirm_channel == "auto"
+    with pytest.raises(ConfigError, match="CONFIRM_CHANNEL"):
+        load_config(make_env(tmp_path, CONFIRM_CHANNEL="elicit"))

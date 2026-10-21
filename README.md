@@ -195,6 +195,7 @@ keys, users simply relink their mailboxes.
 | `SENDING_ENABLED` | no | `true` registers the send tools and `/send/*` pages (default `false`: drafts only) |
 | `SEND_DAILY_CAP` | no | Sends per mailbox in a rolling 24 h, in `confirm` and `auto` (default 20) |
 | `SEND_MAX_RECIPIENTS` | no | Unique to+cc+bcc recipients per message (default 10) |
+| `CONFIRM_CHANNEL` | no | How `confirm` sends are approved: `auto` (default: in the MCP client via elicitation when it supports it, else the confirm link) or `link` (always the confirm link) |
 | `ALLOWED_RECIPIENT_DOMAINS` | no | Comma-separated domains; if set, every recipient's domain must match one exactly |
 | `ATTACHMENT_MAX_MB` | no | Largest attachment `get_attachment` will download (default 15, max 25) |
 | `AUDIT_ON_DELETE` | no | What `delete_my_data` does with the caller's audit rows: `delete` (default) or `pseudonymize` (keep them under a keyed hash) |
@@ -266,6 +267,19 @@ that tells Claude to forward something to an attacker):
   draft and returns a one-time link; nothing is sent until you open it, sign in, review
   From/To/Cc/**Bcc**, subject, attachments and the start of the body, and press **Send**), or `auto`
   (sent directly, within the caps). MCP clients still ask you to approve each send tool call.
+- **Confirming in the client (elicitation).** In `confirm` mode, if your MCP client supports
+  [elicitation](https://modelcontextprotocol.io/specification/2025-06-18/client/elicitation) (form
+  mode), the server asks you directly in the client: From, To, Cc, **Bcc**, subject, attachment
+  names and the first 500 characters of the body, with a single send/don't-send answer. There's no
+  link for the model to leak or open. On accept the server rechecks the policy, the caps, the
+  mailbox and the exact draft version (just like pressing **Send** on the link page) before sending;
+  on decline or cancel it keeps the draft and returns `sent: false`. If the client doesn't support
+  elicitation, the request fails or times out (5 minutes), or the connection uses the 2026-07-28
+  protocol (which has no channel for server-initiated requests), it falls back to the confirm link
+  below, **never** to sending. Client support varies and changes: check your client's MCP
+  documentation. **Trust model:** the server can't verify that a human answered; it trusts the client
+  to show the prompt to you and not let the model answer it. If you don't trust your clients to do
+  that, set `CONFIRM_CHANNEL=link`.
 - **Owner sign-in before any confirm or approval page.** Opening a link shows nothing about the
   email until you sign in with Google as the mailbox owner (`/send/auth/callback`, which you must
   register on your OAuth client). That sets a session cookie for `/send` pages only (HttpOnly,
@@ -280,8 +294,8 @@ that tells Claude to forward something to an attacker):
 - **What this does not stop:** an AI agent that can drive *your own* signed-in browser could open a
   link and press Send while your session is valid (and Google re-auth may be a single click if
   you're already signed in to Google). Keep `confirm` for mailboxes where that matters and don't give
-  browser-control tools to the same agent. Confirming inside the MCP client (elicitation) is planned.
-- **Caps** apply in `confirm` (re-checked when you press Send) and `auto`: daily sends per mailbox,
+  browser-control tools to the same agent.
+- **Caps** apply in `confirm` (re-checked when you press Send or accept in the client) and `auto`: daily sends per mailbox,
   recipients per message, optional recipient-domain allowlist.
 - **Audit:** each send records alias, policy, recipient count and Gmail message id, never addresses
   or bodies.

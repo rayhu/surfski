@@ -63,6 +63,9 @@ See [Calendar module](#calendar-module).
   results.
 - ✅ **Address aliases and "send from"**: see the [design below](#address-aliases-and-send-from).
 - ✅ **Opt-in sending**: see the [design below](#opt-in-sending-design).
+- ✅ **Confirm sends via MCP elicitation** (#27): in `confirm` mode, ask the human in the client when
+  it supports elicitation, else fall back to the confirm link (never to sending). `CONFIRM_CHANNEL=link`
+  forces the link.
 - ✅ **Draft management**: `list_drafts`, `get_draft`, `update_draft`, `delete_draft`. Today Claude can
   create a draft but can't revise one, and "fix the draft you just wrote" is a common request. Uses the
   existing `gmail.compose` scope.
@@ -149,7 +152,7 @@ Each mailbox owner decides whether Claude may send. The default stays **drafts o
    | Policy | Behavior |
    |---|---|
    | `off` (default) | No sending. `create_draft` only. |
-   | `confirm` | `send_email` / `send_draft` create the draft and return a **one-time confirmation link** (signed, 10 min). The email goes out only when the human opens the link and clicks **Send**. This blocks injection even if the model is fooled. |
+   | `confirm` | `send_email` / `send_draft` create the draft, then ask the human in the MCP client (**elicitation**, when the client supports it; policy and caps are rechecked after accept) or else return a **one-time confirmation link** (signed, 10 min). The email goes out only when the human accepts in the client or opens the link and clicks **Send**. This blocks injection even if the model is fooled. |
    | `auto` | Claude sends directly. MCP clients still ask for per-call tool approval, because the tools are annotated `destructiveHint` / `openWorldHint`. |
 
 3. **Raising a policy happens out of band.** `set_send_policy(alias, policy)` only *lowers*

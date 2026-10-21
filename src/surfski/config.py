@@ -62,6 +62,9 @@ class Config:
     send_daily_cap: int = 20
     send_max_recipients: int = 10
     allowed_recipient_domains: frozenset[str] = frozenset()
+    # How confirm-mode sends are confirmed (#27): "auto" = MCP elicitation when the
+    # client supports it, else the confirm link; "link" = always the confirm link.
+    confirm_channel: str = "auto"
     # delete_my_data: "delete" the caller's audit rows, or keep them "pseudonymize"d.
     audit_on_delete: str = "delete"
     attachment_max_bytes: int = 15 * 1024 * 1024
@@ -146,6 +149,10 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         d.strip().lower().lstrip("@") for d in env.get("ALLOWED_RECIPIENT_DOMAINS", "").split(",") if d.strip()
     )
 
+    confirm_channel = env.get("CONFIRM_CHANNEL", "auto").strip().lower() or "auto"
+    if confirm_channel not in ("auto", "link"):
+        raise ConfigError("CONFIRM_CHANNEL must be auto or link")
+
     try:
         attachment_mb = float(env.get("ATTACHMENT_MAX_MB", "15"))
     except ValueError as e:
@@ -176,6 +183,7 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         send_daily_cap=daily_cap,
         send_max_recipients=max_recipients,
         allowed_recipient_domains=domains,
+        confirm_channel=confirm_channel,
         audit_on_delete=audit_on_delete,
         attachment_max_bytes=int(attachment_mb * 1024 * 1024),
     )
