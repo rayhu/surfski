@@ -157,7 +157,7 @@ image, so the server can keep running, and adds `oauth/` as files. It refuses to
 named `env`/`*.env` is in the volume. `--dry-run` shows what it would do; `--help` lists options
 (`--dest`, `--keep`, `--volume`, `--image`).
 
-Nightly at 03:15 (root's crontab, run from the checkout so the `surfski:latest` image exists):
+Nightly at 03:15 from root's crontab (it uses the local `surfski:latest` image that `docker compose build` creates):
 
 ```cron
 15 3 * * * /opt/surfski/scripts/backup.sh --keep 14 >> /var/log/surfski-backup.log 2>&1
