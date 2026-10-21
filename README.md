@@ -234,7 +234,8 @@ sudo docker compose -p surfski exec app surfski admin list
 | `admin audit --owner X [--since 7d\|2026-10-01]` | Audit row counts per tool (ok / failed), never details |
 
 Exit codes: `0` success; `1` refused or failed (unknown owner or alias, missing `--yes`, a failed
-`--revoke`, undecryptable rows during rotation); `2` usage or configuration error.
+revocation at Google, undecryptable rows during rotation); `2` usage or configuration error. When a
+revocation fails, `unlink` and `purge-owner` have still removed the data.
 
 ### Rotating encryption keys
 
@@ -242,7 +243,7 @@ Exit codes: `0` success; `1` refused or failed (unknown owner or alias, missing 
 the server decrypts with the new key, then the old one, and always encrypts with the new one, so
 it keeps working during the whole rotation:
 
-1. Generate a key: `python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.
+1. Generate a key: `python3 scripts/gen_secrets.py` and take its `TOKEN_ENCRYPTION_KEY` line.
 2. In `/etc/surfski/env`, move the current value to `TOKEN_ENCRYPTION_KEY_OLD` and put the new key in
    `TOKEN_ENCRYPTION_KEY`.
 3. Restart: `sudo docker compose -p surfski up -d` (a plain `restart` doesn't reread the env file).
@@ -252,10 +253,11 @@ it keeps working during the whole rotation:
    (relink or `admin unlink` those, or supply the right old key, then run it again).
 5. Remove `TOKEN_ENCRYPTION_KEY_OLD` and restart again.
 
-Per-owner keys work the same way with `TOKEN_ENCRYPTION_KEYS_OLD=owner=oldkey,…`. Adding or removing an
-owner's `TOKEN_ENCRYPTION_KEYS` entry is also a rotation: the server still reads that owner's rows
-under the default key (or, with `TOKEN_ENCRYPTION_KEYS_OLD`, under their old key), and
-`rotate-token-key` moves them over.
+Per-owner keys work the same way with `TOKEN_ENCRYPTION_KEYS_OLD=owner=oldkey,…`. Giving an existing
+owner their own `TOKEN_ENCRYPTION_KEYS` entry is a rotation too: set
+`TOKEN_ENCRYPTION_KEYS_OLD=owner=<the default key>` for it (an owner with a per-owner key never falls
+back to the default key on its own). Removing an owner's entry: set `TOKEN_ENCRYPTION_KEYS_OLD` to
+their former key.
 
 **Backups after a rotation:** older backups still need the old key. Keep the old key with the backups
 it protects until they expire, or take a fresh backup right after rotating.

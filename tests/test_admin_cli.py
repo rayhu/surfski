@@ -189,6 +189,15 @@ def test_admin_purge_reuses_delete_my_data(tmp_path, env, capsys):
     s.close()
 
 
+def test_admin_purge_failed_revocation_exit_1(tmp_path, env):
+    seed(tmp_path).close()
+    rv = Revoker(failing={"rt-alice-work"})
+    assert cli.main(["admin", "purge-owner", "--owner", ALICE, "--yes"], http_factory=rv.factory) == 1
+    s = open_with(tmp_path, KEY_B)
+    assert s.list_accounts(ALICE) == []  # purged regardless
+    s.close()
+
+
 def test_admin_purge_pseudonymizes_like_the_tool(tmp_path, env):
     env(AUDIT_ON_DELETE="pseudonymize")
     s = seed(tmp_path)
@@ -303,7 +312,11 @@ def test_rotate_per_owner_keys(tmp_path):
 def test_rotate_moves_owner_onto_per_owner_key(tmp_path):
     seed(tmp_path).close()  # all under the default KEY_B
     bob_key = Fernet.generate_key().decode()
-    s = open_with(tmp_path, KEY_B, {BOB: bob_key})  # default still accepted for Bob's old rows
+    # A per-owner key never silently falls back to the default key...
+    with pytest.raises(StorageError):
+        open_with(tmp_path, KEY_B, {BOB: bob_key}).get_refresh_token(BOB, "work")
+    # ...the move is an explicit rotation with the default key as Bob's old key.
+    s = open_with(tmp_path, KEY_B, {BOB: bob_key}, old_per_owner={BOB: KEY_B})
     assert s.get_refresh_token(BOB, "work") == "rt-bob-work"
     assert s.admin_rotate_token_key() == {"total": 3, "rotated": 1, "already_current": 2}
     s.close()

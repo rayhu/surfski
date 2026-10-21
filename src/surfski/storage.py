@@ -157,10 +157,11 @@ class TokenCipher:
     previous keys that are accepted for decryption only.
 
     For an owner, the current key is their TOKEN_ENCRYPTION_KEYS entry if any, else the
-    default key; new tokens are always encrypted with it. Decryption tries, in order:
-    the current key, the owner's old per-owner key, the old default key, and (for an
-    owner with a per-owner key) the default key, so moving an owner onto or off a
-    per-owner key is a rotation too."""
+    default key; new tokens are always encrypted with it. Decryption tries the current
+    key, then the owner's TOKEN_ENCRYPTION_KEYS_OLD entry, then TOKEN_ENCRYPTION_KEY_OLD.
+    An owner with a per-owner key never falls back to the current default key, so moving
+    an owner onto a per-owner key is an explicit rotation
+    (TOKEN_ENCRYPTION_KEYS_OLD=owner=<default key>)."""
 
     def __init__(
         self,
@@ -193,8 +194,6 @@ class TokenCipher:
     def _chain(self, owner: str) -> MultiFernet:
         owner = owner.lower()
         keys = [self._for(owner), self._old_per_owner.get(owner), self._old_default]
-        if owner in self._per_owner:
-            keys.append(self._default)
         return MultiFernet([k for k in keys if k is not None])
 
     def encrypt(self, owner: str, plaintext: str) -> bytes:

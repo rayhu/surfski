@@ -5,8 +5,8 @@ shell on the host or inside the container (`docker compose -p surfski exec app s
 admin ...`); there is no network admin endpoint. They never print refresh tokens,
 ciphertext or keys.
 
-Exit codes: 0 success; 1 refused or failed (unknown owner/alias, missing --yes,
-undecryptable rows during rotation); 2 usage or configuration error.
+Exit codes: 0 success; 1 refused or failed (unknown owner/alias, missing --yes, a failed
+revocation at Google, undecryptable rows during rotation); 2 usage or configuration error.
 """
 
 from __future__ import annotations
@@ -172,7 +172,8 @@ def cmd_purge(args, config, storage, http_factory) -> int:
         print(f"  {alias}: {'revoked at Google' if v is True else (v or 'revocation failed')}")
     if result["note"]:
         print(result["note"])
-    return EXIT_OK
+    # The data is gone either way; exit 1 tells a script some revocation needs a manual look.
+    return EXIT_FAIL if any(v is not True for v in result["revoked_at_google"].values()) else EXIT_OK
 
 
 def cmd_rotate(args, config, storage, http_factory) -> int:
