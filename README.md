@@ -235,7 +235,8 @@ sudo docker compose -p surfski exec app surfski admin list
 
 Exit codes: `0` success; `1` refused or failed (unknown owner or alias, missing `--yes`, a failed
 revocation at Google, undecryptable rows during rotation); `2` usage or configuration error. When a
-revocation fails, `unlink` and `purge-owner` have still removed the data.
+revocation fails, `unlink` and `purge-owner` have still removed the data. An unexpected error (for example
+`database is locked`) prints one line and exits 1; `surfski admin --debug …` shows the traceback.
 
 ### Rotating encryption keys
 
@@ -246,7 +247,12 @@ it keeps working during the whole rotation:
 1. Generate a key: `python3 scripts/gen_secrets.py` and take its `TOKEN_ENCRYPTION_KEY` line.
 2. In `/etc/surfski/env`, move the current value to `TOKEN_ENCRYPTION_KEY_OLD` and put the new key in
    `TOKEN_ENCRYPTION_KEY`.
-3. Restart: `sudo docker compose -p surfski up -d` (a plain `restart` doesn't reread the env file).
+3. **Restart the server on the new key before rotating:** `sudo docker compose -p surfski up -d` (a
+   plain `restart` doesn't reread the env file). This order matters: a server still running on the old
+   key keeps writing old-key rows (every link or relink), and any it writes after step 4 stay on the old
+   key. `docker compose exec` also takes the container's env, so the rotate command only sees the new
+   key once the container was recreated. If you got the order wrong, restart and run step 4 again; it
+   is idempotent and only touches rows that aren't on the current key yet.
 4. Rotate: `sudo docker compose -p surfski exec app surfski admin rotate-token-key`. It re-encrypts
    every row in one SQLite write transaction and reports the counts. If any row can't be decrypted
    with the new or the old key, it changes nothing, lists the affected owner / alias pairs and exits 1
@@ -297,6 +303,8 @@ connector (Settings → Connectors). Nothing else is lost: linked mailboxes are 
 | `AUDIT_ON_DELETE` | no | What `delete_my_data` does with the caller's audit rows: `delete` (default) or `pseudonymize` (keep them under a keyed hash) |
 | `TRIAGE_ENABLED` | no | `true` registers the triage tools (default `false`: no triage tools, and `gmail.modify` is never requested) |
 | `TRIAGE_DAILY_CAP` | no | Triage changes (ids touched) per mailbox in a rolling 24 h (default 1000) |
+| `METRICS_ENABLED` | no | `true` serves Prometheus metrics at `/metrics` (default `false`: the route doesn't exist). See [Metrics](#metrics) |
+| `METRICS_TOKEN` | with metrics | Bearer token required on every `/metrics` request (≥32 chars; the server refuses to start without it when metrics are on) |
 | `UNSUBSCRIBE_ALLOWED_PORTS` | no | Extra https ports the one-click unsubscribe POST may use (comma-separated; 443 is always allowed, default none) |
 | `LOG_LEVEL`, `HOST`, `PORT` | no | Logging and bind address |
 
@@ -442,6 +450,44 @@ Guardrails:
   bulk changes with you first.
 - **Audit:** each call records the action and a count (`messages=12`), never message or thread ids or
   label names.
+
+### Metrics
+
+With `METRICS_ENABLED=true`, `GET /metrics` returns the Prometheus text format. It is served on the
+same port as everything else, which your reverse proxy makes public, so every request must carry
+`Authorization: Bearer <METRICS_TOKEN>`: no header gets 401, a wrong one 403 (compared in constant
+time). Generate the token with `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`. You
+can also block `/metrics` at the proxy and scrape `127.0.0.1:38000` from the host.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: surfski
+    scheme: https
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/surfski_token   # contains METRICS_TOKEN
+    static_configs:
+      - targets: ["mcp.example.com"]
+```
+
+| Metric | Labels |
+|---|---|
+| `surfski_tool_calls_total` | `tool`, `outcome` (`ok`, `error`, `internal_error`) |
+| `surfski_tool_duration_seconds` (histogram) | `tool` |
+| `surfski_gmail_api_errors_total` | `status_class` (`400`, `401`, `403`, `404`, `429`, `4xx`, `5xx`, `refresh`, `storage`, `other`) |
+| `surfski_sends_total` | `policy` (`auto`, `confirm`), `outcome` (`sent`, `failed`, `declined`, `link_issued`) |
+| `surfski_triage_modifications_total` | none (messages/threads changed) |
+| `surfski_attachment_extractions_total` | `method` (`text`, `html`, `pdf`, `docx`, `xlsx`, `pptx`, `none`), `outcome` (`ok`, `metadata_only`, `error`) |
+| `surfski_unsubscribe_total` | `method` (`one_click`, `mailto`, `manual`, `none`), `outcome` |
+| `surfski_rate_limit_rejections_total` | none |
+| `surfski_linked_mailboxes`, `surfski_owners` (gauges) | none (counted from SQLite at scrape time) |
+| `surfski_build_info`, `surfski_process_start_time_seconds`, `surfski_uptime_seconds` | `version` on build info |
+
+**No personal data:** label values come from fixed sets (the server's own tool names and the values
+above); anything else is recorded as `other`. No owner, alias, address, query, message id, label name
+or URL ever appears, and cardinality is bounded.
 
 ### Unsubscribe safety
 

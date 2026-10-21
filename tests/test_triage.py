@@ -247,6 +247,7 @@ async def test_partial_failure_keeps_applied_part_of_cap(config, storage, boxes,
     with pytest.raises(ToolError):
         await call(app, tool, alias="work", thread_ids=[f"t{i}" for i in range(5)], **extra)
     assert storage.modifications_today(ALICE, "work", int(time.time())) == 2
+    assert app.surfski["metrics"]._counters["triage"] == {(): 2}
     # Failing on the very first id releases the whole reservation.
     boxes["alice@work.com"].fail_after = 0
     with pytest.raises(ToolError):

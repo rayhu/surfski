@@ -229,6 +229,7 @@ async def test_one_click_post(app, who, boxes, net, storage):
     assert req.headers["user-agent"] == unsub.USER_AGENT
     assert "cookie" not in req.headers and "authorization" not in req.headers
     assert gmail_writes(boxes["alice@work.com"]) == []  # no draft for one-click
+    assert app.surfski["metrics"]._counters["unsubscribe"] == {("one_click", "ok"): 1}
     assert audit(storage) == ["message=m-oc confirm method=one_click outcome=checked",
                               "message=m-oc method=one_click outcome=ok status=200"]
     assert_audit_clean(storage)

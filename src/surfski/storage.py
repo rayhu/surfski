@@ -665,6 +665,12 @@ class Storage:
             rows = c.execute(f"SELECT {ACCOUNT_COLS} FROM accounts ORDER BY owner, alias").fetchall()
         return [Account(**dict(r)) for r in rows]
 
+    def admin_counts(self) -> tuple[int, int]:
+        """(linked mailboxes, distinct owners): counts only, for /metrics."""
+        with self._tx() as c:
+            mailboxes, owners = c.execute("SELECT COUNT(*), COUNT(DISTINCT owner) FROM accounts").fetchone()
+        return mailboxes, owners
+
     def admin_audit_counts(self, owner: str, since: str) -> list[dict]:
         """Audit row counts per tool (ok / failed) for one owner since an ISO timestamp."""
         with self._tx() as c:

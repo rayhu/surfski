@@ -94,7 +94,9 @@ See [Calendar module](#calendar-module).
 - ✅ **Recipient lookup** (`find_contact`, #18): resolve "Alice" to an address from the caller's own mail
   history. It needs no new scope. The People API (`contacts.readonly`, sensitive) is optional later.
 - **Calendar module**: see the [design below](#calendar-module).
-- **Metrics endpoint** (Prometheus) without personal data.
+- ✅ **Metrics endpoint** (#10): Prometheus `/metrics` behind `METRICS_ENABLED` and a Bearer
+  `METRICS_TOKEN`; tool calls, latency, Gmail errors, sends, triage, attachments, unsubscribe and
+  counts, with no personal data in any label.
 - Versioned releases and a changelog.
 
 ## Not planned
