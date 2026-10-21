@@ -19,7 +19,7 @@ Surfski uses [Semantic Versioning](https://semver.org). The version lives in exa
    git push origin vX.Y.Z
    ```
    The tag must be exactly `v` + the `pyproject.toml` version. Pre-releases use a suffix in both,
-   e.g. `version = "0.2.0-rc.1"` and tag `v0.2.0-rc.1`; they are published as GitHub pre-releases.
+   e.g. `version = "0.2.0-rc.1"` and tag `v0.2.0-rc.1`; they are published as GitHub pre-releases. Note that Python normalizes such versions in package metadata (`0.2.0-rc.1` becomes `0.2.0rc1`), so `surfski --version` prints the normalized form.
 5. **The release workflow** (`.github/workflows/release.yml`) then:
    - fails at once if the tag doesn't match the `pyproject.toml` version or the changelog has no
      section for it;

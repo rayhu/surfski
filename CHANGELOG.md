@@ -65,7 +65,7 @@ mailboxes per user, with per-user isolation.
 - Owner isolation: every `accounts` query a tool makes is scoped to the caller, with tests per data
   path. Only the local admin CLI reads across owners.
 - Refresh tokens are Fernet-encrypted at rest (optional per-owner keys); access tokens live only in
-  memory. Logs and audit rows never contain tokens, auth codes, message bodies or email addresses.
+  memory. Logs never contain tokens, auth codes, message bodies or email addresses; audit-row details never contain them either (the audit `owner` column is the caller's own email, and is replaced in pseudonymize mode).
 - Fail-closed configuration: the server refuses to start with missing or malformed secrets or an
   empty allowlist; public mail providers can't be allowlisted as domains.
 - Write features (sending, triage) are off by default and need both an operator switch and a
