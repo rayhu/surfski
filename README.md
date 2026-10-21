@@ -16,7 +16,12 @@ Workspace mailboxes** for each user, and users never see each other's mailboxes.
 
 Tools: `list_accounts`, `link_account`, `relink_account`, `rename_account`, `unlink_account`, `search_threads`,
 `search_all_accounts`, `get_thread`, `get_message`, `list_labels`, `create_draft`, `list_drafts`, `get_draft`,
-`update_draft`, `delete_draft`.
+`update_draft`, `delete_draft`, `list_addresses`, `set_address_label`, `set_default_from`.
+
+**Send from an alias.** `create_draft` and `update_draft` take `from_address` (a verified "Send mail as"
+address or a label set with `set_address_label`) and `include_signature`. Replies default to the address
+the original was sent to; new drafts use `set_default_from`, then Gmail's default. New addresses are added in
+Gmail → Settings → Accounts → Send mail as.
 
 ## Why self-host?
 

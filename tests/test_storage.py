@@ -91,3 +91,52 @@ def test_rename_account(storage):
         storage.rename_account(A, "nope", "x")
     with pytest.raises(ValueError):
         storage.rename_account(A, "work", "bad alias!")
+
+
+OLD_SCHEMA = """
+CREATE TABLE accounts (
+  owner TEXT NOT NULL, alias TEXT NOT NULL, email TEXT NOT NULL,
+  refresh_token_enc BLOB NOT NULL, scopes TEXT NOT NULL, created_at TEXT NOT NULL,
+  last_used_at TEXT, PRIMARY KEY (owner, alias)
+);
+CREATE TABLE audit_log (ts TEXT, owner TEXT, tool TEXT, alias TEXT, detail TEXT, ok INTEGER);
+"""
+
+
+def test_migration_on_existing_db(tmp_path):
+    key = Fernet.generate_key().decode()
+    cipher = TokenCipher(key)
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(OLD_SCHEMA)
+    conn.execute(
+        "INSERT INTO accounts VALUES (?, ?, ?, ?, ?, ?, NULL)",
+        (A, "work", "alice@work.com", cipher.encrypt(A, "rt-old"), "s", "2026-01-01T00:00:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    for _ in range(2):  # idempotent
+        s = Storage(db, cipher)
+        acct = s.get_account(A, "work")
+        assert acct.email == "alice@work.com" and s.get_refresh_token(A, "work") == "rt-old"
+        s.close()
+
+    s = Storage(db, cipher)
+    assert s.get_account(A, "work").default_from is None
+    s.set_default_from(A, "work", "Sales@Work.org")
+    s.set_address_label(A, "work", "sales@work.org", "sales")
+    assert s.get_account(A, "work").default_from == "sales@work.org"
+    assert s.get_address_labels(A, "work") == {"sales": "sales@work.org"}
+    with pytest.raises(AccountNotFound):
+        s.set_address_label(B, "work", "x@y.z", "x")
+    assert s.get_address_labels(B, "work") == {}
+    s.close()
+
+
+def test_add_column_tolerates_concurrent_migration(storage):
+    # Simulates two processes racing past the PRAGMA check: the second ALTER must not fail.
+    storage._add_column("accounts", "default_from", "TEXT")
+    storage._add_column("accounts", "default_from", "TEXT")
+    with pytest.raises(sqlite3.OperationalError):
+        storage._add_column("no_such_table", "x", "TEXT")

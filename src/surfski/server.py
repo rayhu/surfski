@@ -31,7 +31,14 @@ from .linking import (
     revoke_token,
     start_link,
 )
-from .storage import AccountNotFound, Storage, StorageError, TokenCipher, validate_alias
+from .storage import (
+    AccountNotFound,
+    Storage,
+    StorageError,
+    TokenCipher,
+    validate_alias,
+    validate_label,
+)
 
 log = logging.getLogger("surfski")
 
@@ -46,6 +53,30 @@ INSTRUCTIONS = (
 
 
 # ---------------------------------------------------------------- helpers
+
+
+class SendAsCache:
+    """In-memory send-as identities per (owner, alias), with a short TTL."""
+
+    def __init__(self, ttl: float = 300.0):
+        self.ttl = ttl
+        self._lock = threading.Lock()
+        self._data: dict[tuple[str, str], tuple[list[dict], float]] = {}
+
+    def get(self, owner: str, alias: str) -> list[dict] | None:
+        with self._lock:
+            item = self._data.get((owner, alias))
+        if item and time.monotonic() - item[1] < self.ttl:
+            return item[0]
+        return None
+
+    def put(self, owner: str, alias: str, identities: list[dict]) -> None:
+        with self._lock:
+            self._data[(owner, alias)] = (identities, time.monotonic())
+
+    def drop(self, owner: str, alias: str) -> None:
+        with self._lock:
+            self._data.pop((owner, alias), None)
 
 
 class RateLimiter:
@@ -150,6 +181,7 @@ def create_app(
     )
     http_factory = http_factory or (lambda: httpx.AsyncClient(timeout=15))
     token_cache = g.AccessTokenCache()
+    send_as_cache = SendAsCache()
     limiter = RateLimiter(config.rate_limit_per_minute)
 
     def default_service_factory(owner: str, alias: str):
@@ -219,15 +251,126 @@ def create_app(
         write_audit(storage, owner, tool, acct.alias, detail, True)
         return result
 
+    def identities(owner: str, alias: str, svc, refresh: bool = False) -> list[dict]:
+        """Send-as identities, cached per (owner, alias). Runs in the worker thread."""
+        cached = None if refresh else send_as_cache.get(owner, alias)
+        if cached is None:
+            cached = g.op_list_send_as(svc)
+            send_as_cache.put(owner, alias, cached)
+        return cached
+
+    def create_chooser(owner: str, acct, svc, from_address: str | None, strict: bool):
+        def choose(recipients: list[str]):
+            try:
+                ids = identities(owner, acct.alias, svc)
+            except Exception as e:  # noqa: BLE001
+                if strict:
+                    err = g.map_google_error(e, acct.alias)
+                    raise g.GmailError(
+                        f"couldn't read the send-as addresses to verify the From address ({err})"
+                    ) from None
+                ids = []  # e.g. settings scope unticked: fall back to the account email
+            return g.resolve_identity(
+                ids,
+                requested=from_address,
+                labels=storage.get_address_labels(owner, acct.alias),
+                default_from=acct.default_from,
+                reply_recipients=recipients,
+                account_email=acct.email,
+            )
+        return choose
+
     # -- account tools
 
     @mcp.tool(annotations={"readOnlyHint": True})
     async def list_accounts() -> list[dict]:
-        """List the Gmail accounts you have linked (alias + address). Call this first
-        when the user hasn't said which account to use."""
+        """List the Gmail accounts you have linked (alias + address), with each
+        mailbox's address labels, default From and (if loaded) send-as addresses.
+        Call this first when the user hasn't said which account to use."""
         owner = require_owner("list_accounts")
         write_audit(storage, owner, "list_accounts", None, "", True)
-        return [a.public() for a in storage.list_accounts(owner)]
+        out = []
+        for a in storage.list_accounts(owner):
+            labels = storage.get_address_labels(owner, a.alias)
+            ids = send_as_cache.get(owner, a.alias)  # never calls Gmail here
+            row = a.public() | {"address_labels": labels, "addresses_loaded": ids is not None}
+            if ids is None:
+                row["addresses"] = None
+                row["addresses_hint"] = f"call list_addresses('{a.alias}') to load send-as addresses"
+            else:
+                row["addresses"] = [g.public_identity(i, labels) for i in ids]
+            out.append(row)
+        return out
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    async def list_addresses(
+        alias: str,
+        refresh: Annotated[bool, Field(description="Bypass the few-minute cache")] = False,
+    ) -> dict:
+        """List a mailbox's send-as addresses (Gmail "Send mail as"): address, display
+        name, label, default, primary, verification status and whether it has a
+        signature. Only verified addresses can be used as from_address."""
+        owner = require_owner("list_addresses")
+
+        def fn(svc, acct):
+            labels = storage.get_address_labels(owner, acct.alias)
+            ids = identities(owner, acct.alias, svc, refresh=refresh)
+            return {
+                "addresses": [g.public_identity(i, labels) for i in ids],
+                "default_from": acct.default_from,
+            }
+
+        return await gmail_call(owner, alias, "list_addresses", f"refresh={refresh}", fn)
+
+    @mcp.tool
+    async def set_address_label(
+        alias: str,
+        address: Annotated[str, Field(description="A verified send-as address of this mailbox")],
+        label: Annotated[str, Field(description="[a-z0-9_-]{1,32}; empty string removes the label")],
+    ) -> dict:
+        """Give a send-as address a short local label (e.g. 'support'), usable as
+        from_address. Labels are stored on this server only, never in Gmail."""
+        owner = require_owner("set_address_label")
+        if label.strip():
+            try:
+                validate_label(label)
+            except ValueError as e:
+                raise ToolError(str(e)) from None
+
+        def fn(svc, acct):
+            addr = address.strip().lower()
+            if label.strip():
+                ident, _ = g.match_identity(identities(owner, acct.alias, svc), addr, {})
+                addr = ident["address"]
+            storage.set_address_label(owner, acct.alias, addr, label)
+            return {"ok": True, "address": addr, "label": label.strip().lower() or None}
+
+        detail = "set" if label.strip() else "remove"
+        return await gmail_call(owner, alias, "set_address_label", detail, fn)
+
+    @mcp.tool
+    async def set_default_from(
+        alias: str,
+        address: Annotated[
+            str, Field(description="Verified send-as address or label; empty string clears")
+        ],
+    ) -> dict:
+        """Set the default From address for new drafts from this mailbox (replies
+        still default to the address the original was sent to). Empty clears it,
+        falling back to Gmail's default."""
+        owner = require_owner("set_default_from")
+
+        def fn(svc, acct):
+            addr = None
+            if address.strip():
+                labels = storage.get_address_labels(owner, acct.alias)
+                ident, _ = g.match_identity(identities(owner, acct.alias, svc), address, labels)
+                addr = ident["address"]
+            storage.set_default_from(owner, acct.alias, addr)
+            return {"ok": True, "default_from": addr}
+
+        detail = "set" if address.strip() else "clear"
+        return await gmail_call(owner, alias, "set_default_from", detail, fn)
 
     def _link(owner: str, tool: str, alias: str, login_hint: str | None) -> dict:
         try:
@@ -287,6 +430,7 @@ def create_app(
             raise ToolError(str(e)) from None
         old, new = old_alias.strip().lower(), new_alias.strip().lower()
         token_cache.drop(owner, old)
+        send_as_cache.drop(owner, old)
         write_audit(storage, owner, "rename_account", new, f"renamed from {old}", True)
         return {"ok": True, "alias": new}
 
@@ -305,6 +449,7 @@ def create_app(
                 revoked = await revoke_token(http, rt)
         storage.delete_account(owner, acct.alias)
         token_cache.drop(owner, acct.alias)
+        send_as_cache.drop(owner, acct.alias)
         write_audit(storage, owner, "unlink_account", acct.alias, f"revoked={revoked}", True)
         return {"ok": True, "revoked_at_google": revoked}
 
@@ -317,7 +462,9 @@ def create_app(
         max_results: Annotated[int, Field(ge=1, le=50)] = 10,
         page_token: str | None = None,
     ) -> dict:
-        """Search threads in one linked account using Gmail query syntax.
+        """Search threads in one linked account using Gmail query syntax. To find mail
+        sent to one of the mailbox's addresses (an alias), use 'deliveredto:<address>'
+        or 'to:<address>'.
         Call list_accounts first if the user hasn't named an account."""
         owner = require_owner("search_threads")
         return await gmail_call(
@@ -397,16 +544,30 @@ def create_app(
         reply_to_message_id: Annotated[
             str | None, Field(description="Message id to reply to (threads the draft)")
         ] = None,
+        from_address: Annotated[
+            str | None, Field(description="Send-as address or label to send from (see list_addresses)")
+        ] = None,
+        include_signature: Annotated[
+            bool, Field(description="Append the From identity's Gmail signature as plain text")
+        ] = False,
     ) -> dict:
         """Create a Gmail draft (new or reply) in one linked account. This does NOT
         send: the user reviews and sends it from Gmail. Call list_accounts first if the
-        user hasn't said which account to draft from."""
+        user hasn't said which account to draft from. Without from_address, a reply is
+        sent from the address the original was sent to, otherwise the mailbox default.
+        The result's 'from' and 'from_source' say which address was used."""
         owner = require_owner("create_draft")
 
         def fn(svc, acct):
             r = g.op_create_draft(
                 svc,
-                from_addr=acct.email,
+                # A stored default counts as an explicit choice: if send-as can't be
+                # read we error instead of silently sending from another address.
+                choose_from=create_chooser(
+                    owner, acct, svc, from_address,
+                    strict=bool(from_address or include_signature or acct.default_from),
+                ),
+                include_signature=include_signature,
                 to=to,
                 subject=subject,
                 body=body,
@@ -418,6 +579,8 @@ def create_app(
             return r
 
         detail = "reply" if reply_to_message_id else "new"
+        if from_address:
+            detail += " from=explicit"
         return await gmail_call(owner, alias, "create_draft", detail, fn)
 
     @mcp.tool(annotations={"readOnlyHint": True})
@@ -456,6 +619,12 @@ def create_app(
         body: Annotated[str | None, Field(description="Plain-text body; omit to keep")] = None,
         cc: Annotated[str | None, Field(description="Omit to keep, empty string to clear")] = None,
         bcc: Annotated[str | None, Field(description="Omit to keep, empty string to clear")] = None,
+        from_address: Annotated[
+            str | None, Field(description="Send-as address or label; omit to keep the current From")
+        ] = None,
+        include_signature: Annotated[
+            bool, Field(description="Append the From identity's Gmail signature (once)")
+        ] = False,
     ) -> dict:
         """Revise an existing draft. Omitted fields keep their current values; the
         sender and reply threading are preserved. The draft is saved as plain text:
@@ -465,15 +634,32 @@ def create_app(
         owner = require_owner("update_draft")
 
         def fn(svc, acct):
+            choose = None
+            ids: list[dict] = []
+            if from_address or include_signature:
+                ids = identities(owner, acct.alias, svc)
+
+                def choose(current_from: str):
+                    labels = storage.get_address_labels(owner, acct.alias)
+                    if from_address:
+                        return g.match_identity(ids, from_address, labels)
+                    for i in ids:
+                        if i["address"] == current_from and g.is_verified(i):
+                            return i, "current"
+                    raise g.GmailError(
+                        "the draft's From isn't a verified send-as address; pass from_address"
+                    )
             r = g.op_update_draft(
                 svc, draft_id=draft_id, default_from=acct.email,
+                choose_from=choose, include_signature=include_signature, known_identities=ids,
                 to=to, subject=subject, body=body, cc=cc, bcc=bcc,
             )
             r["gmail_url"] = g.gmail_drafts_url(acct.email)
             return r
 
         fields = ",".join(
-            k for k, v in (("to", to), ("subject", subject), ("body", body), ("cc", cc), ("bcc", bcc))
+            k for k, v in (("to", to), ("subject", subject), ("body", body), ("cc", cc), ("bcc", bcc),
+                           ("from", from_address), ("signature", include_signature or None))
             if v is not None
         )
         return await gmail_call(owner, alias, "update_draft", f"draft={draft_id} fields={fields}", fn)
@@ -521,6 +707,7 @@ def create_app(
                 tokens.get("scope") or " ".join(GMAIL_SCOPES),
             )
             token_cache.drop(owner, alias)
+            send_as_cache.drop(owner, alias)
             if tokens.get("expires_in"):
                 token_cache.put(owner, alias, tokens["access_token"], time.time() + int(tokens["expires_in"]))
         except LinkError as e:
