@@ -146,3 +146,19 @@ def test_drafts_url():
 def test_snippet_html_unescaped():
     t = {"id": "t", "messages": [{"snippet": "doesn&#39;t &amp; won&#39;t &lt;b&gt;", "payload": {"headers": []}}]}
     assert g.summarize_thread(t)["snippet"] == "doesn't & won't <b>"
+
+
+def test_inline_parts_count_as_attachments():
+    payload = {
+        "mimeType": "multipart/related",
+        "parts": [
+            {"mimeType": "text/plain", "body": {"data": b64("body"), "attachmentId": "big"}},
+            {"mimeType": "image/png", "headers": hdrs(Content_ID="<i1>"), "body": {"size": 5}},
+            {"mimeType": "image/gif", "body": {"size": 7, "attachmentId": "a2"}},
+        ],
+    }
+    assert g.extract_body(payload) == "body"
+    assert g.extract_attachments(payload) == [
+        {"filename": "", "mime_type": "image/png", "size": 5},
+        {"filename": "", "mime_type": "image/gif", "size": 7},
+    ]

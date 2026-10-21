@@ -63,7 +63,7 @@ See [Calendar module](#calendar-module).
   results.
 - **Address aliases and "send from"**: see the [design below](#address-aliases-and-send-from).
 - **Opt-in sending**: see the [design below](#opt-in-sending-design).
-- **Draft management**: `list_drafts`, `get_draft`, `update_draft`, `delete_draft`. Today Claude can
+- ✅ **Draft management**: `list_drafts`, `get_draft`, `update_draft`, `delete_draft`. Today Claude can
   create a draft but can't revise one, and "fix the draft you just wrote" is a common request. Uses the
   existing `gmail.compose` scope.
 - **`forward_message`**: forward a message, keeping its original attachments. It saves a draft by
