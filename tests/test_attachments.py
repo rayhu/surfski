@@ -294,3 +294,75 @@ def test_strict_fake_attachments_get():
     svc = StrictGmail({"users.messages.attachments.get": lambda **kw: {}})
     with pytest.raises(TypeError, match="unexpected keyword argument format"):
         svc.users().messages().attachments().get(userId="me", messageId="m", id="a", format="raw")
+
+
+def _docx_with_body(body: bytes) -> bytes:
+    return make_zip({"word/document.xml": f'<w:document xmlns:w="{W_NS}"><w:body>'.encode()
+                     + body + b"</w:body></w:document>"})
+
+
+def test_element_bomb_is_bounded_in_memory():
+    """The reviewer's DoS: millions of tiny elements with random padding to keep the
+    compression ratio under the cap."""
+    import os
+    import tracemalloc
+    pad = os.urandom(150_000).hex().encode()
+    big = _docx_with_body(b"<w:p/>" * 3_966_000 + b"<w:p><w:r><w:t>" + pad + b"</w:t></w:r></w:p>")
+    assert len(big) < 600_000
+    with pytest.raises(att.ExtractError, match="zip bomb guard"):  # 23.8 MB part: over the per-part cap
+        att.extract_text(big, DOCX, "x.docx", charset=None, max_chars=50_000)
+
+    under = _docx_with_body(b"<w:p/>" * 1_300_000 + b"<w:p><w:r><w:t>" + pad + b"</w:t></w:r></w:p>")
+    info = zipfile.ZipFile(io.BytesIO(under)).getinfo("word/document.xml")
+    assert info.file_size < att.ZIP_MAX_MEMBER_BYTES and info.file_size / info.compress_size < att.ZIP_MAX_RATIO
+    tracemalloc.start()
+    try:
+        with pytest.raises(att.ExtractError, match="too complex to read"):
+            att.extract_text(under, DOCX, "x.docx", charset=None, max_chars=50_000)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 100 * 1024 * 1024, peak
+
+
+def test_huge_paragraph_stops_at_max_chars():
+    import tracemalloc
+    runs = b"".join(b"<w:r><w:t>%08x</w:t></w:r>" % (i * 2654435761 % 2**32) for i in range(200_000))
+    doc = _docx_with_body(b"<w:p>" + runs + b"</w:p>")
+    tracemalloc.start()
+    try:
+        ex = att.extract_text(doc, DOCX, "x.docx", charset=None, max_chars=1000)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert 1000 < len(ex.text) < 1100 and ex.note is None, len(ex.text)
+    assert peak < 30 * 1024 * 1024, peak
+
+
+def test_element_cap_keeps_partial_text(monkeypatch):
+    monkeypatch.setattr(att, "XML_MAX_ELEMENTS", 50)
+    doc = _docx_with_body(b"".join(b"<w:p><w:r><w:t>line%d</w:t></w:r></w:p>" % i for i in range(100)))
+    ex = att.extract_text(doc, DOCX, "x.docx", charset=None, max_chars=50_000)
+    assert ex.text.startswith("line0\nline1") and "line99" not in ex.text
+    assert "stopped after 50 XML elements" in ex.note
+
+
+def test_huge_part_numbers_do_not_crash():
+    slide = f'<p:sld xmlns:p="x" xmlns:a="{A_NS}"><a:p><a:r><a:t>ok</a:t></a:r></a:p></p:sld>'
+    deck = make_zip({"ppt/slides/slide" + "9" * 5000 + ".xml": slide, "ppt/slides/slide1.xml": slide})
+    ex = att.extract_text(deck, PPTX, "d.pptx", charset=None, max_chars=1000)
+    assert ex.text.count("ok") == 2
+
+
+def test_pdf_decompression_limits_applied(monkeypatch):
+    import pypdf
+    seen = {}
+    real = pypdf.apply_configuration
+
+    def spy(**kw):
+        seen.update(kw)
+        return real(**kw)
+    monkeypatch.setattr(pypdf, "apply_configuration", spy)
+    att.extract_text(make_pdf(["x"]), "application/pdf", "a.pdf", charset=None, max_chars=100)
+    assert seen["zlib_maximum_output_length"] == 20 * 1024 * 1024
+    assert seen["lzw_maximum_output_length"] == seen["maximum_declared_stream_length"] == 20 * 1024 * 1024
