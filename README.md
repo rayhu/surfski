@@ -273,6 +273,11 @@ owner their own `TOKEN_ENCRYPTION_KEYS` entry is a rotation too: set
 back to the default key on its own). Removing an owner's entry: set `TOKEN_ENCRYPTION_KEYS_OLD` to
 their former key.
 
+Pending confirmation links (send, calendar and policy confirmations, which live 10 minutes) are encrypted
+with the owner's token key too. They stay valid during a rotation while the old key is configured, and
+only break if you remove `TOKEN_ENCRYPTION_KEY_OLD` (or the owner's `TOKEN_ENCRYPTION_KEYS_OLD` entry)
+within 10 minutes of the link being issued; the owner then asks for a new link.
+
 **Backups after a rotation:** older backups still need the old key. Keep the old key with the backups
 it protects until they expire, or take a fresh backup right after rotating.
 
@@ -311,6 +316,7 @@ connector (Settings → Connectors). Nothing else is lost: linked mailboxes are 
 | `EXTRACT_SANDBOX` | no | `subprocess` (default): extract attachment text in a resource-limited child process; `inprocess`: in a server thread |
 | `EXTRACT_TIMEOUT_S` | no | Wall-clock limit per extraction; the child is killed after it (default 20, 1–120) |
 | `EXTRACT_MEMORY_MB` | no | Address-space limit of the extraction child (default 512, 128–8192; Linux) |
+| `EXTRACT_SANDBOX_STRICT` | no | `true`: refuse to read attachments unless Landlock confines the extraction child (default `false`: degrade to the rlimits and log a warning). Requires `EXTRACT_SANDBOX=subprocess` |
 | `AUDIT_ON_DELETE` | no | What `delete_my_data` does with the caller's audit rows: `delete` (default) or `pseudonymize` (keep them under a keyed hash) |
 | `TRIAGE_ENABLED` | no | `true` registers the triage tools (default `false`: no triage tools, and `gmail.modify` is never requested) |
 | `TRIAGE_DAILY_CAP` | no | Triage changes (ids touched) per mailbox in a rolling 24 h (default 1000) |
@@ -377,7 +383,7 @@ set -a; source ./local.env; set +a; uv run surfski
   the bytes on stdin and reads JSON from stdout. The child drops its own limits before touching the
   input: address space `EXTRACT_MEMORY_MB` (`RLIMIT_AS`), CPU seconds (`RLIMIT_CPU`), no file data
   writes (`RLIMIT_FSIZE=0`), no new processes (`RLIMIT_NPROC=0`), 16 open files, no core dumps, and
-  Python-level sockets disabled. Its environment holds only `PATH`, `HOME` and `LANG`, and its stdout
+  the kernel confinement below. Its environment holds only `PATH`, `HOME` and `LANG`, and its stdout
   is read incrementally and cut off (child killed) past `max_chars × 8 + 4 KB`; results are
   type-checked before use. The parent kills the child's process group after
   `EXTRACT_TIMEOUT_S` and reaps it. At most 2 extractions run at once. A timeout, OOM or crash
@@ -391,14 +397,35 @@ set -a; source ./local.env; set +a; uv run surfski
     it. It also removes the secret settings from `os.environ` once the config is loaded. A side
     effect: profilers and debuggers that attach to a running process, such as `py-spy` or `gdb`,
     can't attach to the server either (run them as root, or start the server under them).
-  - **Limit:** the worker still runs as the same uid as the server. A parser exploit could still
-    read files that user can read, including the SQLite database (encrypted refresh tokens) and the
-    OAuth store under `DATA_DIR`. The next step is seccomp, namespaces or a separate uid for the
-    worker ([#43](https://github.com/rayhu/surfski/issues/43)).
-  - *Enforced on Linux* (the container): all the rlimits above. *Not enforced without seccomp or
-    namespaces:* network access from native code (only Python's `socket` is blocked; the container
-    has its normal network), reads of files the server user can read, and creating empty files on
-    the `/tmp` tmpfs. On macOS (development), `RLIMIT_AS` and some others aren't supported; they are
+  - *Kernel confinement* ([#43](https://github.com/rayhu/surfski/issues/43)): before parsing, the
+    worker restricts itself with **Landlock** (Linux 5.13+, unprivileged, works under `cap_drop: ALL`
+    and `no-new-privileges`). From then on it can only open files beneath the Python installation,
+    the venv / `sys.path`, the system library directories, `/usr/share/zoneinfo`, `/etc/ld.so.cache`,
+    `/dev/null` and `/dev/urandom`, read-only: nothing under `DATA_DIR` (so not the SQLite database
+    or the OAuth store), nothing else in `/etc`, and no writing, creating, deleting or truncating
+    anywhere. With Landlock ABI 4+ (Linux 6.7+) it also can't bind or connect TCP sockets, and with
+    ABI 6+ it can't signal processes or reach abstract unix sockets outside its sandbox. A small
+    **seccomp** filter makes `socket()`, `io_uring_setup()` and path `truncate()` fail with EPERM
+    (x86_64 and aarch64; foreign-ABI syscalls fail too). Both need only `PR_SET_NO_NEW_PRIVS`, which
+    any process may set, and are applied with ctypes (no new dependency).
+  - *Protection level:* at startup the server runs one trivial extraction and logs the result, for
+    example `extraction sandbox protection: full (Landlock ABI 6, filesystem restricted, TCP blocked,
+    seccomp on)`, and exports it as `surfski_extract_sandbox_info{level=…,landlock_abi=…,seccomp=…}`.
+    Levels: `full` (Landlock filesystem plus a kernel network block), `filesystem`, `network`, `basic`
+    (rlimits only: macOS, kernels before 5.13, Landlock not enabled, or the syscalls blocked by a
+    seccomp profile), `none` (`EXTRACT_SANDBOX=inprocess`). Anything below `full` on Linux is logged as
+    a warning. Set `EXTRACT_SANDBOX_STRICT=true` to refuse to read attachments (a clear tool error)
+    unless Landlock applied. The server also warns if `DATA_DIR` sits beneath a path the worker may
+    read. CI checks in the hardened container that the worker reaches `full`, gets EACCES on
+    `/data/data.db` and EPERM on `socket()`.
+  - **Limits:** the worker still runs as the same uid (a separate uid needs `CAP_SETUID` or a root
+    entry point, which `cap_drop: ALL` and `no-new-privileges` rule out). It can read the code and
+    libraries it is allowed to load (nothing secret). Landlock doesn't cover already-open file
+    descriptors (only its stdin/stdout pipes), UDP needs `socket()` which seccomp blocks, but on
+    architectures other than x86_64 and aarch64 the seccomp filter is skipped. A kernel exploit
+    escapes all of this.
+  - *Enforced on Linux* (the container): all the rlimits above, plus Landlock and seccomp where the
+    kernel supports them. On macOS (development), `RLIMIT_AS` and some others aren't supported; they are
     skipped with a log line, and the timeout still applies. `EXTRACT_SANDBOX=inprocess` turns the
     sandbox off (not recommended).
 - `forward_message`, and drafts with `attachments`, hold the attachments in memory while the draft is

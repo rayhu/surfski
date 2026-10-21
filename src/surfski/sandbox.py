@@ -5,7 +5,12 @@ server), sends the bytes on stdin and reads one JSON result from stdout. The par
 enforces a wall-clock timeout and kills the child's whole process group; the child
 lowers its own rlimits before touching the input. A semaphore caps concurrent
 extractions. Failures map to a short user-facing ExtractError; the child's stderr is
-discarded (only a class name such as "timeout" or "MemoryError" is ever reported)."""
+discarded (only a class name such as "timeout" or "MemoryError" is ever reported).
+
+The child also confines itself with Landlock and seccomp (#43, `confine.py`). `probe()`
+runs one trivial extraction at startup to learn the protection level the kernel gives;
+that level, not one reported by a worker that parsed untrusted input, feeds the logs and
+metrics. With `strict=True` the worker refuses to parse unless Landlock applied."""
 
 from __future__ import annotations
 
@@ -27,12 +32,16 @@ TOO_COMPLEX = "the file was too complex to read safely"
 # Overridable by tests to inject a misbehaving worker.
 WORKER_ARGV = [sys.executable, "-I", "-B", "-m", "surfski.extract_worker"]
 _logged_skips: set[str] = set()
+SANDBOX_UNAVAILABLE = ("attachment reading is disabled: the extraction sandbox (Landlock) is not "
+                       "available on this server and EXTRACT_SANDBOX_STRICT is on")
 
 
 class Sandbox:
     def __init__(self, *, mode: str = "subprocess", timeout_s: float = 20.0, memory_mb: int = 512,
-                 max_concurrent: int = 2):
+                 max_concurrent: int = 2, strict: bool = False):
         self.mode = mode
+        self.strict = strict
+        self.protection: dict | None = None  # set by probe()
         self.timeout_s = timeout_s
         self.memory_mb = memory_mb
         self._sem = threading.BoundedSemaphore(max_concurrent)
@@ -43,7 +52,7 @@ class Sandbox:
     @classmethod
     def from_config(cls, config) -> Sandbox:
         return cls(mode=config.extract_sandbox, timeout_s=config.extract_timeout_s,
-                   memory_mb=config.extract_memory_mb)
+                   memory_mb=config.extract_memory_mb, strict=config.extract_sandbox_strict)
 
     def extract(self, data: bytes, mime_type: str, filename: str, *, charset: str | None,
                 max_chars: int) -> att.Extracted:
@@ -57,16 +66,17 @@ class Sandbox:
             with self._lock:
                 self.active += 1
                 self.peak = max(self.peak, self.active)
-            return self._run(data, mime_type, filename, charset, max_chars)
+            return self._run(data, mime_type, filename, charset, max_chars)[0]
         finally:
             with self._lock:
                 self.active -= 1
             self._sem.release()
 
-    def _run(self, data, mime_type, filename, charset, max_chars) -> att.Extracted:
+    def _run(self, data, mime_type, filename, charset, max_chars) -> tuple[att.Extracted, dict]:
         header = json.dumps({
             "mime_type": mime_type, "filename": filename, "charset": charset, "max_chars": max_chars,
             "memory_mb": self.memory_mb, "cpu_seconds": max(1, math.ceil(self.timeout_s)),
+            "strict": self.strict,
         }).encode() + b"\n"
         cap = output_cap(max_chars)
         start = time.monotonic()
@@ -132,6 +142,9 @@ class Sandbox:
             log.warning("attachment extraction failed: %s (%.2fs)", reason, elapsed)
             raise att.ExtractError(f"{TOO_COMPLEX} ({reason})")
         if result.get("ok") is not True:
+            if result.get("error") == "sandbox":
+                log.error("extraction refused: Landlock is unavailable and EXTRACT_SANDBOX_STRICT is on")
+                raise att.ExtractError(SANDBOX_UNAVAILABLE)
             if result.get("error") == "extract" and isinstance(result.get("message"), str):
                 raise att.ExtractError(result["message"][:300] or "could not read the file")
             cls = result.get("class")
@@ -147,7 +160,45 @@ class Sandbox:
                 _logged_skips.add(name)
                 log.info("extraction sandbox: %s is not supported on this platform; skipped", name)
         log.debug("attachment extracted in subprocess in %.3fs", elapsed)
-        return ex
+        return ex, result
+
+    def probe(self) -> dict:
+        """Run one trivial extraction to learn the protection level this host gives the worker,
+        log it and remember it in `self.protection`. Never raises."""
+        if self.mode == "inprocess":
+            self.protection = {"level": "none", "landlock_abi": 0, "seccomp": False}
+            log.warning("extraction sandbox: off (EXTRACT_SANDBOX=inprocess)")
+            return self.protection
+        report: dict | None = None
+        strict, self.strict = self.strict, False  # learn the level even where strict would refuse
+        try:
+            report = self._probe_run()
+        finally:
+            self.strict = strict
+        self.protection = report or {"level": "unknown", "landlock_abi": 0, "seccomp": False}
+        p = self.protection
+        msg = ("extraction sandbox protection: %s (Landlock ABI %s, filesystem %s, TCP %s, seccomp %s)",
+               p["level"], p["landlock_abi"], "restricted" if p.get("landlock_fs") else "open",
+               "blocked" if p.get("landlock_net") else "open", "on" if p["seccomp"] else "off")
+        if p["level"] == "full":
+            log.info(*msg)
+        elif self.strict and not p.get("landlock_fs"):
+            log.error(*msg)
+            log.error("EXTRACT_SANDBOX_STRICT is on: get_attachment will refuse to read files")
+        else:
+            log.warning(*msg)
+            if sys.platform.startswith("linux"):
+                log.warning("the extraction worker can read files this user can read (DATA_DIR "
+                            "included) or reach the network; see README 'Attachments' (#43)")
+        return self.protection
+
+    def _probe_run(self) -> dict | None:
+        try:
+            _, result = self._run(b"probe", "text/plain", "probe.txt", None, 100)
+        except Exception as e:  # noqa: BLE001
+            log.warning("extraction sandbox probe failed: %s", type(e).__name__)
+            return None
+        return protection_of(result)
 
     @staticmethod
     def _kill(proc: subprocess.Popen) -> None:
@@ -186,6 +237,20 @@ def worker_env() -> dict[str, str]:
     return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": "/tmp", "LANG": "C.UTF-8"}
 
 
+def protection_of(result: dict) -> dict | None:
+    """Type-check a worker's "protection" report."""
+    p = result.get("protection")
+    if not isinstance(p, dict) or p.get("level") not in ("full", "filesystem", "network", "basic"):
+        return None
+    abi = p.get("landlock_abi")
+    if not isinstance(abi, int) or isinstance(abi, bool) or not 0 <= abi < 100:
+        return None
+    flags = {k: p.get(k) for k in ("landlock_fs", "landlock_net", "seccomp")}
+    if not all(isinstance(v, bool) for v in flags.values()):
+        return None
+    return {"level": p["level"], "landlock_abi": abi, **flags}
+
+
 def validated(result: dict, max_chars: int) -> att.Extracted | None:
     """Type-check a worker's success result before trusting it."""
     text, method, note, skipped = (result.get(k) for k in ("text", "method", "note", "skipped"))
@@ -194,6 +259,8 @@ def validated(result: dict, max_chars: int) -> att.Extracted | None:
     if not isinstance(method, str) or method not in att.METHODS:
         return None
     if note is not None and not isinstance(note, str):
+        return None
+    if "protection" in result and protection_of(result) is None:
         return None
     if skipped is not None and not (isinstance(skipped, list) and all(isinstance(x, str) for x in skipped)):
         return None
