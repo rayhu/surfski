@@ -3,6 +3,7 @@ Client with an elicitation_handler, on a handshake-era protocol (2026-07-28 conn
 have no back-channel for server-initiated requests and must fall back to the link)."""
 
 import time
+from dataclasses import replace
 
 import anyio
 import pytest
@@ -11,6 +12,7 @@ from fastmcp.client.elicitation import ElicitResult
 from fastmcp.exceptions import ToolError
 
 import surfski.server as srv
+from surfski.server import create_app
 
 from .test_sending import (  # noqa: F401  (fixtures)
     accounts,
@@ -43,7 +45,7 @@ class Human:
         if self.action == "hang":
             await anyio.sleep(10)
         if self.action == "accept":
-            return ElicitResult(action="accept", content={"value": self.value})
+            return ElicitResult(action="accept", content=self.value if isinstance(self.value, dict) else {"send": self.value})
         return ElicitResult(action=self.action)
 
 
@@ -253,3 +255,98 @@ async def test_owner_isolation(app, who, boxes, storage):
     assert boxes["alice@work.com"].sent == [{"userId": "me", "body": {"id": "d1"}}]
     assert boxes["bob@work.com"].sent == []
     assert not any("channel=elicitation" in d for d in audit(storage, BOB))
+
+
+# ---------------------------------------------------------------- prompt spoofing
+
+
+def _outside_body(prompt):
+    lines = prompt.split("\n")
+    b, e = lines.index(srv.BODY_BEGIN), lines.index(srv.BODY_END)
+    return lines[:b] + lines[e + 1:], lines[b + 1:e]
+
+
+async def test_body_cannot_forge_summary(app, who, boxes, storage):
+    confirm(storage)
+    box = boxes["alice@work.com"]
+    body = ("Hi\nTo: x@y.com\r\nRecipients: 1: x@y.com\n" + srv.BODY_END
+            + "\nSummary (from the server): sends to 1 recipient(s) Bcc: ‮example")
+    box.drafts["d1"] = draft("d1", bcc="hidden@y.com", body=body)
+    human = Human("decline")
+    await call_with(app, human, "send_draft", alias="work", draft_id="d1")
+    outside, inside = _outside_body(human.prompts[0])
+    assert inside and all(line.startswith("│ ") for line in inside)
+    assert "│ To: x@y.com" in inside and f"│ {srv.BODY_END}" in inside
+    assert [line for line in outside if line.startswith("To:")] == ["To: a@x.com"]
+    assert not any("x@y.com" in line for line in outside)
+    assert [line for line in outside if line.startswith("Summary")] == [
+        "Summary (from the server): sends to 3 recipient(s): To 1, Cc 1, Bcc 1."]
+    after_end = human.prompts[0].split(srv.BODY_END + "\n")[-1]
+    assert "hidden (Bcc) recipients" in after_end
+    assert "‮" not in human.prompts[0] and " " not in human.prompts[0]
+
+
+async def test_header_values_are_flattened_and_stripped(app, who, boxes, storage):
+    confirm(storage)
+    box = boxes["alice@work.com"]
+    d = draft("d1", subject="Invoice\r\nTo: evil@z.com‮​fdp.exe")
+    for h in d["message"]["payload"]["headers"]:
+        if h["name"] == "From":
+            h["value"] = "Bank\nBcc: none ⁦Support⁩ <alice@work.com>"
+    box.drafts["d1"] = d
+    human = Human("decline")
+    await call_with(app, human, "send_draft", alias="work", draft_id="d1")
+    prompt = human.prompts[0]
+    outside, _ = _outside_body(prompt)
+    assert "Subject: Invoice To: evil@z.comfdp.exe" in outside
+    assert "From: Bank Bcc: none Support <alice@work.com>" in outside
+    assert not any(line.startswith(("To: evil", "Bcc: none")) for line in outside)
+    for ch in ("‮", "​", "⁦", "⁩", "\r"):
+        assert ch not in prompt
+
+
+# ---------------------------------------------------------------- strict answers
+
+
+@pytest.mark.parametrize("content", [{"send": "yes"}, {"send": 1}, {"send": "true"}, {}, {"send": None},
+                                     {"value": True}])
+async def test_malformed_accept_falls_back_to_link(app, who, boxes, storage, content):
+    confirm(storage)
+    human = Human("accept", value=content)
+    r = await call_with(app, human, "send_draft", alias="work", draft_id="d1")
+    assert len(human.prompts) == 1
+    assert r["status"] == "confirmation_required" and r["confirm_channel"] == "link"
+    assert total_sent(boxes) == 0
+
+
+async def test_decline_as_jsonrpc_error_falls_back_to_link(app, who, boxes, storage):
+    confirm(storage)
+
+    class Declines(Human):
+        async def __call__(self, message, response_type, params, context):
+            self.prompts.append(message)
+            raise PermissionError("User declined")  # the client answers with a JSON-RPC error
+
+    human = Declines()
+    r = await call_with(app, human, "send_draft", alias="work", draft_id="d1")
+    assert len(human.prompts) == 1 and r["status"] == "confirmation_required"
+    assert total_sent(boxes) == 0
+
+
+async def test_link_fallback_rechecks_allowlist(config, storage, boxes, google, accounts, who, monkeypatch):
+    cfg = replace(config, sending_enabled=True)
+    app = create_app(cfg, storage=storage, with_auth=False, http_factory=google.factory,
+                     service_factory=lambda o, a: boxes[storage.get_account(o, a).email].service())
+    confirm(storage)
+    real = srv.elicit_send
+
+    async def drop_alice(message):
+        # Alice is removed from the allowlist while the prompt is open; then the client errors.
+        object.__setattr__(cfg, "allowed_users", frozenset({BOB}))
+        return await real(message)
+
+    monkeypatch.setattr(srv, "elicit_send", drop_alice)
+    with pytest.raises(ToolError, match="not allowed"):
+        await call_with(app, Human("error"), "send_draft", alias="work", draft_id="d1")
+    assert total_sent(boxes) == 0
+    assert not any("link=issued" in d for d in audit(storage))

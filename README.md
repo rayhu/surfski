@@ -278,8 +278,12 @@ that tells Claude to forward something to an attacker):
   protocol (which has no channel for server-initiated requests), it falls back to the confirm link
   below, **never** to sending. Client support varies and changes: check your client's MCP
   documentation. **Trust model:** the server can't verify that a human answered; it trusts the client
-  to show the prompt to you and not let the model answer it. If you don't trust your clients to do
-  that, set `CONFIRM_CHANNEL=link`.
+  to show the prompt to you and not let the model answer it. A client or agent SDK that
+  auto-answers elicitations (or lets the model answer them) **bypasses the human entirely**. If you
+  don't trust every client your users connect with, set `CONFIRM_CHANNEL=link`. The prompt flattens
+  header values to one line, strips bidi and zero-width characters, fences the body excerpt between
+  markers and repeats the server's recipient counts after it, but the subject and body are still
+  written by whoever wrote the email: read the recipient rows, not the text.
 - **Owner sign-in before any confirm or approval page.** Opening a link shows nothing about the
   email until you sign in with Google as the mailbox owner (`/send/auth/callback`, which you must
   register on your OAuth client). That sets a session cookie for `/send` pages only (HttpOnly,

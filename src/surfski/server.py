@@ -9,6 +9,7 @@ import logging
 import secrets
 import threading
 import time
+import unicodedata
 from collections.abc import Callable
 from typing import Annotated, Any, Literal
 from urllib.parse import urlencode
@@ -20,7 +21,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_access_token, get_context
 from fastmcp.server.elicitation import AcceptedElicitation
-from pydantic import Field
+from pydantic import BaseModel, Field, StrictBool
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 
@@ -207,8 +208,33 @@ def daily_cap_error(config: Config, alias: str) -> g.GmailError:
     )
 
 
+# Bidi overrides/isolates and zero-width characters can reorder or hide text in a prompt.
+_INVISIBLE = dict.fromkeys(
+    [*range(0x200B, 0x2010), *range(0x202A, 0x202F), *range(0x2066, 0x206A), 0xFEFF, 0x00AD]
+)
+_LINE_BREAKS = ("\r\n", "\r", "\x85", "\u2028", "\u2029", "\x0b", "\x0c")
+
+
+def clean_field(value: str) -> str:
+    """One display line from an untrusted header value: no line breaks or other control
+    characters (they could forge extra summary rows), no bidi/zero-width characters."""
+    value = (value or "").translate(_INVISIBLE)
+    value = "".join(" " if unicodedata.category(c) in ("Cc", "Zl", "Zp") else c for c in value)
+    return " ".join(value.split())
+
+
+def clean_body(text: str) -> str:
+    """Untrusted body text, keeping line breaks but nothing that can hide or reorder text."""
+    text = (text or "").translate(_INVISIBLE)
+    for br in _LINE_BREAKS:
+        text = text.replace(br, "\n")
+    text = text.replace("\t", "    ")
+    return "".join(c for c in text if c == "\n" or unicodedata.category(c) != "Cc")
+
+
 def confirm_summary(acct, info: dict, recipients: list[str]) -> tuple[list[tuple[str, str]], bool, str]:
-    """(rows, has_bcc, body preview) describing a draft for the human who confirms it."""
+    """(rows, has_bcc, body preview) describing a draft for the human who confirms it.
+    Row values are single sanitized lines; the preview keeps line breaks."""
     h = info["headers"]
     try:
         values = snd.recipient_values(info["raw_headers"])
@@ -220,21 +246,53 @@ def confirm_summary(acct, info: dict, recipients: list[str]) -> tuple[list[tuple
             ("Subject", h.get("subject", "")),
             ("Attachments", ", ".join(info["attachments"]) or "none"),
             ("Recipients", f"{len(recipients)}: " + ", ".join(recipients))]
-    body = info["body"]
+    rows = [(k, clean_field(v)) for k, v in rows]
+    body = clean_body(info["body"])
     preview = body[:PREVIEW_CHARS] + ("…" if len(body) > PREVIEW_CHARS else "")
-    return rows, bool(joined["bcc"]), preview
+    return rows, bool(dict(rows)["Bcc"]), preview
+
+
+def recipient_counts(info: dict) -> dict[str, int]:
+    out = {}
+    for k in snd.RECIPIENT_HEADERS:
+        try:
+            out[k] = len(snd.collect_recipients({k: snd.recipient_values(info["raw_headers"])[k]}))
+        except ValueError:
+            out[k] = 0
+    return out
+
+
+BODY_BEGIN = "--- begin message text (written by the sender, not verified) ---"
+BODY_END = "--- end message text ---"
 
 
 def confirm_message(acct, info: dict, recipients: list[str]) -> str:
-    """Plain-text confirmation prompt for MCP elicitation."""
+    """Plain-text confirmation prompt for MCP elicitation. Header values are flattened to
+    one line each, the body excerpt sits between markers with every line prefixed, and
+    the trusted recipient summary is repeated after it, so text inside the email can't
+    pass itself off as part of the summary."""
     rows, has_bcc, preview = confirm_summary(acct, info, recipients)
+    counts = recipient_counts(info)
+    bcc_warning = "WARNING: this email has hidden (Bcc) recipients."
     lines = ["Send this email from your Gmail account? It can't be undone.", ""]
     lines += [f"{k}: {v or '-'}" for k, v in rows]
     if has_bcc:
-        lines += ["", "WARNING: this email has hidden (Bcc) recipients."]
-    lines += ["", f"Message (first {PREVIEW_CHARS} characters):", preview, "",
-              "Check every field. If you didn't ask for this email, decline: nothing is sent."]
+        lines += [bcc_warning]
+    lines += ["", f"Message (first {PREVIEW_CHARS} characters):", BODY_BEGIN]
+    lines += ["│ " + line for line in preview.split("\n")]
+    lines += [BODY_END, "",
+              f"Summary (from the server): sends to {len(recipients)} recipient(s): "
+              f"To {counts['to']}, Cc {counts['cc']}, Bcc {counts['bcc']}."]
+    if has_bcc:
+        lines += [bcc_warning]
+    lines += ["Check every field above. If you didn't ask for this email, decline: nothing is sent."]
     return "\n".join(lines)
+
+
+class SendDecision(BaseModel):
+    """Elicitation answer: only a JSON boolean true sends ("yes", 1 etc. are rejected)."""
+
+    send: StrictBool = Field(title="Send this email?")
 
 
 def commit_confirmed_send(
@@ -318,11 +376,13 @@ def elicitation_unavailable(config: Config) -> str | None:
 async def elicit_send(message: str) -> str:
     """Ask the human through the MCP client. Returns "accept" (only for an explicit
     accept with send=true), "decline" (decline, cancel, or accept with send=false).
-    Raises on any transport/client error or timeout: the caller falls back to the link."""
+    Raises on any transport/client error, malformed answer (missing field, or not a JSON
+    boolean) or timeout: the caller falls back to the link."""
     ctx = get_context()
     with anyio.fail_after(ELICIT_TIMEOUT_SECONDS):
-        result = await ctx.elicit(message, bool, response_title="Send this email?")
-    if isinstance(result, AcceptedElicitation) and result.data is True:
+        result = await ctx.elicit(message, SendDecision)
+    if (isinstance(result, AcceptedElicitation) and isinstance(result.data, SendDecision)
+            and result.data.send is True):
         return "accept"
     return "decline"
 
@@ -557,6 +617,8 @@ def create_app(
 
     def issue_confirm_link(owner: str, p: dict, reason: str) -> dict:
         """The owner-session-bound confirm link (the fallback channel)."""
+        if owner not in config.allowed_users:
+            raise ToolError("this Google account is not allowed to use this server; nothing was sent")
         try:
             a = storage.get_account(owner, p["alias"])
         except (AccountNotFound, ValueError):
