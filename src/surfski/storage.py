@@ -9,6 +9,7 @@ import re
 import secrets
 import sqlite3
 import threading
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -450,11 +451,14 @@ class Storage:
             )
         return cur.rowcount > 0
 
-    def prune_owner_sessions(self, allowed_owners: frozenset[str] | set[str], now: int) -> int:
-        """Drop expired sessions and those of owners no longer allowed."""
+    def prune_owner_sessions(self, is_allowed: Callable[[str], bool] | frozenset[str] | set[str],
+                             now: int) -> int:
+        """Drop expired sessions and those of owners no longer allowed (`is_allowed` is a
+        predicate such as Config.is_allowed, or a set of owners)."""
+        check = is_allowed if callable(is_allowed) else is_allowed.__contains__
         with self._tx() as c:
             rows = c.execute("SELECT DISTINCT owner FROM owner_sessions").fetchall()
-            gone = [r["owner"] for r in rows if r["owner"] not in allowed_owners]
+            gone = [r["owner"] for r in rows if not check(r["owner"])]
             n = c.execute("DELETE FROM owner_sessions WHERE exp < ?", (now,)).rowcount
             for o in gone:
                 n += c.execute("DELETE FROM owner_sessions WHERE owner = ?", (o,)).rowcount

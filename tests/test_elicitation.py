@@ -84,7 +84,7 @@ async def test_accept_sends_after_recheck(app, who, boxes, storage):
         assert part in prompt, part
     _, inside = _outside_body(prompt)
     assert "".join(line[2:] for line in inside) == "x" * 500 + "…"  # hard-wrapped excerpt
-    assert all(len(line) <= 2 + srv.BODY_WRAP for line in inside)
+    assert all(srv.display_width(line) <= srv.BODY_WRAP for line in inside)
     assert storage.sends_today(ALICE, "work", int(time.time())) == 1
     details = audit(storage)
     assert "policy=confirm recipients=3 message=sent-d1 channel=elicitation result=accepted" in details
@@ -372,7 +372,7 @@ async def test_long_token_is_hard_wrapped(app, who, boxes, storage):
     await call_with(app, human, "send_draft", alias="work", draft_id="d1")
     _, inside = _outside_body(human.prompts[0])
     assert len(inside) > 3 and all(line.startswith("│ ") for line in inside)
-    assert all(len(line) <= 2 + srv.BODY_WRAP for line in inside)
+    assert all(srv.display_width(line) <= srv.BODY_WRAP for line in inside)
     assert inside[-2:] == ["│ ", "│ end"]  # the blank line is kept, and prefixed
     assert "".join(line[2:] for line in inside[:-2]).replace(" ", "") == f"see{token}"
 
@@ -407,3 +407,28 @@ async def test_markup_cannot_hide_prompt(app, who, boxes, storage):
     prompt = human.prompts[0]
     assert "<" not in prompt and ">" not in prompt
     assert "Subject: Hi ‹!--" in prompt and "│ hello ‹!--" in prompt and "│ ‹b›x‹/b› --›" in prompt
+
+
+async def test_cjk_wrapped_by_display_width(app, who, boxes, storage):
+    confirm(storage)
+    text = "确认发送这封邮件之前请检查收件人" * 7  # 112 wide characters
+    combining = "e\u0301" * 90  # 90 columns of e + combining acute
+    boxes["alice@work.com"].drafts["d1"] = draft("d1", body=text[:100] + "\n" + combining)
+    human = Human("decline")
+    await call_with(app, human, "send_draft", alias="work", draft_id="d1")
+    _, inside = _outside_body(human.prompts[0])
+    widths = [srv.display_width(line) for line in inside]
+    assert all(w <= srv.BODY_WRAP for w in widths)
+    assert widths[0] == srv.BODY_WRAP  # 37 wide characters + the 2-column prefix
+    cjk = [line for line in inside if "确" in line or "认" in line or "人" in line]
+    assert "".join(line[2:] for line in cjk) == text[:100]
+    acc = [line for line in inside if "e" in line]
+    assert "".join(line[2:] for line in acc) == combining
+    assert all(srv.display_width(line) <= srv.BODY_WRAP for line in acc) and len(acc) == 2
+
+
+def test_wrap_display_units():
+    assert srv.wrap_display("", 10) == [""]
+    assert srv.wrap_display("aa bb cc", 5) == ["aa bb", "cc"]
+    assert srv.wrap_display("abcdefghij", 4) == ["abcd", "efgh", "ij"]
+    assert srv.wrap_display("中文字符", 5) == ["中文", "字符"]

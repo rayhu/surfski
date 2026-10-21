@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -13,7 +14,6 @@ REQUIRED = (
     "BASE_URL",
     "GOOGLE_CLIENT_ID",
     "GOOGLE_CLIENT_SECRET",
-    "ALLOWED_USERS",
     "JWT_SIGNING_KEY",
     "STORAGE_ENCRYPTION_KEY",
     "TOKEN_ENCRYPTION_KEY",
@@ -27,6 +27,16 @@ CLAUDE_REDIRECT_URIS = (
     "https://claude.com/api/mcp/auth_callback",
 )
 LOCAL_REDIRECT_URIS = ("http://localhost:*", "http://127.0.0.1:*")
+
+
+# Public mailbox providers: allowing one of these as a domain would let anyone with a free
+# account in. List such users individually in ALLOWED_USERS instead.
+CONSUMER_DOMAINS = frozenset({
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "msn.com",
+    "yahoo.com", "ymail.com", "icloud.com", "me.com", "mac.com", "aol.com", "proton.me",
+    "protonmail.com", "gmx.com", "gmx.net", "mail.com", "yandex.com", "qq.com", "163.com",
+})
+_DOMAIN_RE = re.compile(r"^(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 
 
 class ConfigError(RuntimeError):
@@ -50,6 +60,8 @@ class Config:
     storage_encryption_key: str
     token_encryption_key: str
     token_encryption_keys: dict[str, str] = field(default_factory=dict)
+    # Whole Google Workspace domains whose (primary) addresses may use the server (#6).
+    allowed_domains: frozenset[str] = frozenset()
     state_secret: bytes = b""
     data_dir: Path = Path("/var/lib/surfski")
     log_level: str = "INFO"
@@ -68,6 +80,15 @@ class Config:
     # delete_my_data: "delete" the caller's audit rows, or keep them "pseudonymize"d.
     audit_on_delete: str = "delete"
     attachment_max_bytes: int = 15 * 1024 * 1024
+
+    def is_allowed(self, email: str | None) -> bool:
+        """The single allowlist check: the caller's primary address is in ALLOWED_USERS,
+        or its domain exactly matches ALLOWED_DOMAINS (subdomains don't match)."""
+        email = (email or "").strip().lower()
+        local, sep, domain = email.rpartition("@")
+        if not sep or not local or not domain:
+            return False
+        return email in self.allowed_users or domain in self.allowed_domains
 
     @property
     def send_auth_redirect_uri(self) -> str:
@@ -90,6 +111,25 @@ class Config:
         return self.data_dir / "oauth"
 
 
+def parse_allowed_domains(raw: str) -> frozenset[str]:
+    out = set()
+    for d in raw.split(","):
+        d = d.strip().lower()
+        if not d:
+            continue
+        if "@" in d or "*" in d:
+            raise ConfigError(f"ALLOWED_DOMAINS entry {d!r}: list bare domains like example.com "
+                              "(no @, no wildcards; subdomains are not matched)")
+        if not _DOMAIN_RE.match(d):
+            raise ConfigError(f"ALLOWED_DOMAINS entry {d!r} is not a valid domain")
+        if d in CONSUMER_DOMAINS:
+            raise ConfigError(f"ALLOWED_DOMAINS can't include the public mail provider {d}: that "
+                              "would let anyone with a free account in. Put those users' "
+                              "addresses in ALLOWED_USERS instead.")
+        out.add(d)
+    return frozenset(out)
+
+
 def load_config(env: dict[str, str] | None = None) -> Config:
     env = dict(os.environ if env is None else env)
     missing = [k for k in REQUIRED if not env.get(k, "").strip()]
@@ -105,10 +145,11 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         raise ConfigError("BASE_URL must use https unless it is localhost")
 
     allowed = frozenset(
-        e.strip().lower() for e in env["ALLOWED_USERS"].split(",") if e.strip()
+        e.strip().lower() for e in env.get("ALLOWED_USERS", "").split(",") if e.strip()
     )
-    if not allowed:
-        raise ConfigError("ALLOWED_USERS is empty")
+    allowed_domains = parse_allowed_domains(env.get("ALLOWED_DOMAINS", ""))
+    if not allowed and not allowed_domains:
+        raise ConfigError("ALLOWED_USERS and ALLOWED_DOMAINS are both empty: set at least one")
 
     if len(env["JWT_SIGNING_KEY"]) < 32:
         raise ConfigError("JWT_SIGNING_KEY must be at least 32 characters")
@@ -168,6 +209,7 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         google_client_id=env["GOOGLE_CLIENT_ID"].strip(),
         google_client_secret=env["GOOGLE_CLIENT_SECRET"].strip(),
         allowed_users=allowed,
+        allowed_domains=allowed_domains,
         jwt_signing_key=env["JWT_SIGNING_KEY"],
         storage_encryption_key=env["STORAGE_ENCRYPTION_KEY"],
         token_encryption_key=env["TOKEN_ENCRYPTION_KEY"],

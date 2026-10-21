@@ -8,7 +8,6 @@ import html
 import logging
 import secrets
 import threading
-import textwrap
 import time
 import unicodedata
 from collections.abc import Callable
@@ -212,7 +211,9 @@ def daily_cap_error(config: Config, alias: str) -> g.GmailError:
 _LINE_BREAKS = ("\r\n", "\r", "\x85", "\u2028", "\u2029", "\x0b", "\x0c")
 # Elicitation prompt layout: body lines are hard-wrapped so a client's soft wrap can't
 # start a visual line without the fence prefix; free-text header values are capped.
+# BODY_WRAP is the display width (columns) of a whole fenced line, prefix included.
 BODY_WRAP = 76
+BODY_PREFIX = "│ "
 FIELD_MAX = 200
 
 
@@ -238,6 +239,44 @@ def clean_body(text: str) -> str:
         text = text.replace(br, "\n")
     text = "".join(c if c == "\n" or unicodedata.category(c) != "Cc" else " " for c in text)
     return "\n".join(" ".join(line.split()) for line in text.split("\n"))
+
+
+def char_width(c: str) -> int:
+    """Terminal-style display width: 0 for combining marks, 2 for East Asian wide/fullwidth."""
+    if unicodedata.combining(c):
+        return 0
+    return 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+
+
+def display_width(text: str) -> int:
+    return sum(char_width(c) for c in text)
+
+
+def wrap_display(line: str, width: int) -> list[str]:
+    """Greedy word wrap by display width; words wider than `width` are broken."""
+    out: list[str] = []
+    cur, cur_w = "", 0
+    for word in line.split(" "):
+        word_w = display_width(word)
+        gap = 1 if cur else 0
+        if cur_w + gap + word_w <= width:
+            cur, cur_w = (cur + " " + word if cur else word), cur_w + gap + word_w
+            continue
+        if cur:
+            out.append(cur)
+        while word_w > width:
+            piece, piece_w = "", 0
+            for c in word:
+                if piece_w + char_width(c) > width:
+                    break
+                piece, piece_w = piece + c, piece_w + char_width(c)
+            out.append(piece)
+            word = word[len(piece):]
+            word_w = display_width(word)
+        cur, cur_w = word, word_w
+    if cur or not out:
+        out.append(cur)
+    return out
 
 
 def _no_markup(value: str) -> str:
@@ -300,8 +339,8 @@ def confirm_message(acct, info: dict, recipients: list[str]) -> str:
         lines += [bcc_warning]
     lines += ["", f"Message (first {PREVIEW_CHARS} characters):", BODY_BEGIN]
     for line in _no_markup(preview).split("\n"):
-        pieces = textwrap.wrap(line, BODY_WRAP, break_long_words=True, break_on_hyphens=False)
-        lines += ["│ " + piece for piece in pieces or [""]]
+        budget = BODY_WRAP - display_width(BODY_PREFIX)
+        lines += [BODY_PREFIX + piece for piece in wrap_display(line, budget)]
     lines += [BODY_END, "",
               f"Summary (from the server): sends to {len(recipients)} recipient(s): "
               f"To {counts['to']}, Cc {counts['cc']}, Bcc {counts['bcc']}."]
@@ -337,7 +376,7 @@ def commit_confirmed_send(
     runs after the cap reservation and right before sending (the link path burns its
     token there); if it raises, the reservation is released.
     Returns (sent, recipient_count, policy)."""
-    if owner not in config.allowed_users:
+    if not config.is_allowed(owner):
         raise g.GmailError("this Google account is no longer allowed to use this server; nothing was sent")
     try:
         acct = storage.get_account(owner, alias)
@@ -495,8 +534,8 @@ def create_app(
     # handy for tests/ops
     mcp.surfski = {"storage": storage, "config": config, "token_cache": token_cache,
                    "send_as_cache": send_as_cache}
-    # Sessions of owners removed from ALLOWED_USERS (or expired) are useless; drop them.
-    storage.prune_owner_sessions(config.allowed_users, int(time.time()))
+    # Sessions of owners no longer allowed (or expired) are useless; drop them.
+    storage.prune_owner_sessions(config.is_allowed, int(time.time()))
 
     # -- identity
 
@@ -509,7 +548,10 @@ def create_app(
             raise ToolError("not authenticated: no email in token")
         if verified is not None and not _is_true(verified):
             raise ToolError("your Google email is not verified")
-        if email not in config.allowed_users:
+        if email not in config.allowed_users and not _is_true(verified):
+            # Domain-wide access needs Google to vouch for the address explicitly.
+            raise ToolError("your Google email is not verified")
+        if not config.is_allowed(email):
             log.warning("rejected non-allowlisted caller tool=%s", tool)
             raise ToolError("this Google account is not allowed to use this server")
         if not limiter.allow(email):
@@ -639,7 +681,7 @@ def create_app(
 
     def issue_confirm_link(owner: str, p: dict, reason: str) -> dict:
         """The owner-session-bound confirm link (the fallback channel)."""
-        if owner not in config.allowed_users:
+        if not config.is_allowed(owner):
             raise ToolError("this Google account is not allowed to use this server; nothing was sent")
         try:
             a = storage.get_account(owner, p["alias"])
@@ -1404,7 +1446,7 @@ def create_app(
         try:
             payload, verifier = consume_state(storage, config.state_secret, state)
             owner, alias = payload["owner"], payload["alias"]
-            if owner not in config.allowed_users:
+            if not config.is_allowed(owner):
                 raise LinkError("this account is not allowed to use this server")
             async with http_factory() as http:
                 tokens = await exchange_code(
@@ -1450,7 +1492,7 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
     def load_action(token: str | None, purpose: str):
         payload = snd.verify_action(config.state_secret, token or "", purpose)
         owner, alias = payload["o"], payload["a"]
-        if owner not in config.allowed_users:
+        if not config.is_allowed(owner):
             raise snd.ActionError("this Google account is no longer allowed to use this server")
         try:
             acct = storage.get_account(owner, alias)
@@ -1465,7 +1507,7 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
 
     def session_for(request: Request, owner: str, max_age: int | None = None) -> bool:
         s = storage.get_owner_session(request.cookies.get(snd.SESSION_COOKIE), int(time.time()))
-        if not s or s[0] != owner or owner not in config.allowed_users:
+        if not s or s[0] != owner or not config.is_allowed(owner):
             return False
         return max_age is None or time.time() - s[1] <= max_age
 
@@ -1544,7 +1586,7 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
             if email != owner:
                 write_audit(storage, owner, "send_auth", alias, "reauth email mismatch", False)
                 raise snd.ActionError(f"you signed in as {email}, but this needs {owner}. Nothing changed.")
-            if owner not in config.allowed_users:
+            if not config.is_allowed(owner):
                 raise snd.ActionError("this Google account is not allowed to use this server")
         except Exception as err:  # noqa: BLE001
             return error_page("Not signed in", err)
