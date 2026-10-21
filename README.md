@@ -16,10 +16,18 @@ Workspace mailboxes** for each user, and users never see each other's mailboxes.
   send) or `auto`.
 
 Tools: `list_accounts`, `link_account`, `relink_account`, `rename_account`, `unlink_account`, `search_threads`,
-`search_all_accounts`, `get_thread`, `get_message`, `list_labels`, `create_draft`, `list_drafts`, `get_draft`,
+`search_all_accounts`, `find_contact`, `get_thread`, `get_message`, `list_labels`, `create_draft`, `list_drafts`, `get_draft`,
 `update_draft`, `delete_draft`, `list_addresses`, `set_address_label`, `set_default_from`, `forward_message`,
 `get_attachment`, `export_my_data`, `delete_my_data`.
 With `SENDING_ENABLED=true` also: `send_draft`, `send_email`, `set_send_policy` (and `forward_message(send=true)`).
+
+**Find an address.** `find_contact("Alice")` (or part of an address, or a name in any script, e.g.
+`王伟`) looks through the From/To/Cc/Reply-To headers of your own recent mail in all your mailboxes (or
+the `aliases` you pass) and returns likely addresses with their display names, message count, last
+seen date, mailboxes and whether you've written to them, ranked by frequency, recency and that
+"sent to" boost. It needs no extra Google scope. Each mailbox scans at most 50 threads / 200
+messages. Your own addresses and no-reply senders are left out unless you pass `include_self` /
+`include_noreply`. The audit log records only counts, never the name or addresses.
 
 **Send from an alias.** `create_draft` and `update_draft` take `from_address` (a verified "Send mail as"
 address or a label set with `set_address_label`) and `include_signature`. Replies default to the address
@@ -106,6 +114,10 @@ if both allowlists are empty.
 > domains, put the primary addresses in `ALLOWED_USERS`, or the Workspace primary domain in
 > `ALLOWED_DOMAINS` (an alias domain never matches; Google's `hd` claim must equal the primary domain). Linking an alias address links the
 > primary mailbox behind it.
+>
+> **Secondary domains:** if a user's address is on a *secondary* domain of a Workspace org, Google's
+> `hd` claim may still be the org's **primary** domain, so list the primary domain in
+> `ALLOWED_DOMAINS` (or list the user in `ALLOWED_USERS`). A mismatch fails closed: the user is refused.
 
 ### 3. Run
 
