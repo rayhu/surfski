@@ -672,3 +672,32 @@ async def test_refused_send_reports_kept_draft(config, storage, boxes, google, a
     with pytest.raises(ToolError, match="draft new2 was kept"):
         await call(app, "forward_message", alias="work", message_id="m1", to="evil@z.com", send=True)
     assert "new2" in box.drafts and box.sent == []
+
+
+async def test_logout_ends_session(app, who, boxes, storage, google):
+    storage.set_send_policy(ALICE, "work", "confirm")
+    r = await call(app, "send_draft", alias="work", draft_id="d1")
+    token = token_of(r["confirm_url"])
+    client = web(app)
+    sign_in(client, google, token)
+    page = client.get(f"/send/confirm?token={token}")
+    assert page.status_code == 200 and "/send/logout" in page.text
+    assert storage._conn.execute("SELECT COUNT(*) FROM owner_sessions").fetchone()[0] == 1
+    resp = client.post("/send/logout")
+    assert resp.status_code == 200 and "Signed out" in resp.text
+    cookie = resp.headers["set-cookie"].lower()
+    assert "surfski_owner=" in cookie and "max-age=0" in cookie and "path=/send" in cookie
+    assert storage._conn.execute("SELECT COUNT(*) FROM owner_sessions").fetchone()[0] == 0
+    assert client.get(f"/send/confirm?token={token}").status_code == 401
+    assert client.post("/send/confirm", data={"token": token}).status_code == 400
+    assert total_sent(boxes) == 0
+    assert client.post("/send/logout").status_code == 200  # idempotent
+
+
+async def test_raise_page_hides_details_before_sign_in(app, who, storage):
+    r = await call(app, "set_send_policy", alias="work", policy="auto")
+    page = web(app).get(f"/send/policy?token={token_of(r['approve_url'])}")
+    assert page.status_code == 401
+    body = page.text.split("<body>", 1)[1].split("name='token'")[0]  # visible text, minus the token
+    for secret in ("alice@work.com", "work", "auto", "off", ALICE):
+        assert secret not in body, secret

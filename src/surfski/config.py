@@ -62,6 +62,8 @@ class Config:
     send_daily_cap: int = 20
     send_max_recipients: int = 10
     allowed_recipient_domains: frozenset[str] = frozenset()
+    # delete_my_data: "delete" the caller's audit rows, or keep them "pseudonymize"d.
+    audit_on_delete: str = "delete"
 
     @property
     def send_auth_redirect_uri(self) -> str:
@@ -143,6 +145,10 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         d.strip().lower().lstrip("@") for d in env.get("ALLOWED_RECIPIENT_DOMAINS", "").split(",") if d.strip()
     )
 
+    audit_on_delete = env.get("AUDIT_ON_DELETE", "delete").strip().lower() or "delete"
+    if audit_on_delete not in ("delete", "pseudonymize"):
+        raise ConfigError("AUDIT_ON_DELETE must be delete or pseudonymize")
+
     return Config(
         base_url=base_url,
         google_client_id=env["GOOGLE_CLIENT_ID"].strip(),
@@ -163,4 +169,5 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         send_daily_cap=daily_cap,
         send_max_recipients=max_recipients,
         allowed_recipient_domains=domains,
+        audit_on_delete=audit_on_delete,
     )

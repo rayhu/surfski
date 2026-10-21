@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import html
 import logging
 import secrets
@@ -93,6 +95,11 @@ class SendAsCache:
     def drop(self, owner: str, alias: str) -> None:
         with self._lock:
             self._data.pop((owner, alias), None)
+
+    def drop_owner(self, owner: str) -> None:
+        with self._lock:
+            for key in [k for k in self._data if k[0] == owner]:
+                del self._data[key]
 
 
 class RateLimiter:
@@ -252,7 +259,11 @@ def create_app(
         ),
         auth=build_auth(config) if with_auth else None,
     )
-    mcp.surfski = {"storage": storage, "config": config}  # handy for tests/ops
+    # handy for tests/ops
+    mcp.surfski = {"storage": storage, "config": config, "token_cache": token_cache,
+                   "send_as_cache": send_as_cache}
+    # Sessions of owners removed from ALLOWED_USERS (or expired) are useless; drop them.
+    storage.prune_owner_sessions(config.allowed_users, int(time.time()))
 
     # -- identity
 
@@ -295,10 +306,13 @@ def create_app(
                 err = g.map_google_error(e, acct.alias)
             if "relink" in str(err):
                 token_cache.drop(owner, acct.alias)
-            write_audit(storage, owner, tool, acct.alias, f"{detail} err={type(e).__name__}", False)
+            if storage.account_exists(owner, acct.alias):
+                write_audit(storage, owner, tool, acct.alias, f"{detail} err={type(e).__name__}", False)
             raise ToolError(str(err)) from None
-        storage.touch_account(owner, acct.alias)
-        write_audit(storage, owner, tool, acct.alias, detail, True)
+        # If the account vanished mid-call (delete_my_data / unlink), don't re-create an
+        # audit trail for it.
+        if storage.touch_account(owner, acct.alias):
+            write_audit(storage, owner, tool, acct.alias, detail, True)
         return result
 
     def identities(owner: str, alias: str, svc, refresh: bool = False) -> list[dict]:
@@ -583,6 +597,67 @@ def create_app(
         send_as_cache.drop(owner, acct.alias)
         write_audit(storage, owner, "unlink_account", acct.alias, f"revoked={revoked}", True)
         return {"ok": True, "revoked_at_google": revoked}
+
+    @mcp.tool(annotations={"destructiveHint": True})
+    async def delete_my_data(
+        confirm: Annotated[str, Field(description='Must be exactly "DELETE"')],
+    ) -> dict:
+        """Delete ALL of your data on this server: unlink every mailbox (revoking each
+        token at Google, best effort) and erase your accounts, labels, defaults, send
+        settings, pending links, send history, browser sessions and audit rows. This
+        cannot be undone. Only call it when the user explicitly asked for it in this
+        conversation, and pass confirm="DELETE"."""
+        owner = require_owner("delete_my_data")
+        if confirm != "DELETE":
+            raise ToolError('nothing deleted: pass confirm="DELETE" to erase all your data')
+        pseudonym = None
+        if config.audit_on_delete == "pseudonymize":
+            digest = hmac.new(config.state_secret, b"audit-pseudonym:" + owner.encode(), hashlib.sha256)
+            pseudonym = "deleted-" + digest.hexdigest()[:16]
+        # Purge first (one transaction), then revoke with the tokens held in memory: the
+        # data is gone even if Google is slow or down.
+        counts, tokens = storage.purge_owner(owner, pseudonym)
+        token_cache.drop_owner(owner)
+        send_as_cache.drop_owner(owner)
+        revoked: dict[str, Any] = {}
+        done: dict[str, bool] = {}
+        async with http_factory() as http:
+            for alias, rt in tokens:
+                if rt is None:
+                    revoked[alias] = "not revoked: token could not be decrypted"
+                    continue
+                if rt not in done:
+                    done[rt] = await revoke_token(http, rt)
+                revoked[alias] = done[rt]
+        if pseudonym:
+            write_audit(storage, pseudonym, "delete_my_data", None,
+                        f"accounts={counts['accounts']} revoked={sum(1 for v in revoked.values() if v is True)}",
+                        True)
+        log.info("delete_my_data: purged %d accounts", counts["accounts"])
+        return {
+            "ok": True,
+            "deleted": counts,
+            "revoked_at_google": revoked,
+            "audit_log": "pseudonymized" if pseudonym else "deleted",
+            "note": ("Any mailbox where revocation failed can be disconnected at "
+                     "https://myaccount.google.com/permissions."
+                     if any(v is not True for v in revoked.values()) else ""),
+        }
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    async def export_my_data() -> dict:
+        """Export what this server stores about you (no tokens): your linked mailboxes
+        with aliases, addresses, labels, default From, send policy and timestamps."""
+        owner = require_owner("export_my_data")
+        write_audit(storage, owner, "export_my_data", None, "", True)
+        return {
+            "owner": owner,
+            "accounts": [
+                a.public() | {"address_labels": storage.get_address_labels(owner, a.alias)}
+                for a in storage.list_accounts(owner)
+            ],
+            "audit_rows": len(storage.audit_rows(owner)),
+        }
 
     # -- mail tools
 
@@ -1032,7 +1107,7 @@ def create_app(
         except Exception:
             log.exception("gmail link failed unexpectedly")
             return _page("Linking failed", "Unexpected error; ask Claude to start linking again.", 500)
-        write_audit(storage, owner, "gmail_callback", alias, f"linked {email}", True)
+        write_audit(storage, owner, "gmail_callback", alias, "linked", True)
         return _page("Linked ✓", f"Linked {email} as '{alias}'. You can close this tab.")
 
     if config.sending_enabled:
@@ -1073,7 +1148,7 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
 
     def signin_page(title: str, token: str, owner: str, why: str) -> HTMLResponse:
         inner = (
-            f"<p>{e(why)}</p><p>Sign in with Google as <b>{e(owner)}</b> to continue.</p>"
+            f"<p>{e(why)}</p><p>Sign in with Google as the mailbox owner to continue.</p>"
             + _post_form(f"{config.base_url}/send/auth/start", token, "Sign in with Google")
             + "<p>If you didn't ask for this, close this tab: nothing happens.</p>"
         )
@@ -1174,6 +1249,22 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
         )
         return resp
 
+    @mcp.custom_route("/send/logout", methods=["POST"], include_in_schema=False)
+    async def auth_logout(request: Request):
+        raw = request.cookies.get(snd.SESSION_COOKIE)
+        s = storage.get_owner_session(raw, int(time.time()))
+        storage.delete_owner_session(raw)
+        if s:
+            write_audit(storage, s[0], "send_auth", None, "session ended", True)
+        resp = _page("Signed out", "You're signed out of this server's sending pages.")
+        resp.delete_cookie(snd.SESSION_COOKIE, path="/send", httponly=True, samesite="strict",
+                           secure=not config.is_local)
+        return resp
+
+    def logout_form() -> str:
+        return ("<form method='post' action='/send/logout'>"
+                "<button type='submit'>Sign out</button></form>")
+
     # -- confirm a send
 
     @mcp.custom_route("/send/confirm", methods=["GET"], include_in_schema=False)
@@ -1205,7 +1296,8 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
         inner = (summary_html(acct, info, recipients)
                  + "<p>Check every field. Pressing Send sends this email from your Gmail "
                  "account; it can't be undone.</p>" + _post_form("/send/confirm", token, "Send")
-                 + "<p>If you didn't ask for this email, just close this tab: nothing is sent.</p>")
+                 + "<p>If you didn't ask for this email, just close this tab: nothing is sent.</p>"
+                 + logout_form())
         return _html_page("Send this email?", inner)
 
     @mcp.custom_route("/send/confirm", methods=["POST"], include_in_schema=False)
@@ -1267,17 +1359,19 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
             payload, acct, data = load_action(token, snd.PURPOSE_RAISE)
         except Exception as err:  # noqa: BLE001
             return error_page("Can't change the send policy", err)
+        if not session_for(request, acct.owner, snd.RAISE_SESSION_MAX_AGE):
+            # Nothing about the mailbox or the request until the owner has signed in.
+            return signin_page("Approve a change?", token, acct.owner,
+                               "A change to a mailbox's sending settings is waiting for your "
+                               "approval. This needs a fresh Google sign-in.")
         what = (f"Claude asked to change the send policy of mailbox {acct.alias} ({acct.email}) "
                 f"from {acct.send_policy} to {data['policy']}.")
-        if not session_for(request, acct.owner, snd.RAISE_SESSION_MAX_AGE):
-            return signin_page("Approve sending?", token, acct.owner,
-                               what + " This needs a fresh Google sign-in.")
         inner = (
             f"<p>{e(what)}</p>"
             "<p><b>confirm</b>: Claude can prepare emails, but each one is sent only after you open "
             "a link, sign in and press Send. <b>auto</b>: Claude sends directly (within the "
             "server's caps).</p>" + _post_form("/send/policy", token, "Apply")
-            + "<p>If you didn't ask for this, close this tab: nothing changes.</p>"
+            + "<p>If you didn't ask for this, close this tab: nothing changes.</p>" + logout_form()
         )
         return _html_page("Approve sending?", inner)
 
