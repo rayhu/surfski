@@ -98,6 +98,10 @@ class Config:
     triage_daily_cap: int = 1000
     # Prometheus /metrics (#10). Off by default; when on, a Bearer METRICS_TOKEN is required.
     metrics_enabled: bool = False
+    # Attachment extraction sandbox (#30).
+    extract_sandbox: str = "subprocess"
+    extract_timeout_s: float = 20.0
+    extract_memory_mb: int = 512
     metrics_token: str = ""
 
     def is_allowed(self, email: str | None, *, email_verified: Any, hd: str | None) -> bool:
@@ -171,6 +175,22 @@ def _per_owner_keys(env: dict[str, str], name: str) -> dict[str, str]:
         _validate_fernet_key(f"{name}[{owner}]", key.strip())
         out[owner] = key.strip()
     return out
+
+
+# Settings that are secrets. After load_config, `scrub_secret_env` removes them from
+# os.environ so nothing later (a library, a subprocess spawned without an explicit env)
+# can pick them up. It does not change /proc/<pid>/environ, which keeps the environment
+# the process started with; PR_SET_DUMPABLE (sandbox.harden_process) protects that.
+SECRET_ENV = ("GOOGLE_CLIENT_SECRET", "JWT_SIGNING_KEY", "STORAGE_ENCRYPTION_KEY",
+              "STORAGE_ENCRYPTION_KEY_OLD", "TOKEN_ENCRYPTION_KEY", "TOKEN_ENCRYPTION_KEY_OLD",
+              "TOKEN_ENCRYPTION_KEYS", "TOKEN_ENCRYPTION_KEYS_OLD", "STATE_SECRET", "METRICS_TOKEN")
+
+
+def scrub_secret_env() -> list[str]:
+    removed = [k for k in SECRET_ENV if k in os.environ]
+    for k in removed:
+        del os.environ[k]
+    return removed
 
 
 def load_config(env: dict[str, str] | None = None) -> Config:
@@ -271,6 +291,19 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         raise ConfigError("METRICS_ENABLED=true needs METRICS_TOKEN (at least 32 characters): "
                           "/metrics is served on the public port and must be protected")
 
+    extract_sandbox = env.get("EXTRACT_SANDBOX", "subprocess").strip().lower() or "subprocess"
+    if extract_sandbox not in ("subprocess", "inprocess"):
+        raise ConfigError("EXTRACT_SANDBOX must be subprocess or inprocess")
+    try:
+        extract_timeout = float(env.get("EXTRACT_TIMEOUT_S", "20"))
+        extract_memory = int(env.get("EXTRACT_MEMORY_MB", "512"))
+    except ValueError as e:
+        raise ConfigError("EXTRACT_TIMEOUT_S and EXTRACT_MEMORY_MB must be numbers") from e
+    if not 1 <= extract_timeout <= 120:
+        raise ConfigError("EXTRACT_TIMEOUT_S must be between 1 and 120")
+    if not 128 <= extract_memory <= 8192:
+        raise ConfigError("EXTRACT_MEMORY_MB must be between 128 and 8192")
+
     return Config(
         base_url=base_url,
         google_client_id=env["GOOGLE_CLIENT_ID"].strip(),
@@ -303,4 +336,7 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         triage_daily_cap=triage_cap,
         metrics_enabled=metrics_on,
         metrics_token=metrics_token,
+        extract_sandbox=extract_sandbox,
+        extract_timeout_s=extract_timeout,
+        extract_memory_mb=extract_memory,
     )

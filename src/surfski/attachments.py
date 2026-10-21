@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from defusedxml import ElementTree as SafeET
 from defusedxml.common import DefusedXmlException
 
-from .gmail import html_to_text
+from .htmltext import html_to_text
 
 # Zip (DOCX/XLSX/PPTX) limits.
 ZIP_MAX_ENTRIES = 2000
@@ -48,6 +48,9 @@ OOXML = {
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 S = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+
+
+METHODS = frozenset({"text", "html", "pdf", "docx", "xlsx", "pptx", "none"})
 
 
 class ExtractError(Exception):
