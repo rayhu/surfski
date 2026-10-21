@@ -27,6 +27,8 @@ ZIP_MAX_TOTAL_BYTES = 60 * 1024 * 1024
 ZIP_MAX_RATIO = 150  # uncompressed / compressed, for members over 1 MB
 # XML parts are stream-parsed; this caps elements seen per document.
 XML_MAX_ELEMENTS = 500_000
+XML_MAX_DEPTH = 256
+XML_MAX_ATTRIBUTES = 1000
 # PDF limits.
 PDF_MAX_PAGES = 200
 PDF_MAX_STREAM_BYTES = 20 * 1024 * 1024  # pypdf decompression limits (default 75 MB)
@@ -191,6 +193,10 @@ class _XmlStream:
             for event, el in SafeET.iterparse(io.BytesIO(data), events=("start", "end"),
                                               forbid_dtd=True, forbid_entities=True, forbid_external=True):
                 if event == "start":
+                    if len(stack) >= XML_MAX_DEPTH:
+                        raise ExtractError(f"the document nests deeper than {XML_MAX_DEPTH} levels; refusing to read it")
+                    if len(el.attrib) > XML_MAX_ATTRIBUTES:
+                        raise ExtractError("the document has an element with too many attributes; refusing to read it")
                     self.elements += 1
                     if self.elements > XML_MAX_ELEMENTS:
                         self.capped = True
