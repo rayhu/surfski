@@ -312,3 +312,14 @@ def test_strict_fake_rejects_unknown_kwargs():
         svc.users().nope()
     # threads.get does accept metadataHeaders
     svc.users().threads().get(userId="me", id="t1", format="metadata", metadataHeaders=["Subject"]).execute()
+
+
+async def test_update_draft_refuses_unreadable_body(app, who, store):
+    d = store["alice@work.com"]["d1"]
+    d["message"]["payload"]["body"] = {"size": 900000, "attachmentId": "big-body"}
+    with pytest.raises(ToolError, match="too large to read back; pass 'body'"):
+        await call(app, "update_draft", alias="work", draft_id="d1", subject="new")
+    assert "_last_update" not in d
+    r = await call(app, "update_draft", alias="work", draft_id="d1", body="replacement")
+    assert r["draft_id"] == "d1"
+    assert decode_raw(d["_last_update"]["message"]["raw"]).get_content().strip() == "replacement"

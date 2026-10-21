@@ -15,6 +15,7 @@ from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 
 ALIAS_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+LABEL_RE = ALIAS_RE
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
@@ -38,7 +39,20 @@ CREATE TABLE IF NOT EXISTS pending_links (
 CREATE TABLE IF NOT EXISTS audit_log (
   ts TEXT, owner TEXT, tool TEXT, alias TEXT, detail TEXT, ok INTEGER
 );
+CREATE TABLE IF NOT EXISTS address_labels (
+  owner TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  address TEXT NOT NULL,
+  label TEXT NOT NULL,
+  PRIMARY KEY (owner, alias, address),
+  UNIQUE (owner, alias, label)
+);
 """
+
+# Columns added after the first release; applied with a guarded ALTER TABLE.
+MIGRATIONS = [("accounts", "default_from", "TEXT")]
+
+ACCOUNT_COLS = "owner, alias, email, scopes, created_at, last_used_at, default_from"
 
 
 class StorageError(Exception):
@@ -56,6 +70,13 @@ def validate_alias(alias: str) -> str:
     return alias
 
 
+def validate_label(label: str) -> str:
+    label = (label or "").strip().lower()
+    if not LABEL_RE.match(label):
+        raise ValueError("label must match [a-z0-9_-]{1,32}")
+    return label
+
+
 def now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
@@ -68,6 +89,7 @@ class Account:
     scopes: str
     created_at: str
     last_used_at: str | None
+    default_from: str | None = None
 
     def public(self) -> dict:
         return {
@@ -75,6 +97,7 @@ class Account:
             "email": self.email,
             "created_at": self.created_at,
             "last_used_at": self.last_used_at,
+            "default_from": self.default_from,
         }
 
 
@@ -115,6 +138,10 @@ class Storage:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(SCHEMA)
+            for table, col, decl in MIGRATIONS:
+                cols = {r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+                if col not in cols:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
             self._conn.commit()
 
     @contextmanager
@@ -138,7 +165,18 @@ class Storage:
         owner = owner.lower()
         alias = validate_alias(alias)
         enc = self.cipher.encrypt(owner, refresh_token)
+        email = email.lower()
         with self._tx() as c:
+            prev = c.execute(
+                "SELECT email FROM accounts WHERE owner = ? AND alias = ?", (owner, alias)
+            ).fetchone()
+            if prev and prev["email"] != email:
+                # A different mailbox under the same alias: its labels/default don't apply.
+                c.execute("DELETE FROM address_labels WHERE owner = ? AND alias = ?", (owner, alias))
+                c.execute(
+                    "UPDATE accounts SET default_from = NULL WHERE owner = ? AND alias = ?",
+                    (owner, alias),
+                )
             c.execute(
                 """INSERT INTO accounts (owner, alias, email, refresh_token_enc, scopes, created_at)
                    VALUES (?, ?, ?, ?, ?, ?)
@@ -148,14 +186,13 @@ class Storage:
                      scopes=excluded.scopes,
                      created_at=excluded.created_at,
                      last_used_at=NULL""",
-                (owner, alias, email.lower(), enc, scopes, now_iso()),
+                (owner, alias, email, enc, scopes, now_iso()),
             )
 
     def list_accounts(self, owner: str) -> list[Account]:
         with self._tx() as c:
             rows = c.execute(
-                "SELECT owner, alias, email, scopes, created_at, last_used_at "
-                "FROM accounts WHERE owner = ? ORDER BY alias",
+                f"SELECT {ACCOUNT_COLS} FROM accounts WHERE owner = ? ORDER BY alias",
                 (owner.lower(),),
             ).fetchall()
         return [Account(**dict(r)) for r in rows]
@@ -164,8 +201,7 @@ class Storage:
         alias = validate_alias(alias)
         with self._tx() as c:
             row = c.execute(
-                "SELECT owner, alias, email, scopes, created_at, last_used_at "
-                "FROM accounts WHERE owner = ? AND alias = ?",
+                f"SELECT {ACCOUNT_COLS} FROM accounts WHERE owner = ? AND alias = ?",
                 (owner.lower(), alias),
             ).fetchone()
         if not row:
@@ -202,6 +238,9 @@ class Storage:
                 "DELETE FROM accounts WHERE owner = ? AND alias = ?",
                 (owner.lower(), alias),
             )
+            c.execute(
+                "DELETE FROM address_labels WHERE owner = ? AND alias = ?", (owner.lower(), alias)
+            )
         return cur.rowcount > 0
 
     def rename_account(self, owner: str, old_alias: str, new_alias: str) -> None:
@@ -224,6 +263,61 @@ class Storage:
                 "UPDATE accounts SET alias = ? WHERE owner = ? AND alias = ?",
                 (new_alias, owner, old_alias),
             )
+            c.execute(
+                "UPDATE address_labels SET alias = ? WHERE owner = ? AND alias = ?",
+                (new_alias, owner, old_alias),
+            )
+
+    # ---- send-from settings (always owner-scoped) ----
+
+    def _require_account(self, c, owner: str, alias: str) -> None:
+        if not c.execute(
+            "SELECT 1 FROM accounts WHERE owner = ? AND alias = ?", (owner, alias)
+        ).fetchone():
+            raise AccountNotFound(
+                f"no linked account '{alias}'. Call list_accounts to see your accounts."
+            )
+
+    def set_default_from(self, owner: str, alias: str, address: str | None) -> None:
+        owner, alias = owner.lower(), validate_alias(alias)
+        with self._tx() as c:
+            self._require_account(c, owner, alias)
+            c.execute(
+                "UPDATE accounts SET default_from = ? WHERE owner = ? AND alias = ?",
+                ((address or "").lower() or None, owner, alias),
+            )
+
+    def get_address_labels(self, owner: str, alias: str) -> dict[str, str]:
+        """{label: address} for one mailbox of this owner."""
+        with self._tx() as c:
+            rows = c.execute(
+                "SELECT label, address FROM address_labels WHERE owner = ? AND alias = ? ORDER BY label",
+                (owner.lower(), validate_alias(alias)),
+            ).fetchall()
+        return {r["label"]: r["address"] for r in rows}
+
+    def set_address_label(self, owner: str, alias: str, address: str, label: str) -> None:
+        """Set (or, with an empty label, remove) the label of one address."""
+        owner, alias, address = owner.lower(), validate_alias(alias), address.strip().lower()
+        label = validate_label(label) if (label or "").strip() else ""
+        with self._tx() as c:
+            self._require_account(c, owner, alias)
+            if label:
+                taken = c.execute(
+                    "SELECT address FROM address_labels WHERE owner = ? AND alias = ? AND label = ?",
+                    (owner, alias, label),
+                ).fetchone()
+                if taken and taken["address"] != address:
+                    raise StorageError(f"label '{label}' is already used for {taken['address']}")
+            c.execute(
+                "DELETE FROM address_labels WHERE owner = ? AND alias = ? AND address = ?",
+                (owner, alias, address),
+            )
+            if label:
+                c.execute(
+                    "INSERT INTO address_labels (owner, alias, address, label) VALUES (?, ?, ?, ?)",
+                    (owner, alias, address, label),
+                )
 
     # ---- pending links ----
 

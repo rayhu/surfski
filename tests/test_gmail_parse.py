@@ -6,6 +6,8 @@ import pytest
 
 from surfski import gmail as g
 
+from .fakes import StrictGmail
+
 
 def b64(s: str, enc="utf-8") -> str:
     return base64.urlsafe_b64encode(s.encode(enc)).decode().rstrip("=")
@@ -89,32 +91,24 @@ def test_reply_headers():
     assert rh == {"thread_id": "t9", "in_reply_to": "<b@x>", "references": "<a@x> <b@x>", "subject": "Re: Plans"}
 
 
-def test_create_draft_reply_uses_thread(monkeypatch):
+def test_create_draft_reply_uses_thread():
     captured = {}
+    svc = StrictGmail({
+        "users.messages.get": lambda **kw: {
+            "threadId": "t1", "payload": {"headers": hdrs(Subject="Re: 报价", Message_ID="<m@x>", To="me@x.com")}},
+        "users.drafts.create": lambda **kw: captured.update(kw["body"]) or {"id": "d1"},
+    })
+    seen = {}
 
-    class Exec:
-        def __init__(self, v): self.v = v
-        def execute(self): return self.v
+    def choose(recipients):
+        seen["recipients"] = recipients
+        return {"address": "me@x.com", "display_name": ""}, "account"
 
-    class Msgs:
-        def get(self, **kw):
-            return Exec({"threadId": "t1", "payload": {"headers": hdrs(Subject="Re: 报价", Message_ID="<m@x>")}})
-
-    class Drafts:
-        def create(self, userId, body):
-            captured.update(body)
-            return Exec({"id": "d1"})
-
-    class Users:
-        def messages(self): return Msgs()
-        def drafts(self): return Drafts()
-
-    class Svc:
-        def users(self): return Users()
-
-    r = g.op_create_draft(Svc(), from_addr="me@x.com", to="a@x.com", subject="", body="好的",
+    r = g.op_create_draft(svc, choose_from=choose, to="a@x.com", subject="", body="好的",
                           cc=None, bcc=None, reply_to_message_id="m1")
-    assert r["draft_id"] == "d1"
+    assert r == {"draft_id": "d1", "thread_id": "t1", "from": "me@x.com", "from_source": "account"}
+    assert seen["recipients"] == ["me@x.com"]
+    assert svc.calls_to("users.messages.get")[0]["metadataHeaders"][-3:] == ["To", "Cc", "Delivered-To"]
     msg = captured["message"]
     assert msg["threadId"] == "t1"
     parsed = email.message_from_bytes(base64.urlsafe_b64decode(msg["raw"]), policy=policy.default)

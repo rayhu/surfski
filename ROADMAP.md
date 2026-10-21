@@ -61,7 +61,7 @@ See [Calendar module](#calendar-module).
   the shared grant for that mailbox and kill the new link.
 - ✅ **Unescape Gmail snippets**: Gmail returns snippets HTML-escaped (`&#39;`). Decode them in search
   results.
-- **Address aliases and "send from"**: see the [design below](#address-aliases-and-send-from).
+- ✅ **Address aliases and "send from"**: see the [design below](#address-aliases-and-send-from).
 - **Opt-in sending**: see the [design below](#opt-in-sending-design).
 - ✅ **Draft management**: `list_drafts`, `get_draft`, `update_draft`, `delete_draft`. Today Claude can
   create a draft but can't revise one, and "fix the draft you just wrote" is a common request. Uses the

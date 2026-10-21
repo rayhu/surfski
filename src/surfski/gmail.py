@@ -11,10 +11,12 @@ import calendar
 import re
 import threading
 import time
+from email.headerregistry import Address
 from email.message import EmailMessage
 from email.utils import formataddr, getaddresses, parseaddr
 from html import unescape
 from html.parser import HTMLParser
+from collections.abc import Callable
 from typing import Any
 
 from google.auth.exceptions import RefreshError
@@ -357,6 +359,134 @@ def reply_headers(original: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------- send-as identities
+
+
+def is_verified(identity: dict) -> bool:
+    """Gmail accepts a From only for the primary address or an accepted custom alias
+    (verificationStatus only applies to custom "from" aliases)."""
+    return bool(identity.get("is_primary")) or identity.get("verification_status") == "accepted"
+
+
+def op_list_send_as(svc) -> list[dict]:
+    resp = svc.users().settings().sendAs().list(userId="me").execute()
+    out = []
+    for i in resp.get("sendAs", []) or []:
+        out.append(
+            {
+                "address": (i.get("sendAsEmail") or "").lower(),
+                "display_name": i.get("displayName") or "",
+                "is_default": bool(i.get("isDefault")),
+                "is_primary": bool(i.get("isPrimary")),
+                "verification_status": i.get("verificationStatus")
+                or ("accepted" if i.get("isPrimary") else None),
+                "signature": i.get("signature") or "",
+            }
+        )
+    return [i for i in out if i["address"]]
+
+
+def public_identity(identity: dict, labels: dict[str, str]) -> dict:
+    by_addr = {a: l for l, a in labels.items()}
+    return {
+        "address": identity["address"],
+        "display_name": identity["display_name"],
+        "label": by_addr.get(identity["address"]),
+        "is_default": identity["is_default"],
+        "is_primary": identity["is_primary"],
+        "verification_status": identity["verification_status"],
+        "verified": is_verified(identity),
+        "has_signature": bool(identity.get("signature")),
+    }
+
+
+def _choices(identities: list[dict], labels: dict[str, str]) -> str:
+    by_addr = {a: l for l, a in labels.items()}
+    items = [
+        f"{i['address']} (label '{by_addr[i['address']]}')" if i["address"] in by_addr else i["address"]
+        for i in identities
+        if is_verified(i)
+    ]
+    return ", ".join(items) or "none"
+
+
+def match_identity(identities: list[dict], requested: str, labels: dict[str, str]) -> tuple[dict, str]:
+    """Resolve an address or label to a verified identity. Returns (identity, source)."""
+    req = (requested or "").strip().lower()
+    _, addr = parseaddr(req)
+    source = "explicit"
+    if "@" not in req:
+        source = "label"
+        addr = labels.get(req, "")
+    for i in identities:
+        if addr and i["address"] == addr.lower():
+            if is_verified(i):
+                return i, source
+            raise GmailError(
+                f"{addr} is not verified for sending (status: {i['verification_status']}). "
+                f"Valid choices: {_choices(identities, labels)}"
+            )
+    what = f"label '{req}'" if source == "label" else f"'{requested}'"
+    raise GmailError(
+        f"{what} is not a send-as address of this mailbox. Valid choices: {_choices(identities, labels)}. "
+        "New addresses are added in Gmail → Settings → Accounts → Send mail as."
+    )
+
+
+def recipient_addresses(headers: dict[str, str]) -> list[str]:
+    """Addresses a message was sent to: To, then Cc, then Delivered-To."""
+    vals = [headers.get(k, "") for k in ("to", "cc", "delivered-to")]
+    return [a.lower() for _, a in getaddresses([v for v in vals if v]) if a]
+
+
+def resolve_identity(
+    identities: list[dict],
+    *,
+    requested: str | None,
+    labels: dict[str, str],
+    default_from: str | None,
+    reply_recipients: list[str],
+    account_email: str,
+) -> tuple[dict, str]:
+    """explicit/label → original recipient (replies) → stored default → Gmail default
+    → account email. Returns (identity, source)."""
+    if requested:
+        return match_identity(identities, requested, labels)
+    verified = {i["address"]: i for i in identities if is_verified(i)}
+    for a in reply_recipients:
+        if a in verified:
+            return verified[a], "reply"
+    if default_from and default_from.lower() in verified:
+        return verified[default_from.lower()], "stored_default"
+    for i in verified.values():
+        if i["is_default"]:
+            return i, "gmail_default"
+    account_email = account_email.lower()
+    return verified.get(account_email) or {
+        "address": account_email, "display_name": "", "signature": "",
+        "is_default": False, "is_primary": True, "verification_status": "accepted",
+    }, "account"
+
+
+def from_header(identity: dict) -> str:
+    """Formatted From value; the email policy RFC 2047-encodes non-ASCII names."""
+    name = identity.get("display_name") or ""
+    if "\r" in name or "\n" in name:
+        name = ""
+    return str(Address(display_name=name, addr_spec=identity["address"]))
+
+
+def signature_text(identity: dict) -> str:
+    return html_to_text(identity.get("signature") or "")
+
+
+def append_signature(body: str, identity: dict) -> str:
+    sig = signature_text(identity)
+    if not sig or sig in body:
+        return body
+    return f"{body.rstrip()}\n\n-- \n{sig}"
+
+
 # ---------------------------------------------------------------- operations
 
 
@@ -401,16 +531,19 @@ def op_list_labels(svc) -> list[dict]:
 def op_create_draft(
     svc,
     *,
-    from_addr: str,
+    choose_from: Callable[[list[str]], tuple[dict, str]],
     to: str,
     subject: str,
     body: str,
     cc: str | None,
     bcc: str | None,
     reply_to_message_id: str | None,
+    include_signature: bool = False,
 ) -> dict:
+    """choose_from(reply_recipient_addresses) picks the sending identity."""
     users = svc.users()
     thread_id = in_reply_to = references = None
+    recipients: list[str] = []
     if reply_to_message_id:
         orig = (
             users.messages()
@@ -418,15 +551,19 @@ def op_create_draft(
                 userId="me",
                 id=reply_to_message_id,
                 format="metadata",
-                metadataHeaders=["Subject", "Message-ID", "References"],
+                metadataHeaders=["Subject", "Message-ID", "References", "To", "Cc", "Delivered-To"],
             )
             .execute()
         )
         rh = reply_headers(orig)
+        recipients = recipient_addresses(headers_map(orig.get("payload") or {}))
         thread_id, in_reply_to, references = rh["thread_id"], rh["in_reply_to"], rh["references"]
         subject = reply_subject(subject or rh["subject"])
+    identity, source = choose_from(recipients)
+    if include_signature:
+        body = append_signature(body, identity)
     mime = build_mime(
-        from_addr=from_addr,
+        from_addr=from_header(identity),
         to=to,
         subject=subject,
         body=body,
@@ -439,7 +576,12 @@ def op_create_draft(
     if thread_id:
         message["threadId"] = thread_id
     draft = users.drafts().create(userId="me", body={"message": message}).execute()
-    return {"draft_id": draft.get("id"), "thread_id": thread_id}
+    return {
+        "draft_id": draft.get("id"),
+        "thread_id": thread_id,
+        "from": identity["address"],
+        "from_source": source,
+    }
 
 
 def op_list_drafts(svc, max_results: int, page_token: str | None) -> dict:
@@ -481,6 +623,8 @@ def op_update_draft(
     *,
     draft_id: str,
     default_from: str,
+    choose_from: Callable[[str], tuple[dict, str] | None] | None = None,
+    include_signature: bool = False,
     to: str | None,
     subject: str | None,
     body: str | None,
@@ -488,7 +632,8 @@ def op_update_draft(
     bcc: str | None,
 ) -> dict:
     """Rebuild a draft's MIME. None keeps the current value; "" clears cc/bcc.
-    From, threadId, In-Reply-To and References are always preserved."""
+    threadId, In-Reply-To and References are always preserved. From is kept unless
+    choose_from(current_from_address) returns an identity."""
     drafts = svc.users().drafts()
     current = drafts.get(userId="me", id=draft_id, format="full").execute()
     msg = current.get("message") or {}
@@ -513,11 +658,18 @@ def op_update_draft(
     new_to = h.get("to", "") if to is None else to
     if not _addr_list(new_to):
         raise GmailError("the draft has no recipients; pass 'to'")
+    from_value = h.get("from") or default_from
+    chosen = choose_from(parseaddr(from_value)[1].lower()) if choose_from else None
+    new_body = extract_body(payload) if body is None else body
+    if chosen:
+        from_value = from_header(chosen[0])
+        if include_signature:
+            new_body = append_signature(new_body, chosen[0])
     mime = build_mime(
-        from_addr=h.get("from") or default_from,
+        from_addr=from_value,
         to=new_to,
         subject=h.get("subject", "") if subject is None else subject,
-        body=extract_body(payload) if body is None else body,
+        body=new_body,
         cc=h.get("cc") if cc is None else cc,
         bcc=h.get("bcc") if bcc is None else bcc,
         in_reply_to=h.get("in-reply-to") or None,
@@ -529,6 +681,8 @@ def op_update_draft(
         message["threadId"] = msg["threadId"]
     updated = drafts.update(userId="me", id=draft_id, body={"id": draft_id, "message": message}).execute()
     out: dict[str, Any] = {"draft_id": updated.get("id", draft_id)}
+    if chosen:
+        out["from"], out["from_source"] = chosen[0]["address"], chosen[1]
     if flattened_html:
         out["flattened_html"] = True
     return out
