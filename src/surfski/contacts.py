@@ -31,18 +31,39 @@ def norm(text: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", text or "").casefold().split())
 
 
+_STRIP_CHARS = set('"(){}:*')
+_OPERATOR_WORDS = {"OR", "AND"}
+
+
 def clean_term(term: str) -> str:
-    """The user's search text, safe to put inside a Gmail `q` group: no quotes, parens,
-    braces or control characters. Raises ValueError if nothing is left."""
-    t = "".join(" " if (unicodedata.category(c)[0] == "C" or c in '"(){}') else c for c in term or "")
-    t = " ".join(t.split())[:MAX_TERM_CHARS].strip()
+    """The user's search text as plain words, safe to quote into a Gmail `q` group: no
+    quotes, parens, braces, colons (field operators like in:), wildcards, control
+    characters, leading '-' (negation) or standalone OR/AND. Raises ValueError if nothing
+    is left."""
+    t = "".join(" " if (unicodedata.category(c)[0] == "C" or c in _STRIP_CHARS) else c for c in term or "")
+    words = [w.lstrip("-") for w in t.split()]
+    t = " ".join(w for w in words if w and w not in _OPERATOR_WORDS)[:MAX_TERM_CHARS].strip()
     if not t:
         raise ValueError("give a name or part of an address to look up")
     return t
 
 
 def gmail_query(term: str) -> str:
-    return f"from:({term}) OR to:({term}) OR cc:({term})"
+    """Each word quoted, so nothing in it can act as a Gmail operator."""
+    q = " ".join(f'"{w}"' for w in term.split())
+    return f"from:({q}) OR to:({q}) OR cc:({q})"
+
+
+def parse_addresses(value: str) -> list[tuple[str, str]]:
+    """getaddresses, retried leniently when the strict parser gives up on the whole
+    header (it returns only empty pairs for e.g. `Wei <w@x.com> junk, c@d.com`)."""
+    pairs = getaddresses([value])
+    if all(not n and not a for n, a in pairs):
+        try:
+            pairs = getaddresses([value], strict=False)
+        except TypeError:  # Python without the strict parameter: already lenient
+            pass
+    return pairs
 
 
 def matches(term_n: str, name: str, address: str) -> bool:
@@ -77,7 +98,7 @@ def collect(messages: list[dict], term: str, alias: str, acc: dict[str, dict]) -
             hname = (h.get("name") or "").lower()
             if hname not in ("from", "to", "cc", "reply-to", "bcc"):
                 continue
-            for name, addr in getaddresses([h.get("value") or ""]):
+            for name, addr in parse_addresses(h.get("value") or ""):
                 addr = addr.strip().lower()
                 if not _ADDR_RE.match(addr) or not matches(term_n, name, addr):
                     continue

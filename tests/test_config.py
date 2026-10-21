@@ -76,3 +76,12 @@ def test_confirm_channel(tmp_path):
     assert load_config(make_env(tmp_path, CONFIRM_CHANNEL="")).confirm_channel == "auto"
     with pytest.raises(ConfigError, match="CONFIRM_CHANNEL"):
         load_config(make_env(tmp_path, CONFIRM_CHANNEL="elicit"))
+
+
+def test_unsubscribe_allowed_ports(tmp_path):
+    assert load_config(make_env(tmp_path)).unsubscribe_allowed_ports == frozenset()
+    cfg = load_config(make_env(tmp_path, UNSUBSCRIBE_ALLOWED_PORTS="8443, 9443"))
+    assert cfg.unsubscribe_allowed_ports == frozenset({8443, 9443})
+    for bad in ("https", "0", "70000"):
+        with pytest.raises(ConfigError, match="UNSUBSCRIBE_ALLOWED_PORTS"):
+            load_config(make_env(tmp_path, UNSUBSCRIBE_ALLOWED_PORTS=bad))

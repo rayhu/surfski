@@ -87,6 +87,8 @@ class Config:
     # delete_my_data: "delete" the caller's audit rows, or keep them "pseudonymize"d.
     audit_on_delete: str = "delete"
     attachment_max_bytes: int = 15 * 1024 * 1024
+    # Extra https ports the one-click unsubscribe POST may use (#17); 443 is always allowed.
+    unsubscribe_allowed_ports: frozenset[int] = frozenset()
 
     def is_allowed(self, email: str | None, *, email_verified: Any, hd: str | None) -> bool:
         """The single allowlist check. Allowed if the caller's primary address is listed in
@@ -221,6 +223,14 @@ def load_config(env: dict[str, str] | None = None) -> Config:
     if audit_on_delete not in ("delete", "pseudonymize"):
         raise ConfigError("AUDIT_ON_DELETE must be delete or pseudonymize")
 
+    try:
+        unsub_ports = frozenset(
+            int(p) for p in env.get("UNSUBSCRIBE_ALLOWED_PORTS", "").split(",") if p.strip())
+    except ValueError as e:
+        raise ConfigError("UNSUBSCRIBE_ALLOWED_PORTS must be a comma-separated list of ports") from e
+    if any(not 0 < p < 65536 for p in unsub_ports):
+        raise ConfigError("UNSUBSCRIBE_ALLOWED_PORTS must be ports between 1 and 65535")
+
     return Config(
         base_url=base_url,
         google_client_id=env["GOOGLE_CLIENT_ID"].strip(),
@@ -245,4 +255,5 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         confirm_channel=confirm_channel,
         audit_on_delete=audit_on_delete,
         attachment_max_bytes=int(attachment_mb * 1024 * 1024),
+        unsubscribe_allowed_ports=unsub_ports,
     )

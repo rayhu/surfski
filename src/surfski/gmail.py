@@ -559,6 +559,17 @@ def op_get_message(svc, message_id: str, max_body_chars: int) -> dict:
     return parse_message(m, max_body_chars)
 
 
+UNSUBSCRIBE_METADATA = ["List-Unsubscribe", "List-Unsubscribe-Post", "To", "Cc", "Delivered-To"]
+
+
+def op_unsubscribe_headers(svc, message_id: str) -> list[dict]:
+    """The headers unsubscribe (#17) needs, every occurrence. Metadata format: the body is
+    never fetched, so links in it can't be followed."""
+    m = svc.users().messages().get(userId="me", id=message_id, format="metadata",
+                                   metadataHeaders=UNSUBSCRIBE_METADATA).execute()
+    return (m.get("payload") or {}).get("headers") or []
+
+
 def op_list_labels(svc) -> list[dict]:
     resp = svc.users().labels().list(userId="me").execute()
     return [
