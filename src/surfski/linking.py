@@ -15,7 +15,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from .storage import GMAIL_MODIFY_SCOPE, Storage, validate_alias
+from .storage import CALENDAR_SCOPES, GMAIL_MODIFY_SCOPE, Storage, validate_alias
 
 GMAIL_SCOPES = (
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -89,10 +89,13 @@ def start_link(
     hd: str | None = None,
     now: float | None = None,
     triage_email: str | None = None,
+    calendar_email: str | None = None,
 ) -> LinkStart:
-    """With triage_email (#8), the link also requests gmail.modify and the callback only
-    accepts that exact mailbox. It is a full re-consent (prompt=consent,
-    include_granted_scopes=false): the new refresh token carries exactly the scopes listed."""
+    """With triage_email (#8), the link also requests gmail.modify; with calendar_email
+    (#19), the calendar scopes. The callback then only accepts that exact mailbox. It is a
+    full re-consent (prompt=consent, include_granted_scopes=false): the new refresh token
+    carries exactly the scopes listed, so a caller adding one capability must also pass
+    the capabilities the mailbox already has. Plain links never request either."""
     alias = validate_alias(alias)
     owner = owner.lower()
     nonce = secrets.token_urlsafe(24)
@@ -105,7 +108,10 @@ def start_link(
     scopes = GMAIL_SCOPES
     if triage_email:
         payload["triage"] = triage_email.lower()
-        scopes = GMAIL_SCOPES + (GMAIL_MODIFY_SCOPE,)
+        scopes = scopes + (GMAIL_MODIFY_SCOPE,)
+    if calendar_email:
+        payload["calendar"] = calendar_email.lower()
+        scopes = scopes + CALENDAR_SCOPES
     state = sign_state(state_secret, payload)
     params = {
         "client_id": client_id,
@@ -142,6 +148,7 @@ async def exchange_code(
     code: str,
     code_verifier: str,
     require_modify: bool = False,
+    require_calendar: bool = False,
 ) -> dict:
     resp = await http.post(
         TOKEN_ENDPOINT,
@@ -173,6 +180,12 @@ async def exchange_code(
         raise LinkError(
             "Triage was not enabled: Google did not grant the Gmail modify permission. Ask "
             "Claude for a new enable_triage link and tick every checkbox. Nothing changed."
+        )
+    if require_calendar and not all(s in granted for s in CALENDAR_SCOPES):
+        raise LinkError(
+            "Calendar was not enabled: Google did not grant both calendar permissions (view "
+            "and edit events). Ask Claude for a new enable_calendar link and tick every "
+            "checkbox. Nothing changed."
         )
     return tokens
 

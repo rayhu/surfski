@@ -36,6 +36,10 @@ GOOGLE_ISSUERS = ("accounts.google.com", "https://accounts.google.com")
 PURPOSE_SEND = "send-confirm"
 PURPOSE_RAISE = "policy-raise"
 PURPOSE_AUTH = "owner-auth"
+# Calendar module (#19): separate purposes, so a calendar token can never be applied by
+# the mail send/policy pages (a calendar raise must not raise the mail send policy).
+PURPOSE_CAL_CONFIRM = "calendar-confirm"
+PURPOSE_CAL_RAISE = "calendar-raise"
 
 
 class ActionError(Exception):
@@ -99,15 +103,18 @@ def issue_action(
     data: dict,
     ttl: int = ACTION_TTL_SECONDS,
     now: float | None = None,
+    bind: str | None = None,
 ) -> str:
-    """Store a single-use nonce (with server-side data) and return the signed token."""
+    """Store a single-use nonce (with server-side data) and return the signed token.
+    `bind` (e.g. a payload hash) is signed into the token as "h" for the caller to
+    recheck against the server-side data."""
     nonce = secrets.token_urlsafe(24)
     exp = int(now or time.time()) + ttl
     storage.add_action_token(nonce, owner, alias, purpose, exp, json.dumps(data))
-    return sign_action(
-        state_secret,
-        {"p": purpose, "o": owner.lower(), "a": alias, "e": email.lower(), "n": nonce, "x": exp},
-    )
+    payload = {"p": purpose, "o": owner.lower(), "a": alias, "e": email.lower(), "n": nonce, "x": exp}
+    if bind is not None:
+        payload["h"] = bind
+    return sign_action(state_secret, payload)
 
 
 def token_data(raw: str | None) -> dict | None:

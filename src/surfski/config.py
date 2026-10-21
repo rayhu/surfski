@@ -103,6 +103,14 @@ class Config:
     extract_timeout_s: float = 20.0
     extract_memory_mb: int = 512
     metrics_token: str = ""
+    # Modules served by this deployment (#19): "mail" always, "calendar" opt-in.
+    features: frozenset[str] = frozenset({"mail"})
+    # Calendar events that email external attendees, per mailbox in a rolling 24 h.
+    calendar_invite_daily_cap: int = 20
+
+    @property
+    def calendar_enabled(self) -> bool:
+        return "calendar" in self.features
 
     def is_allowed(self, email: str | None, *, email_verified: Any, hd: str | None) -> bool:
         """The single allowlist check. Allowed if the caller's primary address is listed in
@@ -304,6 +312,21 @@ def load_config(env: dict[str, str] | None = None) -> Config:
     if not 128 <= extract_memory <= 8192:
         raise ConfigError("EXTRACT_MEMORY_MB must be between 128 and 8192")
 
+    features = frozenset(f.strip().lower() for f in env.get("FEATURES", "mail").split(",") if f.strip())
+    features = features or frozenset({"mail"})
+    unknown = features - {"mail", "calendar"}
+    if unknown:
+        raise ConfigError(f"FEATURES has unknown module(s) {', '.join(sorted(unknown))}: use mail,calendar")
+    if "mail" not in features:
+        raise ConfigError("FEATURES must include mail (calendar-only deployments and the "
+                          "/calendar/mcp endpoint are not supported yet)")
+    try:
+        invite_cap = int(env.get("CALENDAR_INVITE_DAILY_CAP", "20"))
+    except ValueError as e:
+        raise ConfigError("CALENDAR_INVITE_DAILY_CAP must be an integer") from e
+    if invite_cap < 1:
+        raise ConfigError("CALENDAR_INVITE_DAILY_CAP must be at least 1")
+
     return Config(
         base_url=base_url,
         google_client_id=env["GOOGLE_CLIENT_ID"].strip(),
@@ -339,4 +362,6 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         extract_sandbox=extract_sandbox,
         extract_timeout_s=extract_timeout,
         extract_memory_mb=extract_memory,
+        features=features,
+        calendar_invite_daily_cap=invite_cap,
     )
