@@ -8,7 +8,9 @@ import html
 import logging
 import secrets
 import threading
+import textwrap
 import time
+import unicodedata
 from collections.abc import Callable
 from typing import Annotated, Any, Literal
 from urllib.parse import urlencode
@@ -18,8 +20,9 @@ import httpx
 from cryptography.fernet import Fernet
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
-from fastmcp.server.dependencies import get_access_token
-from pydantic import Field
+from fastmcp.server.dependencies import get_access_token, get_context
+from fastmcp.server.elicitation import AcceptedElicitation
+from pydantic import BaseModel, Field, StrictBool
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 
@@ -56,8 +59,9 @@ SEND_SAFETY = (
 
 INSTRUCTIONS_SENDING = (
     "Sending: each mailbox has a send_policy (see list_accounts). 'off' = drafts only; "
-    "'confirm' = send_draft/send_email return a one-time link the user must open and press "
-    "Send; 'auto' = sent directly within caps. " + SEND_SAFETY + " Claude cannot raise a "
+    "'confirm' = the user is asked in this app to approve the send (if the app supports it), "
+    "else send_draft/send_email return a one-time link the user must open and press Send; "
+    "a declined send returns sent=false and keeps the draft; 'auto' = sent directly within caps. " + SEND_SAFETY + " Claude cannot raise a "
     "send policy: set_send_policy returns a link where the owner re-authenticates."
 )
 
@@ -175,6 +179,234 @@ def _post_form(action: str, token: str, label: str) -> str:
         f"<input type='hidden' name='token' value='{html.escape(token)}'>"
         f"<button type='submit'>{html.escape(label)}</button></form>"
     )
+
+
+# ---------------------------------------------------------------- confirmed sends
+# Shared by POST /send/confirm and by an accepted MCP elicitation (#27), so both
+# confirmation channels recheck exactly the same things before anything is sent.
+
+PREVIEW_CHARS = 500
+# How long to wait for the user to answer an elicitation before falling back to the
+# confirm link (never to sending).
+ELICIT_TIMEOUT_SECONDS = 300
+
+
+def checked_recipients(config: Config, info: dict) -> list[str]:
+    """All recipients of a draft after every cap check; GmailError (user-facing) if one fails."""
+    try:
+        return snd.checked_recipients(
+            info["raw_headers"],
+            max_recipients=config.send_max_recipients,
+            allowed_domains=config.allowed_recipient_domains,
+        )
+    except ValueError as e:
+        raise g.GmailError(f"not sent: {e}") from None
+
+
+def daily_cap_error(config: Config, alias: str) -> g.GmailError:
+    return g.GmailError(
+        f"not sent: mailbox '{alias}' reached its limit of {config.send_daily_cap} sends in 24 hours"
+    )
+
+
+_LINE_BREAKS = ("\r\n", "\r", "\x85", "\u2028", "\u2029", "\x0b", "\x0c")
+# Elicitation prompt layout: body lines are hard-wrapped so a client's soft wrap can't
+# start a visual line without the fence prefix; free-text header values are capped.
+BODY_WRAP = 76
+FIELD_MAX = 200
+
+
+def _visible(c: str) -> bool:
+    # Cf = format characters: bidi controls, zero-width, word joiners, tag characters...
+    return unicodedata.category(c) != "Cf"
+
+
+def clean_field(value: str) -> str:
+    """One display line from an untrusted header value: no line breaks or other control
+    characters (they could forge extra summary rows), no format (Cf) characters."""
+    value = "".join(c for c in (value or "") if _visible(c))
+    value = "".join(" " if unicodedata.category(c) in ("Cc", "Zl", "Zp") else c for c in value)
+    return " ".join(value.split())
+
+
+def clean_body(text: str) -> str:
+    """Untrusted body text: line breaks kept, every whitespace run inside a line collapsed
+    to one space (padding can't push text onto its own visual line), no control or
+    format characters."""
+    text = "".join(c for c in (text or "") if _visible(c))
+    for br in _LINE_BREAKS:
+        text = text.replace(br, "\n")
+    text = "".join(c if c == "\n" or unicodedata.category(c) != "Cc" else " " for c in text)
+    return "\n".join(" ".join(line.split()) for line in text.split("\n"))
+
+
+def _no_markup(value: str) -> str:
+    # A Markdown/HTML-rendering client could hide the rest of the prompt behind "<!--".
+    return value.replace("<", "‹").replace(">", "›")
+
+
+def _cap(value: str, limit: int = FIELD_MAX) -> str:
+    return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def confirm_summary(acct, info: dict, recipients: list[str]) -> tuple[list[tuple[str, str]], bool, str]:
+    """(rows, has_bcc, body preview) describing a draft for the human who confirms it.
+    Row values are single sanitized lines; the preview keeps line breaks."""
+    h = info["headers"]
+    try:
+        values = snd.recipient_values(info["raw_headers"])
+    except ValueError:
+        values = {k: [] for k in snd.RECIPIENT_HEADERS}
+    joined = {k: ", ".join(v for v in vals if v.strip()) for k, vals in values.items()}
+    rows = [("Mailbox", f"{acct.alias} ({acct.email})"), ("From", h.get("from", "")),
+            ("To", joined["to"]), ("Cc", joined["cc"]), ("Bcc", joined["bcc"]),
+            ("Subject", h.get("subject", "")),
+            ("Attachments", ", ".join(info["attachments"]) or "none"),
+            ("Recipients", f"{len(recipients)}: " + ", ".join(recipients))]
+    rows = [(k, clean_field(v)) for k, v in rows]
+    body = clean_body(info["body"])
+    preview = body[:PREVIEW_CHARS] + ("…" if len(body) > PREVIEW_CHARS else "")
+    return rows, bool(dict(rows)["Bcc"]), preview
+
+
+def recipient_counts(info: dict) -> dict[str, int]:
+    out = {}
+    for k in snd.RECIPIENT_HEADERS:
+        try:
+            out[k] = len(snd.collect_recipients({k: snd.recipient_values(info["raw_headers"])[k]}))
+        except ValueError:
+            out[k] = 0
+    return out
+
+
+BODY_BEGIN = "--- begin message text (written by the sender, not verified) ---"
+BODY_END = "--- end message text ---"
+
+
+def confirm_message(acct, info: dict, recipients: list[str]) -> str:
+    """Plain-text confirmation prompt for MCP elicitation. Header values are flattened to
+    one line each, the body excerpt sits between markers with every line prefixed, and
+    the trusted recipient summary is repeated after it, so text inside the email can't
+    pass itself off as part of the summary."""
+    rows, has_bcc, preview = confirm_summary(acct, info, recipients)
+    counts = recipient_counts(info)
+    bcc_warning = "WARNING: this email has hidden (Bcc) recipients."
+    lines = ["Send this email from your Gmail account? It can't be undone.", ""]
+    for k, v in rows:
+        if k in ("From", "Subject", "Attachments"):  # free text, not checked addresses
+            v = _cap(v)
+        lines.append(f"{k}: {_no_markup(v) or '-'}")
+    if has_bcc:
+        lines += [bcc_warning]
+    lines += ["", f"Message (first {PREVIEW_CHARS} characters):", BODY_BEGIN]
+    for line in _no_markup(preview).split("\n"):
+        pieces = textwrap.wrap(line, BODY_WRAP, break_long_words=True, break_on_hyphens=False)
+        lines += ["│ " + piece for piece in pieces or [""]]
+    lines += [BODY_END, "",
+              f"Summary (from the server): sends to {len(recipients)} recipient(s): "
+              f"To {counts['to']}, Cc {counts['cc']}, Bcc {counts['bcc']}."]
+    if has_bcc:
+        lines += [bcc_warning]
+    lines += ["Check every field above. If you didn't ask for this email, decline: nothing is sent."]
+    return "\n".join(lines)
+
+
+class SendDecision(BaseModel):
+    """Elicitation answer: only a JSON boolean true sends ("yes", 1 etc. are rejected)."""
+
+    send: StrictBool = Field(title="Send this email?")
+
+
+def commit_confirmed_send(
+    config: Config,
+    storage: Storage,
+    make_service,
+    *,
+    owner: str,
+    alias: str,
+    email: str,
+    draft_id: str,
+    message_id: str,
+    changed_error: str,
+    before_send: Callable[[int], None] | None = None,
+) -> tuple[dict, int, str]:
+    """Send a draft a human just confirmed, after rechecking everything: the mailbox is
+    still linked to the same address, its policy still allows sending, the draft is the
+    exact version the human saw, and the caps hold. Runs in a worker thread. Raises
+    g.GmailError (user-facing) and sends nothing if any check fails. `before_send(now)`
+    runs after the cap reservation and right before sending (the link path burns its
+    token there); if it raises, the reservation is released.
+    Returns (sent, recipient_count, policy)."""
+    if owner not in config.allowed_users:
+        raise g.GmailError("this Google account is no longer allowed to use this server; nothing was sent")
+    try:
+        acct = storage.get_account(owner, alias)
+    except (AccountNotFound, ValueError):
+        raise g.GmailError("this mailbox is no longer linked; nothing was sent") from None
+    if acct.email != email:
+        raise g.GmailError("this mailbox was relinked since the confirmation was requested; nothing was sent")
+    if acct.send_policy not in ("confirm", "auto"):
+        raise g.GmailError("sending is now off for this mailbox; nothing was sent")
+    svc = make_service(owner, alias)
+    info = g.op_draft_for_send(svc, draft_id)
+    if info["message_id"] != message_id:
+        raise g.GmailError(changed_error)
+    recipients = checked_recipients(config, info)
+    now = int(time.time())
+    rid = storage.reserve_send(owner, alias, config.send_daily_cap, now)
+    if rid is None:
+        raise daily_cap_error(config, alias)
+    try:
+        if before_send is not None:
+            before_send(now)
+        sent = g.op_send_draft(svc, draft_id)
+    except Exception:
+        storage.release_send(rid)
+        raise
+    return sent, len(recipients), acct.send_policy
+
+
+def elicitation_unavailable(config: Config) -> str | None:
+    """None if the current request can confirm via MCP elicitation, else a short reason
+    (for the audit log and the tool result)."""
+    if config.confirm_channel != "auto":
+        return "operator-link-only"
+    try:
+        ctx = get_context()
+        if ctx.is_background_task:
+            return "background-task"
+        session = ctx.session
+        caps = session.client_capabilities
+    except Exception:  # noqa: BLE001  (no request context)
+        return "no-context"
+    el = getattr(caps, "elicitation", None)
+    if el is None:
+        return "client-not-capable"
+    # An empty elicitation capability means form mode (pre-2025-11-25 clients); a
+    # client that declares only URL mode can't render our form.
+    if getattr(el, "form", None) is None and getattr(el, "url", None) is not None:
+        return "client-not-capable"
+    # 2026-07-28 connections have no back-channel for server-initiated requests.
+    try:
+        if not session.can_send_request:
+            return "no-back-channel"
+    except Exception:  # noqa: BLE001
+        return "no-back-channel"
+    return None
+
+
+async def elicit_send(message: str) -> str:
+    """Ask the human through the MCP client. Returns "accept" (only for an explicit
+    accept with send=true), "decline" (decline, cancel, or accept with send=false).
+    Raises on any transport/client error, malformed answer (missing field, or not a JSON
+    boolean) or timeout: the caller falls back to the link."""
+    ctx = get_context()
+    with anyio.fail_after(ELICIT_TIMEOUT_SECONDS):
+        result = await ctx.elicit(message, SendDecision)
+    if (isinstance(result, AcceptedElicitation) and isinstance(result.data, SendDecision)
+            and result.data.send is True):
+        return "accept"
+    return "decline"
 
 
 def build_client_storage(config: Config):
@@ -361,50 +593,27 @@ def create_app(
         return a
 
     def check_caps(info: dict) -> list[str]:
-        try:
-            return snd.checked_recipients(
-                info["raw_headers"],
-                max_recipients=config.send_max_recipients,
-                allowed_domains=config.allowed_recipient_domains,
-            )
-        except ValueError as e:
-            raise g.GmailError(f"not sent: {e}") from None
-
-    def daily_cap_error(alias: str) -> g.GmailError:
-        return g.GmailError(
-            f"not sent: mailbox '{alias}' reached its limit of {config.send_daily_cap} sends "
-            "in 24 hours"
-        )
+        return checked_recipients(config, info)
 
     def send_or_confirm(owner: str, acct, svc, draft_id: str, tool: str) -> dict:
-        """Apply the mailbox's send policy to an existing draft."""
+        """Apply the mailbox's send policy to an existing draft. In confirm mode nothing is
+        sent here: the result carries a "_pending" record that finish_send (on the event
+        loop, outside this worker thread) turns into an elicitation or a confirm link."""
         a = require_sending(owner, acct)
         info = g.op_draft_for_send(svc, draft_id)
         recipients = check_caps(info)
         now = int(time.time())
         if a.send_policy == "confirm":
             if storage.sends_today(owner, a.alias, now) >= config.send_daily_cap:
-                raise daily_cap_error(a.alias)
-            token = snd.issue_action(
-                storage, config.state_secret, owner=owner, alias=a.alias, email=a.email,
-                purpose=snd.PURPOSE_SEND,
-                data={"draft_id": draft_id, "message_id": info["message_id"]},
-            )
-            write_audit(storage, owner, tool, a.alias,
-                        f"policy=confirm recipients={len(recipients)} draft={draft_id} link=issued", True)
-            return {
-                "status": "confirmation_required",
-                "draft_id": draft_id,
-                "confirm_url": f"{config.base_url}/send/confirm?{urlencode({'token': token})}",
-                "expires_in": snd.ACTION_TTL_SECONDS,
-                "instructions": (
-                    "Nothing has been sent. Give the user this link: the email is sent only when "
-                    "they open it, check it and press Send. It works once and expires in 10 minutes."
-                ),
-            }
+                raise daily_cap_error(config, a.alias)
+            return {"draft_id": draft_id, "_pending": {
+                "tool": tool, "alias": a.alias, "email": a.email, "draft_id": draft_id,
+                "message_id": info["message_id"], "recipients": len(recipients),
+                "message": confirm_message(a, info, recipients),
+            }}
         rid = storage.reserve_send(owner, a.alias, config.send_daily_cap, now)
         if rid is None:
-            raise daily_cap_error(a.alias)
+            raise daily_cap_error(config, a.alias)
         try:
             # Re-check right before sending so a concurrent update_draft can't swap in
             # content (or recipients) that weren't checked.
@@ -427,6 +636,81 @@ def create_app(
             raise g.GmailError(
                 f"{e}. Nothing was sent; draft {draft_id} was kept (see list_drafts)."
             ) from None
+
+    def issue_confirm_link(owner: str, p: dict, reason: str) -> dict:
+        """The owner-session-bound confirm link (the fallback channel)."""
+        if owner not in config.allowed_users:
+            raise ToolError("this Google account is not allowed to use this server; nothing was sent")
+        try:
+            a = storage.get_account(owner, p["alias"])
+        except (AccountNotFound, ValueError):
+            raise ToolError("this mailbox is no longer linked; nothing was sent") from None
+        if a.email != p["email"] or a.send_policy == "off":
+            raise ToolError(f"sending is now off for mailbox '{p['alias']}'; nothing was sent. "
+                            f"Draft {p['draft_id']} was kept.")
+        token = snd.issue_action(
+            storage, config.state_secret, owner=owner, alias=a.alias, email=a.email,
+            purpose=snd.PURPOSE_SEND,
+            data={"draft_id": p["draft_id"], "message_id": p["message_id"]},
+        )
+        write_audit(storage, owner, p["tool"], a.alias,
+                    f"policy=confirm recipients={p['recipients']} draft={p['draft_id']} "
+                    f"link=issued channel=link reason={reason}", True)
+        return {
+            "status": "confirmation_required",
+            "draft_id": p["draft_id"],
+            "confirm_channel": "link",
+            "confirm_url": f"{config.base_url}/send/confirm?{urlencode({'token': token})}",
+            "expires_in": snd.ACTION_TTL_SECONDS,
+            "instructions": (
+                "Nothing has been sent. Give the user this link: the email is sent only when "
+                "they open it, check it and press Send. It works once and expires in 10 minutes."
+            ),
+        }
+
+    async def finish_send(owner: str, r: dict) -> dict:
+        """Complete a confirm-mode send (#27): ask the human via MCP elicitation when the
+        client supports it, else (or if asking fails) return the confirm link. Never
+        sends without an explicit accept, and never falls back to sending."""
+        p = r.pop("_pending", None)
+        if p is None:
+            return r
+        tool, alias, draft_id = p["tool"], p["alias"], p["draft_id"]
+        reason = elicitation_unavailable(config)
+        if reason is None:
+            try:
+                answer = await elicit_send(p["message"])
+            except Exception as e:  # noqa: BLE001  (any failure -> link, never send)
+                log.info("elicitation failed tool=%s err=%s; using confirm link", tool, type(e).__name__)
+                reason = "elicitation-error" if not isinstance(e, TimeoutError) else "elicitation-timeout"
+            else:
+                if answer != "accept":
+                    write_audit(storage, owner, tool, alias,
+                                f"policy=confirm draft={draft_id} channel=elicitation result=declined", True)
+                    return {**r, "status": "declined", "sent": False, "draft_id": draft_id,
+                            "confirm_channel": "elicitation",
+                            "instructions": "The user declined. Nothing was sent; the draft was kept "
+                                            "(see list_drafts). Don't retry unless they ask."}
+                try:
+                    sent, n, policy = await anyio.to_thread.run_sync(lambda: commit_confirmed_send(
+                        config, storage, make_service, owner=owner, alias=alias, email=p["email"],
+                        draft_id=draft_id, message_id=p["message_id"],
+                        changed_error="not sent: the draft was edited after it was shown for "
+                                      "confirmation",
+                    ))
+                except Exception as e:  # noqa: BLE001
+                    err = g.map_google_error(e, alias)
+                    if storage.account_exists(owner, alias):
+                        write_audit(storage, owner, tool, alias,
+                                    f"channel=elicitation result=accepted err={type(e).__name__}", False)
+                    raise ToolError(f"{err}. Nothing was sent; draft {draft_id} was kept "
+                                    "(see list_drafts).") from None
+                write_audit(storage, owner, tool, alias,
+                            f"policy={policy} recipients={n} message={sent['message_id']} "
+                            "channel=elicitation result=accepted", True)
+                return {**r, "status": "sent", "sent": True, "draft_id": draft_id,
+                        "confirm_channel": "elicitation", **sent}
+        return {**r, **issue_confirm_link(owner, p, reason)}
 
     # -- account tools
 
@@ -935,7 +1219,7 @@ def create_app(
 
         detail = f"message={message_id}" + (" from=explicit" if from_address else "")
         detail += " send" if send else ""
-        return await gmail_call(owner, alias, "forward_message", detail, fn)
+        return await finish_send(owner, await gmail_call(owner, alias, "forward_message", detail, fn))
 
     FORWARD_DOC = """Forward a message: saves a DRAFT (new thread) with the note, the standard
         'Forwarded message' header block, the original plain-text body and the
@@ -947,7 +1231,7 @@ def create_app(
         @mcp.tool(
             description=FORWARD_DOC + (
                 " With send=true the draft is then sent per the mailbox's send_policy (off: "
-                "error; confirm: returns a link the user must open; auto: sent). " + SEND_SAFETY
+                "error; confirm: the user approves it in the app, or opens a returned link; auto: sent). " + SEND_SAFETY
             ),
             annotations={"destructiveHint": True, "openWorldHint": True},
         )
@@ -999,23 +1283,25 @@ def create_app(
             annotations=SEND_ANN,
             description=(
                 "Send an existing draft, following the mailbox's send_policy: off = error; "
-                "confirm = returns a one-time link the user must open and press Send (nothing "
-                "is sent until then); auto = sent now, within the server's caps. " + SEND_SAFETY
+                "confirm = the user is asked to approve it in the app when supported, else a "
+                "one-time link is returned that they must open and press Send (nothing is sent "
+                "until then; a declined send returns sent=false); auto = sent now, within the server's caps. " + SEND_SAFETY
             ),
         )
         async def send_draft(alias: str, draft_id: str) -> dict:
             owner = require_owner("send_draft")
-            return await gmail_call(
+            return await finish_send(owner, await gmail_call(
                 owner, alias, "send_draft", f"draft={draft_id}",
                 lambda svc, acct: send_or_confirm(owner, acct, svc, draft_id, "send_draft"),
-            )
+            ))
 
         @mcp.tool(
             annotations=SEND_ANN,
             description=(
                 "Compose and send an email (new or reply) following the mailbox's send_policy: "
                 "it is saved as a draft first, then off = error (nothing created); confirm = "
-                "returns a one-time link the user must open and press Send; auto = sent now, "
+                "the user approves it in the app, or a one-time link is returned that they must "
+                "open and press Send; auto = sent now, "
                 "within caps. From resolution and threading work as in create_draft. "
                 + SEND_SAFETY
             ),
@@ -1054,7 +1340,7 @@ def create_app(
                 return r
 
             detail = "reply" if reply_to_message_id else "new"
-            return await gmail_call(owner, alias, "send_email", detail, fn)
+            return await finish_send(owner, await gmail_call(owner, alias, "send_email", detail, fn))
 
         @mcp.tool(
             description=(
@@ -1199,28 +1485,16 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
 
     def check_info(info: dict) -> list[str]:
         try:
-            return snd.checked_recipients(info["raw_headers"], max_recipients=config.send_max_recipients,
-                                          allowed_domains=config.allowed_recipient_domains)
-        except ValueError as err:
-            raise snd.ActionError(f"not sent: {err}") from None
+            return checked_recipients(config, info)
+        except g.GmailError as err:
+            raise snd.ActionError(str(err)) from None
 
     def summary_html(acct, info: dict, recipients: list[str]) -> str:
-        h = info["headers"]
-        try:
-            values = snd.recipient_values(info["raw_headers"])
-        except ValueError:
-            values = {k: [] for k in snd.RECIPIENT_HEADERS}
-        joined = {k: ", ".join(v for v in vals if v.strip()) for k, vals in values.items()}
-        rows = [("Mailbox", f"{acct.alias} ({acct.email})"), ("From", h.get("from", "")),
-                ("To", joined["to"]), ("Cc", joined["cc"]), ("Bcc", joined["bcc"]),
-                ("Subject", h.get("subject", "")),
-                ("Attachments", ", ".join(info["attachments"]) or "none"),
-                ("Recipients", f"{len(recipients)}: " + ", ".join(recipients))]
+        rows, has_bcc, preview = confirm_summary(acct, info, recipients)
         dl = "".join(f"<dt>{e(k)}</dt><dd>{e(v) or '&mdash;'}</dd>" for k, v in rows)
-        bcc = "<p class='warn'>This email has hidden (Bcc) recipients.</p>" if joined["bcc"] else ""
-        body = info["body"]
-        preview = body[:500] + ("…" if len(body) > 500 else "")
-        return f"<dl>{dl}</dl>{bcc}<p>Message (first 500 characters):</p><pre>{e(preview)}</pre>"
+        bcc = "<p class='warn'>This email has hidden (Bcc) recipients.</p>" if has_bcc else ""
+        return (f"<dl>{dl}</dl>{bcc}<p>Message (first {PREVIEW_CHARS} characters):</p>"
+                f"<pre>{e(preview)}</pre>")
 
     # -- owner re-auth (shared by confirm and policy pages)
 
@@ -1348,34 +1622,23 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
             owner, alias = acct.owner, acct.alias
             if not session_for(request, owner):
                 raise snd.ActionError(f"sign in as {owner} first: open the link again")
-            if acct.send_policy not in ("confirm", "auto"):
-                raise snd.ActionError("sending is now off for this mailbox; nothing was sent")
 
-            def work():
-                svc = make_service(owner, alias)
-                info = g.op_draft_for_send(svc, data["draft_id"])
-                if info["message_id"] != data["message_id"]:
-                    raise snd.ActionError("the draft was edited after this link was created; nothing "
-                                          "was sent. Ask Claude for a new link.")
-                recipients = check_info(info)
-                now = int(time.time())
-                rid = storage.reserve_send(owner, alias, config.send_daily_cap, now)
-                if rid is None:
-                    raise snd.ActionError(f"not sent: this mailbox reached its limit of "
-                                          f"{config.send_daily_cap} sends in 24 hours")
+            def burn(now: int) -> None:
                 # Burn the link before sending: a double click can't send twice.
                 if storage.consume_action_token(payload["n"], owner, alias, snd.PURPOSE_SEND, now) is None:
-                    storage.release_send(rid)
                     raise snd.ActionError("this link was already used or has expired")
                 consumed["done"] = True
-                try:
-                    sent = g.op_send_draft(svc, data["draft_id"])
-                except Exception:
-                    storage.release_send(rid)
-                    raise
-                return sent, len(recipients)
 
-            sent, n = await anyio.to_thread.run_sync(work)
+            def work():
+                return commit_confirmed_send(
+                    config, storage, make_service, owner=owner, alias=alias, email=payload["e"],
+                    draft_id=data["draft_id"], message_id=data["message_id"],
+                    changed_error="the draft was edited after this link was created; nothing "
+                                  "was sent. Ask Claude for a new link.",
+                    before_send=burn,
+                )
+
+            sent, n, policy = await anyio.to_thread.run_sync(work)
         except Exception as err:  # noqa: BLE001
             if owner:
                 write_audit(storage, owner, "send_confirm", alias, f"err={type(err).__name__}", False)
@@ -1384,7 +1647,7 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
             return _page("Not sent", f"{g.map_google_error(err, alias or '')}. This link is now "
                          "used up; ask Claude for a new one.", 502)
         write_audit(storage, owner, "send_confirm", alias,
-                    f"policy={acct.send_policy} recipients={n} message={sent['message_id']}", True)
+                    f"policy={policy} recipients={n} message={sent['message_id']}", True)
         return _page("Sent ✓", "The email was sent. You can close this tab.")
 
     # -- raise a send policy (needs a fresh owner session)
