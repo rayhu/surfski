@@ -32,6 +32,7 @@ from . import sending as snd
 from . import unsubscribe as unsub
 from .audit import install_log_redaction, write_audit
 from .config import Config, ConfigError, load_config
+from .metrics import Metrics, ToolMetricsMiddleware
 from .linking import (
     GMAIL_SCOPES,
     LinkError,
@@ -681,6 +682,7 @@ def create_app(
     token_cache = g.AccessTokenCache()
     send_as_cache = SendAsCache()
     limiter = RateLimiter(config.rate_limit_per_minute)
+    metrics = Metrics()
 
     def service_scopes(owner: str, alias: str) -> list[str]:
         """Scopes asked for when refreshing: gmail.modify only while the operator switch
@@ -721,7 +723,8 @@ def create_app(
     )
     # handy for tests/ops
     mcp.surfski = {"storage": storage, "config": config, "token_cache": token_cache,
-                   "send_as_cache": send_as_cache}
+                   "send_as_cache": send_as_cache, "metrics": metrics}
+    mcp.add_middleware(ToolMetricsMiddleware(mcp, metrics))
     # Sessions of owners no longer allowed (or expired) are useless; drop them.
     # Sessions are only created after Google verified the email; `hd` was recorded then.
     storage.prune_owner_sessions(
@@ -749,6 +752,7 @@ def create_app(
                                 "are not allowed)")
             raise ToolError("this Google account is not allowed to use this server")
         if not limiter.allow(email):
+            metrics.rate_limited()
             raise ToolError("rate limit exceeded; slow down and retry in a minute")
         return email
 
@@ -774,6 +778,8 @@ def create_app(
         try:
             result = await anyio.to_thread.run_sync(work)
         except Exception as e:  # noqa: BLE001
+            if not isinstance(e, g.GmailError):
+                metrics.gmail_error(e)
             if isinstance(e, StorageError):
                 err = g.GmailError(str(e))
             else:
@@ -863,7 +869,9 @@ def create_app(
             sent = g.op_send_draft(svc, draft_id)
         except Exception:
             storage.release_send(rid)
+            metrics.send("auto", "failed")
             raise
+        metrics.send("auto", "sent")
         write_audit(storage, owner, tool, a.alias,
                     f"policy=auto recipients={len(recipients)} message={sent['message_id']}", True)
         return {"status": "sent", "draft_id": draft_id, **sent}
@@ -897,6 +905,7 @@ def create_app(
         write_audit(storage, owner, p["tool"], a.alias,
                     f"policy=confirm recipients={p['recipients']} draft={p['draft_id']} "
                     f"link=issued channel=link reason={reason}", True)
+        metrics.send("confirm", "link_issued")
         return {
             "status": "confirmation_required",
             "draft_id": p["draft_id"],
@@ -927,6 +936,7 @@ def create_app(
                 reason = "elicitation-error" if not isinstance(e, TimeoutError) else "elicitation-timeout"
             else:
                 if answer != "accept":
+                    metrics.send("confirm", "declined")
                     write_audit(storage, owner, tool, alias,
                                 f"policy=confirm draft={draft_id} channel=elicitation result=declined", True)
                     return {**r, "status": "declined", "sent": False, "draft_id": draft_id,
@@ -941,12 +951,16 @@ def create_app(
                                       "confirmation",
                     ))
                 except Exception as e:  # noqa: BLE001
+                    metrics.send("confirm", "failed")
+                    if not isinstance(e, g.GmailError):
+                        metrics.gmail_error(e)
                     err = g.map_google_error(e, alias)
                     if storage.account_exists(owner, alias):
                         write_audit(storage, owner, tool, alias,
                                     f"channel=elicitation result=accepted err={type(e).__name__}", False)
                     raise ToolError(f"{err}. Nothing was sent; draft {draft_id} was kept "
                                     "(see list_drafts).") from None
+                metrics.send(policy, "sent")
                 write_audit(storage, owner, tool, alias,
                             f"policy={policy} recipients={n} message={sent['message_id']} "
                             "channel=elicitation result=accepted", True)
@@ -994,7 +1008,9 @@ def create_app(
                     # Keep the part of the reservation that was really applied (a
                     # thread loop can fail partway); release only the rest.
                     storage.settle_modifications(rid, progress.done)
+                    metrics.triage(progress.done)
                     raise
+                metrics.triage(len(ids))
                 return {"ok": True, "action": tool, kind: len(ids), **(extra if isinstance(extra, dict) else {})}
 
             return await gmail_call(owner, alias, tool, f"{kind}={len(ids)}", fn)
@@ -1473,8 +1489,10 @@ def create_app(
                 ex = att.extract_text(raw, meta["mime_type"], meta["filename"],
                                       charset=meta["charset"], max_chars=max_chars)
             except att.ExtractError as e:
+                metrics.attachment(att.detect_method(meta["mime_type"], meta["filename"]), "error")
                 raise g.GmailError(f"couldn't read '{meta['filename'] or 'attachment'}': {e}") from None
             text, truncated = (None, False) if ex.text is None else g.truncate(ex.text, max_chars)
+            metrics.attachment(ex.method, "ok" if ex.text is not None else "metadata_only")
             out = {"filename": meta["filename"], "mime_type": meta["mime_type"], "size": meta["size"],
                    "part_id": meta["part_id"], "text": text, "truncated": truncated, "method": ex.method}
             if ex.note:
@@ -1917,6 +1935,7 @@ def create_app(
             offered["http_ignored"] = found.http
         method = found.method
         if not confirm:
+            metrics.unsubscribe(method, "preview")
             would = {
                 "one_click": "POST List-Unsubscribe=One-Click to the https URL (RFC 8058)",
                 "mailto": "create a draft to the mailto address, then send it per the send policy",
@@ -1927,26 +1946,32 @@ def create_app(
                     "instructions": "Nothing was changed. Call again with confirm=true only if "
                                     "the user wants to unsubscribe."}
         if method == "none":
+            metrics.unsubscribe(method, "not_available")
             return {"status": "not_available", "method": method, "offered": offered,
                     "instructions": "This message has no List-Unsubscribe header. Nothing was done."}
         if method == "manual":
+            metrics.unsubscribe(method, "manual")
             return {"status": "manual", "method": method, "url": (found.https or found.http)[0],
                     "offered": offered,
                     "instructions": "Not opened: this is a web page that may need a human. Give "
                                     "the user the URL to open themselves."}
         if method == "mailto":
-            return await finish_send(owner, r["result"])
+            res = await finish_send(owner, r["result"])
+            metrics.unsubscribe(method, str(res.get("status", "other")))
+            return res
         try:
             res = await unsub.one_click_post(
                 found.https[0], allowed_ports=config.unsubscribe_allowed_ports,
                 resolve=unsubscribe_resolver, transport=unsubscribe_transport,
             )
         except unsub.UnsubscribeError as e:
+            metrics.unsubscribe(method, "failed")
             write_audit(storage, owner, "unsubscribe", r["alias"],
                         f"message={message_id} method=one_click outcome=failed", False)
             raise ToolError(f"not unsubscribed: {e}. Nothing else was tried.") from None
         write_audit(storage, owner, "unsubscribe", r["alias"],
                     f"message={message_id} method=one_click outcome=ok status={res['status']}", True)
+        metrics.unsubscribe(method, "ok")
         return {"status": "unsubscribed", "method": method, "http_status": res["status"],
                 "instructions": "The sender's server accepted the one-click unsubscribe. Mail "
                                 "already queued may still arrive for a few days."}
@@ -1956,6 +1981,20 @@ def create_app(
     @mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
     async def healthz(request: Request):
         return PlainTextResponse("ok")
+
+    if config.metrics_enabled:
+        expected = f"Bearer {config.metrics_token}".encode()
+
+        @mcp.custom_route("/metrics", methods=["GET"], include_in_schema=False)
+        async def metrics_route(request: Request):
+            auth = request.headers.get("authorization", "")
+            if not auth:
+                return PlainTextResponse("unauthorized\n", 401, headers={"WWW-Authenticate": "Bearer"})
+            if not hmac.compare_digest(auth.encode(), expected):
+                return PlainTextResponse("forbidden\n", 403)
+            mailboxes, owners = await anyio.to_thread.run_sync(storage.admin_counts)
+            return PlainTextResponse(metrics.render(mailboxes, owners),
+                                     media_type="text/plain; version=0.0.4; charset=utf-8")
 
     @mcp.custom_route("/gmail/callback", methods=["GET"], include_in_schema=False)
     async def gmail_callback(request: Request):
@@ -2221,10 +2260,12 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
         except Exception as err:  # noqa: BLE001
             if owner:
                 write_audit(storage, owner, "send_confirm", alias, f"err={type(err).__name__}", False)
+                mcp.surfski["metrics"].send("confirm", "failed")
             if isinstance(err, snd.ActionError) or not consumed["done"]:
                 return error_page("Not sent", err)
             return _page("Not sent", f"{g.map_google_error(err, alias or '')}. This link is now "
                          "used up; ask Claude for a new one.", 502)
+        mcp.surfski["metrics"].send(policy, "sent")
         write_audit(storage, owner, "send_confirm", alias,
                     f"policy={policy} recipients={n} message={sent['message_id']}", True)
         return _page("Sent ✓", "The email was sent. You can close this tab.")

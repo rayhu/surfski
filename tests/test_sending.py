@@ -394,6 +394,7 @@ async def test_auto_send_and_caps(config, storage, boxes, google, accounts, who)
     row = [x for x in storage.audit_rows(ALICE) if x["tool"] == "send_draft"][-1]
     assert row["ok"] == 1
     assert [x["detail"] for x in storage.audit_rows(ALICE)].count("policy=auto recipients=2 message=sent-d1") == 1
+    assert app.surfski["metrics"]._counters["sends"] == {("auto", "sent"): 1}
 
     with pytest.raises(ToolError, match="not allowed by this server: z.com"):
         await call(app, "send_email", alias="work", to="a@x.com, evil@z.com", subject="s", body="b")

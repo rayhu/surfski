@@ -96,6 +96,9 @@ class Config:
     # Opt-in mailbox triage (#8). Off by default: no triage tools, never gmail.modify.
     triage_enabled: bool = False
     triage_daily_cap: int = 1000
+    # Prometheus /metrics (#10). Off by default; when on, a Bearer METRICS_TOKEN is required.
+    metrics_enabled: bool = False
+    metrics_token: str = ""
 
     def is_allowed(self, email: str | None, *, email_verified: Any, hd: str | None) -> bool:
         """The single allowlist check. Allowed if the caller's primary address is listed in
@@ -259,6 +262,15 @@ def load_config(env: dict[str, str] | None = None) -> Config:
     if triage_cap < 1:
         raise ConfigError("TRIAGE_DAILY_CAP must be at least 1")
 
+    metrics_enabled = env.get("METRICS_ENABLED", "false").strip().lower()
+    if metrics_enabled not in ("true", "false", "1", "0", "yes", "no", ""):
+        raise ConfigError("METRICS_ENABLED must be true or false")
+    metrics_on = metrics_enabled in ("true", "1", "yes")
+    metrics_token = env.get("METRICS_TOKEN", "").strip()
+    if metrics_on and len(metrics_token) < 32:
+        raise ConfigError("METRICS_ENABLED=true needs METRICS_TOKEN (at least 32 characters): "
+                          "/metrics is served on the public port and must be protected")
+
     return Config(
         base_url=base_url,
         google_client_id=env["GOOGLE_CLIENT_ID"].strip(),
@@ -289,4 +301,6 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         unsubscribe_allowed_ports=unsub_ports,
         triage_enabled=triage_enabled in ("true", "1", "yes"),
         triage_daily_cap=triage_cap,
+        metrics_enabled=metrics_on,
+        metrics_token=metrics_token,
     )

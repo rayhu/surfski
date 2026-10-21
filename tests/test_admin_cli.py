@@ -381,3 +381,18 @@ async def test_storage_key_old_still_reads(tmp_path):
     # Without the old key the old entry reads as missing (the client must reconnect).
     assert await new_only.get("client-1", collection="clients") is None
     assert isinstance(storage_fernet(old_cfg), Fernet)
+
+
+def test_unexpected_error_is_one_line_exit_1(tmp_path, env, capsys, monkeypatch):
+    seed(tmp_path).close()
+
+    def locked(self):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(Storage, "admin_list_accounts", locked)
+    assert cli.main(["admin", "list"]) == 1
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1 and "OperationalError: database is locked" in err
+    assert "Traceback" not in err
+    with pytest.raises(sqlite3.OperationalError):
+        cli.main(["admin", "--debug", "list"])

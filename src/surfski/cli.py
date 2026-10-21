@@ -30,6 +30,7 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("serve", help="run the MCP server (the default)")
 
     admin = sub.add_parser("admin", help="local administration (no network endpoint)")
+    admin.add_argument("--debug", action="store_true", help="show a traceback on unexpected errors")
     a = admin.add_subparsers(dest="admin_cmd", metavar="COMMAND", required=True)
 
     ls = a.add_parser("list", help="owners and their linked mailboxes (never tokens)")
@@ -100,14 +101,25 @@ def admin(args: argparse.Namespace, *, http_factory=None) -> int:
     from .audit import install_log_redaction
 
     install_log_redaction()
-    config, storage = _open_storage()
-    if storage is None:
-        return EXIT_USAGE
-    http_factory = http_factory or (lambda: httpx.AsyncClient(timeout=15))
+    storage = None
     try:
+        config, storage = _open_storage()
+        if storage is None:
+            return EXIT_USAGE
+        http_factory = http_factory or (lambda: httpx.AsyncClient(timeout=15))
         return _COMMANDS[args.admin_cmd](args, config, storage, http_factory)
+    except Exception as e:  # noqa: BLE001  (e.g. sqlite3.OperationalError: database is locked)
+        if getattr(args, "debug", False):
+            raise
+        from .audit import redact
+
+        msg = redact(" ".join(str(e).split()))[:200]
+        print(f"error: {type(e).__name__}: {msg} (re-run with admin --debug for a traceback)",
+              file=sys.stderr)
+        return EXIT_FAIL
     finally:
-        storage.close()
+        if storage is not None:
+            storage.close()
 
 
 def cmd_list(args, config, storage, http_factory) -> int:
