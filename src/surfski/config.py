@@ -64,8 +64,8 @@ class Config:
     allowed_recipient_domains: frozenset[str] = frozenset()
 
     @property
-    def send_policy_redirect_uri(self) -> str:
-        return f"{self.base_url}/send/policy/callback"
+    def send_auth_redirect_uri(self) -> str:
+        return f"{self.base_url}/send/auth/callback"
 
     @property
     def gmail_redirect_uri(self) -> str:

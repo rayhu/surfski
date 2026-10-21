@@ -868,6 +868,7 @@ def op_draft_for_send(svc, draft_id: str) -> dict:
         "message_id": msg.get("id"),
         "thread_id": msg.get("threadId"),
         "headers": headers_map(payload),
+        "raw_headers": payload.get("headers", []) or [],
         "body": extract_body(payload),
         "attachments": [a["filename"] or a["mime_type"] for a in extract_attachments(payload)],
     }

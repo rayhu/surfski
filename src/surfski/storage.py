@@ -3,8 +3,10 @@ cross-owner read path."""
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -47,6 +49,12 @@ CREATE TABLE IF NOT EXISTS action_tokens (
   exp INTEGER NOT NULL,
   used INTEGER NOT NULL DEFAULT 0,
   data TEXT
+);
+CREATE TABLE IF NOT EXISTS owner_sessions (
+  id_hash TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  exp INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sends (
   owner TEXT NOT NULL,
@@ -408,6 +416,29 @@ class Storage:
                 return None
             cur = c.execute("UPDATE action_tokens SET used = 1 WHERE nonce = ? AND used = 0", (nonce,))
             return row["data"] if cur.rowcount == 1 else None
+
+    def create_owner_session(self, owner: str, ttl: int, now: int) -> str:
+        """New browser session for /send pages. Returns the raw id (cookie value);
+        only its sha256 is stored."""
+        raw = secrets.token_urlsafe(32)
+        with self._tx() as c:
+            c.execute("DELETE FROM owner_sessions WHERE exp < ?", (now,))
+            c.execute(
+                "INSERT INTO owner_sessions (id_hash, owner, created_at, exp) VALUES (?, ?, ?, ?)",
+                (hashlib.sha256(raw.encode()).hexdigest(), owner.lower(), now, now + ttl),
+            )
+        return raw
+
+    def get_owner_session(self, raw: str | None, now: int) -> tuple[str, int] | None:
+        """(owner, created_at) for a live session, else None."""
+        if not raw:
+            return None
+        with self._tx() as c:
+            row = c.execute(
+                "SELECT owner, created_at FROM owner_sessions WHERE id_hash = ? AND exp >= ?",
+                (hashlib.sha256(raw.encode()).hexdigest(), now),
+            ).fetchone()
+        return (row["owner"], row["created_at"]) if row else None
 
     def reserve_send(self, owner: str, alias: str, cap: int, now: int) -> int | None:
         """Atomically count sends in the rolling 24 h and, if under cap, record one.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import logging
+import secrets
 import threading
 import time
 from collections.abc import Callable
@@ -342,10 +343,10 @@ def create_app(
             )
         return a
 
-    def check_caps(recipients: list[str]) -> None:
+    def check_caps(info: dict) -> list[str]:
         try:
-            snd.check_recipients(
-                recipients,
+            return snd.checked_recipients(
+                info["raw_headers"],
                 max_recipients=config.send_max_recipients,
                 allowed_domains=config.allowed_recipient_domains,
             )
@@ -362,8 +363,7 @@ def create_app(
         """Apply the mailbox's send policy to an existing draft."""
         a = require_sending(owner, acct)
         info = g.op_draft_for_send(svc, draft_id)
-        recipients = snd.unique_recipients(info["headers"])
-        check_caps(recipients)
+        recipients = check_caps(info)
         now = int(time.time())
         if a.send_policy == "confirm":
             if storage.sends_today(owner, a.alias, now) >= config.send_daily_cap:
@@ -400,6 +400,16 @@ def create_app(
         write_audit(storage, owner, tool, a.alias,
                     f"policy=auto recipients={len(recipients)} message={sent['message_id']}", True)
         return {"status": "sent", "draft_id": draft_id, **sent}
+
+    def send_kept_draft(owner: str, acct, svc, draft_id: str, tool: str) -> dict:
+        """send_or_confirm for a draft this call just created: if it's refused, say the
+        draft was kept instead of leaving it orphaned silently."""
+        try:
+            return send_or_confirm(owner, acct, svc, draft_id, tool)
+        except g.GmailError as e:
+            raise g.GmailError(
+                f"{e}. Nothing was sent; draft {draft_id} was kept (see list_drafts)."
+            ) from None
 
     # -- account tools
 
@@ -808,7 +818,7 @@ def create_app(
             )
             r["gmail_url"] = g.gmail_drafts_url(acct.email)
             if send:
-                r.update(send_or_confirm(owner, acct, svc, r["draft_id"], "forward_message"))
+                r.update(send_kept_draft(owner, acct, svc, r["draft_id"], "forward_message"))
             return r
 
         detail = f"message={message_id}" + (" from=explicit" if from_address else "")
@@ -928,7 +938,7 @@ def create_app(
                     reply_to_message_id=reply_to_message_id,
                 )
                 r["gmail_url"] = g.gmail_drafts_url(acct.email)
-                r.update(send_or_confirm(owner, acct, svc, r["draft_id"], "send_email"))
+                r.update(send_kept_draft(owner, acct, svc, r["draft_id"], "send_email"))
                 return r
 
             detail = "reply" if reply_to_message_id else "new"
@@ -1032,8 +1042,12 @@ def create_app(
 
 
 def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_service, http_factory) -> None:
-    """/send/confirm and /send/policy*: only registered when SENDING_ENABLED."""
-    confirm_action = f"{config.base_url}/send/confirm"
+    """/send/* pages, only registered when SENDING_ENABLED.
+
+    Every page that shows a draft or changes anything needs an owner session: a
+    cookie set after the owner re-authenticated with Google on /send/auth/callback.
+    A link alone (e.g. leaked by a prompt-injected model) is not enough."""
+    e = html.escape
 
     def load_action(token: str | None, purpose: str):
         payload = snd.verify_action(config.state_secret, token or "", purpose)
@@ -1051,51 +1065,147 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
             raise snd.ActionError("this link was already used or has expired; ask Claude for a new one")
         return payload, acct, data
 
-    def error_page(title: str, e: Exception, status: int = 400) -> HTMLResponse:
-        if isinstance(e, snd.ActionError | g.GmailError):
-            return _page(title, str(e), status)
+    def session_for(request: Request, owner: str, max_age: int | None = None) -> bool:
+        s = storage.get_owner_session(request.cookies.get(snd.SESSION_COOKIE), int(time.time()))
+        if not s or s[0] != owner or owner not in config.allowed_users:
+            return False
+        return max_age is None or time.time() - s[1] <= max_age
+
+    def signin_page(title: str, token: str, owner: str, why: str) -> HTMLResponse:
+        inner = (
+            f"<p>{e(why)}</p><p>Sign in with Google as <b>{e(owner)}</b> to continue.</p>"
+            + _post_form(f"{config.base_url}/send/auth/start", token, "Sign in with Google")
+            + "<p>If you didn't ask for this, close this tab: nothing happens.</p>"
+        )
+        return _html_page(title, inner, 401)
+
+    def error_page(title: str, err: Exception, status: int = 400) -> HTMLResponse:
+        if isinstance(err, snd.ActionError | g.GmailError):
+            return _page(title, str(err), status)
         log.exception("send route failed")
-        return _page(title, str(g.map_google_error(e, "")), 502)
+        return _page(title, str(g.map_google_error(err, "")), 502)
+
+    def check_info(info: dict) -> list[str]:
+        try:
+            return snd.checked_recipients(info["raw_headers"], max_recipients=config.send_max_recipients,
+                                          allowed_domains=config.allowed_recipient_domains)
+        except ValueError as err:
+            raise snd.ActionError(f"not sent: {err}") from None
 
     def summary_html(acct, info: dict, recipients: list[str]) -> str:
         h = info["headers"]
-        e = html.escape
+        try:
+            values = snd.recipient_values(info["raw_headers"])
+        except ValueError:
+            values = {k: [] for k in snd.RECIPIENT_HEADERS}
+        joined = {k: ", ".join(v for v in vals if v.strip()) for k, vals in values.items()}
         rows = [("Mailbox", f"{acct.alias} ({acct.email})"), ("From", h.get("from", "")),
-                ("To", h.get("to", "")), ("Cc", h.get("cc", "")), ("Bcc", h.get("bcc", "")),
+                ("To", joined["to"]), ("Cc", joined["cc"]), ("Bcc", joined["bcc"]),
                 ("Subject", h.get("subject", "")),
                 ("Attachments", ", ".join(info["attachments"]) or "none"),
-                ("Recipients", str(len(recipients)))]
+                ("Recipients", f"{len(recipients)}: " + ", ".join(recipients))]
         dl = "".join(f"<dt>{e(k)}</dt><dd>{e(v) or '&mdash;'}</dd>" for k, v in rows)
-        bcc = "<p class='warn'>This email has hidden (Bcc) recipients.</p>" if h.get("bcc") else ""
+        bcc = "<p class='warn'>This email has hidden (Bcc) recipients.</p>" if joined["bcc"] else ""
         body = info["body"]
         preview = body[:500] + ("…" if len(body) > 500 else "")
         return f"<dl>{dl}</dl>{bcc}<p>Message (first 500 characters):</p><pre>{e(preview)}</pre>"
 
+    # -- owner re-auth (shared by confirm and policy pages)
+
+    @mcp.custom_route("/send/auth/start", methods=["POST"], include_in_schema=False)
+    async def auth_start(request: Request):
+        form = await request.form()
+        token = str(form.get("token") or "")
+        try:
+            try:
+                payload, acct, _ = load_action(token, snd.PURPOSE_SEND)
+                nxt = "/send/confirm?" + urlencode({"token": token})
+            except snd.ActionError:
+                payload, acct, _ = load_action(token, snd.PURPOSE_RAISE)
+                nxt = "/send/policy?" + urlencode({"token": token})
+        except Exception as err:  # noqa: BLE001
+            return error_page("Can't sign in", err)
+        verifier, challenge = snd.new_pkce()
+        oidc_nonce = secrets.token_urlsafe(24)
+        state = snd.issue_action(
+            storage, config.state_secret, owner=acct.owner, alias=acct.alias, email=acct.email,
+            purpose=snd.PURPOSE_AUTH, data={"verifier": verifier, "nonce": oidc_nonce, "next": nxt},
+        )
+        url = snd.reauth_url(
+            client_id=config.google_client_id, redirect_uri=config.send_auth_redirect_uri,
+            state=state, challenge=challenge, login_hint=acct.owner, nonce=oidc_nonce,
+        )
+        return RedirectResponse(url, status_code=303, headers=PAGE_HEADERS)
+
+    @mcp.custom_route("/send/auth/callback", methods=["GET"], include_in_schema=False)
+    async def auth_callback(request: Request):
+        q = request.query_params
+        if q.get("error") or not q.get("code"):
+            return _page("Not signed in", "Google sign-in was cancelled. Nothing changed.", 400)
+        try:
+            payload = snd.verify_action(config.state_secret, q.get("state") or "", snd.PURPOSE_AUTH)
+            owner, alias = payload["o"], payload["a"]
+            auth = snd.token_data(storage.consume_action_token(
+                payload["n"], owner, alias, snd.PURPOSE_AUTH, int(time.time())))
+            if auth is None:
+                raise snd.ActionError("this sign-in was already used or has expired; start again from the link")
+            async with http_factory() as http:
+                email = await snd.reauth_email(
+                    http, client_id=config.google_client_id, client_secret=config.google_client_secret,
+                    redirect_uri=config.send_auth_redirect_uri, code=q["code"],
+                    code_verifier=auth["verifier"], nonce=auth["nonce"],
+                )
+            if email != owner:
+                write_audit(storage, owner, "send_auth", alias, "reauth email mismatch", False)
+                raise snd.ActionError(f"you signed in as {email}, but this needs {owner}. Nothing changed.")
+            if owner not in config.allowed_users:
+                raise snd.ActionError("this Google account is not allowed to use this server")
+        except Exception as err:  # noqa: BLE001
+            return error_page("Not signed in", err)
+        sid = storage.create_owner_session(owner, snd.SESSION_TTL_SECONDS, int(time.time()))
+        write_audit(storage, owner, "send_auth", alias, "session created", True)
+        # No redirect: a SameSite=Strict cookie isn't sent on a redirect chain that
+        # started at Google. The user clicks a same-origin link instead.
+        resp = _html_page("Signed in", f"<p>Signed in as <b>{e(email)}</b>.</p>"
+                          f"<p><a href='{e(auth['next'])}'>Continue</a></p>")
+        resp.set_cookie(
+            snd.SESSION_COOKIE, sid, max_age=snd.SESSION_TTL_SECONDS, path="/send",
+            httponly=True, samesite="strict", secure=not config.is_local,
+        )
+        return resp
+
+    # -- confirm a send
+
     @mcp.custom_route("/send/confirm", methods=["GET"], include_in_schema=False)
     async def send_confirm_page(request: Request):
-        token = request.query_params.get("token")
+        token = request.query_params.get("token") or ""
         try:
             payload, acct, data = load_action(token, snd.PURPOSE_SEND)
             if acct.send_policy == "off":
                 raise snd.ActionError("sending is now off for this mailbox; nothing was sent")
+        except Exception as err:  # noqa: BLE001
+            return error_page("Can't send", err)
+        if not session_for(request, acct.owner):
+            return signin_page("Sign in to review", token, acct.owner,
+                               "An email is waiting for your confirmation.")
+        try:
             info = await anyio.to_thread.run_sync(
                 lambda: g.op_draft_for_send(make_service(acct.owner, acct.alias), data["draft_id"])
             )
-        except Exception as e:  # noqa: BLE001
-            return error_page("Can't send", e)
+        except Exception as err:  # noqa: BLE001
+            return error_page("Can't send", err)
         if info["message_id"] != data["message_id"]:
             return _page("Draft changed", "The draft was edited after this link was created, so "
                          "it wasn't sent. Ask Claude for a new link.", 409)
-        recipients = snd.unique_recipients(info["headers"])
-        inner = summary_html(acct, info, recipients)
         try:
-            snd.check_recipients(recipients, max_recipients=config.send_max_recipients,
-                                 allowed_domains=config.allowed_recipient_domains)
-        except ValueError as e:
-            return _html_page("Can't send", inner + f"<p class='warn'>{html.escape(str(e))}</p>", 400)
-        inner += ("<p>Check every field. Pressing Send sends this email from your Gmail "
-                  "account; it can't be undone.</p>" + _post_form(confirm_action, token or "", "Send")
-                  + "<p>If you didn't ask for this email, just close this tab: nothing is sent.</p>")
+            recipients = check_info(info)
+        except snd.ActionError as err:
+            return _html_page("Can't send", summary_html(acct, info, [])
+                              + f"<p class='warn'>{e(str(err))}</p>", 400)
+        inner = (summary_html(acct, info, recipients)
+                 + "<p>Check every field. Pressing Send sends this email from your Gmail "
+                 "account; it can't be undone.</p>" + _post_form("/send/confirm", token, "Send")
+                 + "<p>If you didn't ask for this email, just close this tab: nothing is sent.</p>")
         return _html_page("Send this email?", inner)
 
     @mcp.custom_route("/send/confirm", methods=["POST"], include_in_schema=False)
@@ -1107,6 +1217,8 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
         try:
             payload, acct, data = load_action(token, snd.PURPOSE_SEND)
             owner, alias = acct.owner, acct.alias
+            if not session_for(request, owner):
+                raise snd.ActionError(f"sign in as {owner} first: open the link again")
             if acct.send_policy not in ("confirm", "auto"):
                 raise snd.ActionError("sending is now off for this mailbox; nothing was sent")
 
@@ -1116,12 +1228,7 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
                 if info["message_id"] != data["message_id"]:
                     raise snd.ActionError("the draft was edited after this link was created; nothing "
                                           "was sent. Ask Claude for a new link.")
-                recipients = snd.unique_recipients(info["headers"])
-                try:
-                    snd.check_recipients(recipients, max_recipients=config.send_max_recipients,
-                                         allowed_domains=config.allowed_recipient_domains)
-                except ValueError as e:
-                    raise snd.ActionError(f"not sent: {e}") from None
+                recipients = check_info(info)
                 now = int(time.time())
                 rid = storage.reserve_send(owner, alias, config.send_daily_cap, now)
                 if rid is None:
@@ -1140,118 +1247,55 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
                 return sent, len(recipients)
 
             sent, n = await anyio.to_thread.run_sync(work)
-        except Exception as e:  # noqa: BLE001
+        except Exception as err:  # noqa: BLE001
             if owner:
-                write_audit(storage, owner, "send_confirm", alias, f"err={type(e).__name__}", False)
-            if isinstance(e, snd.ActionError) or not consumed["done"]:
-                return error_page("Not sent", e)
-            return _page("Not sent", f"{g.map_google_error(e, alias or '')}. This link is now "
+                write_audit(storage, owner, "send_confirm", alias, f"err={type(err).__name__}", False)
+            if isinstance(err, snd.ActionError) or not consumed["done"]:
+                return error_page("Not sent", err)
+            return _page("Not sent", f"{g.map_google_error(err, alias or '')}. This link is now "
                          "used up; ask Claude for a new one.", 502)
         write_audit(storage, owner, "send_confirm", alias,
                     f"policy={acct.send_policy} recipients={n} message={sent['message_id']}", True)
         return _page("Sent ✓", "The email was sent. You can close this tab.")
 
-    # -- raising a send policy: page -> Google re-auth -> POST
+    # -- raise a send policy (needs a fresh owner session)
 
     @mcp.custom_route("/send/policy", methods=["GET"], include_in_schema=False)
     async def policy_page(request: Request):
-        token = request.query_params.get("token")
+        token = request.query_params.get("token") or ""
         try:
             payload, acct, data = load_action(token, snd.PURPOSE_RAISE)
-        except Exception as e:  # noqa: BLE001
-            return error_page("Can't change the send policy", e)
-        e = html.escape
+        except Exception as err:  # noqa: BLE001
+            return error_page("Can't change the send policy", err)
+        what = (f"Claude asked to change the send policy of mailbox {acct.alias} ({acct.email}) "
+                f"from {acct.send_policy} to {data['policy']}.")
+        if not session_for(request, acct.owner, snd.RAISE_SESSION_MAX_AGE):
+            return signin_page("Approve sending?", token, acct.owner,
+                               what + " This needs a fresh Google sign-in.")
         inner = (
-            f"<p>Claude asked to change the send policy of mailbox <b>{e(acct.alias)}</b> "
-            f"({e(acct.email)}) from <b>{e(acct.send_policy)}</b> to <b>{e(data['policy'])}</b>.</p>"
+            f"<p>{e(what)}</p>"
             "<p><b>confirm</b>: Claude can prepare emails, but each one is sent only after you open "
-            "a link and press Send. <b>auto</b>: Claude sends directly (within the server's caps).</p>"
-            f"<p>To approve, sign in with Google as <b>{e(acct.owner)}</b>.</p>"
-            + _post_form(f"{config.base_url}/send/policy/start", token or "", "Sign in with Google")
+            "a link, sign in and press Send. <b>auto</b>: Claude sends directly (within the "
+            "server's caps).</p>" + _post_form("/send/policy", token, "Apply")
             + "<p>If you didn't ask for this, close this tab: nothing changes.</p>"
         )
         return _html_page("Approve sending?", inner)
-
-    @mcp.custom_route("/send/policy/start", methods=["POST"], include_in_schema=False)
-    async def policy_start(request: Request):
-        form = await request.form()
-        token = str(form.get("token") or "")
-        try:
-            payload, acct, data = load_action(token, snd.PURPOSE_RAISE)
-        except Exception as e:  # noqa: BLE001
-            return error_page("Can't change the send policy", e)
-        verifier, challenge = snd.new_pkce()
-        state = snd.issue_action(
-            storage, config.state_secret, owner=acct.owner, alias=acct.alias, email=acct.email,
-            purpose=snd.PURPOSE_AUTH, data={"raise_nonce": payload["n"], "verifier": verifier},
-        )
-        url = snd.policy_auth_url(
-            client_id=config.google_client_id, redirect_uri=config.send_policy_redirect_uri,
-            state=state, challenge=challenge, login_hint=acct.owner,
-        )
-        return RedirectResponse(url, status_code=303, headers=PAGE_HEADERS)
-
-    @mcp.custom_route("/send/policy/callback", methods=["GET"], include_in_schema=False)
-    async def policy_callback(request: Request):
-        q = request.query_params
-        if q.get("error") or not q.get("code"):
-            return _page("Not approved", "Google sign-in was cancelled. Nothing changed.", 400)
-        try:
-            payload = snd.verify_action(config.state_secret, q.get("state") or "", snd.PURPOSE_AUTH)
-            owner, alias = payload["o"], payload["a"]
-            auth = snd.token_data(storage.consume_action_token(
-                payload["n"], owner, alias, snd.PURPOSE_AUTH, int(time.time())))
-            if auth is None:
-                raise snd.ActionError("this sign-in was already used or has expired; open the approval link again")
-            async with http_factory() as http:
-                email = await snd.reauth_email(
-                    http, client_id=config.google_client_id, client_secret=config.google_client_secret,
-                    redirect_uri=config.send_policy_redirect_uri, code=q["code"],
-                    code_verifier=auth["verifier"],
-                )
-            if email != owner:
-                write_audit(storage, owner, "set_send_policy", alias, "reauth email mismatch", False)
-                raise snd.ActionError(f"you signed in as {email}, but only {owner} can approve this. Nothing changed.")
-            # The raise link must still be live; mint a short apply token for the POST.
-            raise_token_data = snd.token_data(storage.peek_action_token(
-                auth["raise_nonce"], owner, alias, snd.PURPOSE_RAISE, int(time.time())))
-            if raise_token_data is None:
-                raise snd.ActionError("the approval link was already used or has expired")
-            acct = storage.get_account(owner, alias)
-            if acct.email != payload["e"]:
-                raise snd.ActionError("this mailbox was relinked; ask Claude for a new link")
-            apply_token = snd.issue_action(
-                storage, config.state_secret, owner=owner, alias=alias, email=acct.email,
-                purpose=snd.PURPOSE_APPLY, data={"raise_nonce": auth["raise_nonce"]},
-                ttl=snd.APPLY_TTL_SECONDS,
-            )
-        except Exception as e:  # noqa: BLE001
-            return error_page("Not approved", e)
-        h = html.escape
-        inner = (
-            f"<p>Signed in as <b>{h(email)}</b>.</p><p>Change the send policy of <b>{h(alias)}</b> "
-            f"({h(acct.email)}) from <b>{h(acct.send_policy)}</b> to "
-            f"<b>{h(raise_token_data['policy'])}</b>?</p>"
-            + _post_form(f"{config.base_url}/send/policy", apply_token, "Apply")
-        )
-        return _html_page("Apply the change?", inner)
 
     @mcp.custom_route("/send/policy", methods=["POST"], include_in_schema=False)
     async def policy_apply(request: Request):
         form = await request.form()
         token = str(form.get("token") or "")
         try:
-            payload, acct, data = load_action(token, snd.PURPOSE_APPLY)
-            now = int(time.time())
-            if storage.consume_action_token(payload["n"], acct.owner, acct.alias, snd.PURPOSE_APPLY, now) is None:
-                raise snd.ActionError("this approval was already used or has expired")
+            payload, acct, data = load_action(token, snd.PURPOSE_RAISE)
+            if not session_for(request, acct.owner, snd.RAISE_SESSION_MAX_AGE):
+                raise snd.ActionError(f"sign in again as {acct.owner} first: open the link again")
             raised = snd.token_data(storage.consume_action_token(
-                data["raise_nonce"], acct.owner, acct.alias, snd.PURPOSE_RAISE, now))
+                payload["n"], acct.owner, acct.alias, snd.PURPOSE_RAISE, int(time.time())))
             if raised is None:
                 raise snd.ActionError("the approval link was already used or has expired")
             storage.set_send_policy(acct.owner, acct.alias, raised["policy"])
-        except Exception as e:  # noqa: BLE001
-            return error_page("Not applied", e)
+        except Exception as err:  # noqa: BLE001
+            return error_page("Not applied", err)
         write_audit(storage, acct.owner, "set_send_policy", acct.alias,
                     f"{acct.send_policy}->{raised['policy']} via=owner-reauth", True)
         return _page("Done ✓", f"Mailbox '{acct.alias}' now has send policy '{raised['policy']}'. "

@@ -11,6 +11,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import time
 from email.utils import getaddresses
@@ -23,13 +24,18 @@ from .linking import AUTH_ENDPOINT, TOKEN_ENDPOINT, pkce_pair
 from .storage import SEND_POLICIES, Storage
 
 ACTION_TTL_SECONDS = 600
-APPLY_TTL_SECONDS = 300
-USERINFO_ENDPOINT = "https://openidconnect.googleapis.com/v1/userinfo"
+SESSION_TTL_SECONDS = 12 * 3600
+SESSION_COOKIE = "surfski_owner"
+# Raising a policy needs a session created this recently (fresh Google sign-in).
+RAISE_SESSION_MAX_AGE = 600
+# The id_token must have been issued this recently.
+ID_TOKEN_MAX_AGE = 300
+TOKENINFO_ENDPOINT = "https://oauth2.googleapis.com/tokeninfo"
+GOOGLE_ISSUERS = ("accounts.google.com", "https://accounts.google.com")
 
 PURPOSE_SEND = "send-confirm"
 PURPOSE_RAISE = "policy-raise"
-PURPOSE_AUTH = "policy-auth"
-PURPOSE_APPLY = "policy-apply"
+PURPOSE_AUTH = "owner-auth"
 
 
 class ActionError(Exception):
@@ -111,13 +117,40 @@ def token_data(raw: str | None) -> dict | None:
 # ---------------------------------------------------------------- caps
 
 
-def unique_recipients(headers: dict[str, str]) -> list[str]:
-    vals = [headers.get(k, "") for k in ("to", "cc", "bcc")]
+RECIPIENT_HEADERS = ("to", "cc", "bcc")
+RESENT_HEADERS = ("resent-to", "resent-cc", "resent-bcc")
+_ADDR_RE = re.compile(r"^[^@\s<>(),;:\\\"\[\]]+@[A-Za-z0-9.-]+\.[A-Za-z0-9-]+$")
+
+
+def recipient_values(raw_headers: list[dict]) -> dict[str, list[str]]:
+    """Every occurrence of To/Cc/Bcc (case-insensitive), not just the first."""
+    out: dict[str, list[str]] = {k: [] for k in RECIPIENT_HEADERS}
+    for h in raw_headers or []:
+        name = (h.get("name") or "").lower()
+        if name in out:
+            out[name].append(h.get("value") or "")
+        elif name in RESENT_HEADERS:
+            raise ValueError(f"the message has a {h.get('name')} header, which isn't allowed")
+    return out
+
+
+def collect_recipients(values: dict[str, list[str]]) -> list[str]:
+    """Unique lowercased addresses over all recipient header occurrences. Raises
+    ValueError if any entry is empty or not a single plain address."""
     seen: list[str] = []
-    for _, addr in getaddresses([v for v in vals if v]):
-        addr = addr.strip().lower()
-        if addr and addr not in seen:
-            seen.append(addr)
+    for vals in values.values():
+        for v in vals:
+            if not v.strip():
+                continue
+            pairs = getaddresses([v])
+            if not pairs:
+                raise ValueError(f"can't parse recipient header value {v!r}")
+            for _, addr in pairs:
+                addr = addr.strip().lower()
+                if not addr or not _ADDR_RE.match(addr):
+                    raise ValueError(f"invalid recipient in {v!r}")
+                if addr not in seen:
+                    seen.append(addr)
     return seen
 
 
@@ -138,10 +171,21 @@ def check_recipients(recipients: list[str], *, max_recipients: int, allowed_doma
             )
 
 
+def checked_recipients(raw_headers: list[dict], *, max_recipients: int, allowed_domains: frozenset[str]) -> list[str]:
+    """All recipients of a message, after every cap check (ValueError on failure)."""
+    recipients = collect_recipients(recipient_values(raw_headers))
+    check_recipients(recipients, max_recipients=max_recipients, allowed_domains=allowed_domains)
+    return recipients
+
+
 # ---------------------------------------------------------------- owner re-auth
 
 
-def policy_auth_url(*, client_id: str, redirect_uri: str, state: str, challenge: str, login_hint: str) -> str:
+def reauth_url(
+    *, client_id: str, redirect_uri: str, state: str, challenge: str, login_hint: str, nonce: str
+) -> str:
+    # Google documents only none/consent/select_account for prompt and returns no
+    # auth_time claim, so prompt=login/max_age can't be used or verified here.
     params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
@@ -150,6 +194,7 @@ def policy_auth_url(*, client_id: str, redirect_uri: str, state: str, challenge:
         "prompt": "select_account",
         "login_hint": login_hint,
         "state": state,
+        "nonce": nonce,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     }
@@ -168,8 +213,12 @@ async def reauth_email(
     redirect_uri: str,
     code: str,
     code_verifier: str,
+    nonce: str,
+    now: float | None = None,
 ) -> str:
-    """Exchange the code (back channel, TLS) and return the verified, lowercased email."""
+    """Exchange the code, verify the id_token with Google's tokeninfo endpoint
+    (signature checked by Google; we check aud, iss, exp, iat, nonce, email_verified
+    and auth_time if present) and return the lowercased email."""
     resp = await http.post(
         TOKEN_ENDPOINT,
         data={
@@ -181,20 +230,33 @@ async def reauth_email(
             "code_verifier": code_verifier,
         },
     )
-    if resp.status_code != 200 or not resp.json().get("access_token"):
-        raise ActionError("Google rejected the sign-in; open the approval link again")
-    access = resp.json()["access_token"]
-    info = await http.get(USERINFO_ENDPOINT, headers={"Authorization": f"Bearer {access}"})
+    tokens = resp.json() if resp.status_code == 200 else {}
+    id_token = tokens.get("id_token")
+    if not id_token:
+        raise ActionError("Google rejected the sign-in; start again from the link")
+    info = await http.get(TOKENINFO_ENDPOINT, params={"id_token": id_token})
     if info.status_code != 200:
-        raise ActionError("could not read your Google identity; try again")
-    data: dict[str, Any] = info.json()
-    email = (data.get("email") or "").strip().lower()
-    verified = data.get("email_verified")
-    if not email or not (verified is True or str(verified).lower() == "true"):
-        raise ActionError("your Google email is not verified")
-    # Best effort: don't keep a token we no longer need.
+        raise ActionError("Google could not verify the sign-in; start again from the link")
+    claims: dict[str, Any] = info.json()
+    now = now or time.time()
     try:
-        await http.post("https://oauth2.googleapis.com/revoke", data={"token": access})
-    except httpx.HTTPError:
-        pass
+        exp, iat = int(claims.get("exp", 0)), int(claims.get("iat", 0))
+    except (TypeError, ValueError):
+        raise ActionError("invalid sign-in token") from None
+    if claims.get("aud") != client_id or claims.get("iss") not in GOOGLE_ISSUERS:
+        raise ActionError("the sign-in token was not issued for this server")
+    if exp < now or now - iat > ID_TOKEN_MAX_AGE:
+        raise ActionError("the sign-in is too old; start again from the link")
+    if not hmac.compare_digest(str(claims.get("nonce", "")), nonce):
+        raise ActionError("the sign-in doesn't match this request; start again from the link")
+    if "auth_time" in claims and now - int(claims["auth_time"]) > ID_TOKEN_MAX_AGE:
+        raise ActionError("please sign in again (your Google sign-in is too old)")
+    email = str(claims.get("email") or "").strip().lower()
+    if not email or str(claims.get("email_verified")).lower() != "true":
+        raise ActionError("your Google email is not verified")
+    if tokens.get("access_token"):
+        try:  # best effort: we only needed the identity
+            await http.post("https://oauth2.googleapis.com/revoke", data={"token": tokens["access_token"]})
+        except httpx.HTTPError:
+            pass
     return email

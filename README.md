@@ -77,7 +77,7 @@ Caddy, nginx or Traefik.
 5. **Clients** → create a **Web application** client with these redirect URIs:
    - `https://<host>/auth/callback`
    - `https://<host>/gmail/callback`
-   - `https://<host>/send/policy/callback` (only needed if you set `SENDING_ENABLED=true`)
+   - `https://<host>/send/auth/callback` (only needed if you set `SENDING_ENABLED=true`)
 6. If you use Google Workspace, the admin should go to Admin console → Security → API controls →
    Manage third-party app access, add the app by client ID and mark it **Trusted**. Otherwise
    Workspace policy may block mailbox linking.
@@ -231,16 +231,24 @@ that tells Claude to forward something to an attacker):
 
 - **Operator switch:** without `SENDING_ENABLED=true` the send tools and `/send/*` routes don't exist.
 - **Per-mailbox policy**, shown by `list_accounts`: `off` (default), `confirm` (Claude prepares the
-  draft and returns a one-time link; nothing is sent until you open it, review From/To/Cc/**Bcc**,
-  subject, attachments and the start of the body, and press **Send**), or `auto` (sent directly,
-  within the caps). MCP clients still ask you to approve each send tool call.
+  draft and returns a one-time link; nothing is sent until you open it, sign in, review
+  From/To/Cc/**Bcc**, subject, attachments and the start of the body, and press **Send**), or `auto`
+  (sent directly, within the caps). MCP clients still ask you to approve each send tool call.
+- **Owner sign-in on every confirm and approval page.** Opening a link shows nothing about the
+  email until you sign in with Google as the mailbox owner (`/send/auth/callback`, which you must
+  register on your OAuth client). That sets a session cookie for `/send` pages only (HttpOnly,
+  SameSite=Strict, Secure on https, 12 h, stored server-side). Send and Apply require that session
+  for the same owner as the link, so **a leaked link alone can't send**.
 - **Claude can't raise a policy.** `set_send_policy` lowers it immediately but, to raise it, returns
-  a link where you must sign in with Google again as the owner and press **Apply**. Register
-  `https://<host>/send/policy/callback` on your OAuth client for this.
+  a link that needs a Google sign-in from the last 10 minutes as the owner, then an **Apply** click.
 - **Links** are HMAC-signed (key derived from `STATE_SECRET`, separate from linking), single-use,
   expire in 10 minutes, and are bound to the owner, alias, mailbox address and the exact draft
-  version: if the draft changes after the link was made, it won't send. Opening a link (GET) never
+  version: if the draft changes after the link was made, it won't send. Opening a page (GET) never
   sends or changes anything; pages can't be framed and don't leak the link via Referer.
+- **What this does not stop:** an AI agent that can drive *your own* signed-in browser could open a
+  link and press Send while your session is valid (and Google re-auth may be a single click if
+  you're already signed in to Google). Keep `confirm` for mailboxes where that matters and don't give
+  browser-control tools to the same agent. Confirming inside the MCP client (elicitation) is planned.
 - **Caps** apply in `confirm` (re-checked when you press Send) and `auto`: daily sends per mailbox,
   recipients per message, optional recipient-domain allowlist.
 - **Audit:** each send records alias, policy, recipient count and Gmail message id, never addresses

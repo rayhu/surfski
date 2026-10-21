@@ -89,25 +89,51 @@ class Mailbox:
 
 
 class Google:
-    """Mock for Google's token + userinfo endpoints used by the policy re-auth."""
+    """Mock for Google's token + tokeninfo endpoints used by the owner re-auth."""
+
+    CLIENT_ID = "cid.apps.googleusercontent.com"
 
     def __init__(self):
         self.email = ALICE
-        self.verified = True
+        self.claims_override: dict = {}
+        self.nonce = None
         self.token_forms: list[dict] = []
+        self.tokeninfo_calls = 0
+
+    def claims(self):
+        now = int(time.time())
+        c = {"aud": self.CLIENT_ID, "iss": "https://accounts.google.com", "exp": str(now + 3600),
+             "iat": str(now), "email": self.email, "email_verified": "true", "nonce": self.nonce,
+             "sub": "123"}
+        c.update(self.claims_override)
+        return {k: v for k, v in c.items() if v is not None}
 
     def handler(self, req: httpx.Request):
         if req.url.path == "/token":
             self.token_forms.append(parse_qs(req.content.decode()))
-            return httpx.Response(200, json={"access_token": "at", "expires_in": 60, "id_token": "x"})
-        if req.url.path == "/v1/userinfo":
-            return httpx.Response(200, json={"email": self.email, "email_verified": self.verified})
+            return httpx.Response(200, json={"access_token": "at", "expires_in": 60, "id_token": "idt"})
+        if req.url.path == "/tokeninfo":
+            self.tokeninfo_calls += 1
+            assert req.url.params["id_token"] == "idt"
+            return httpx.Response(200, json=self.claims())
         if req.url.path == "/revoke":
             return httpx.Response(200)
         return httpx.Response(404)
 
     def factory(self):
         return httpx.AsyncClient(transport=httpx.MockTransport(self.handler))
+
+
+def sign_in(client, google, token, *, expect_ok=True):
+    """Run the owner re-auth for a confirm/raise token. Returns the callback response."""
+    resp = client.post("/send/auth/start", data={"token": token})
+    assert resp.status_code == 303, resp.text
+    q = parse_qs(urlparse(resp.headers["location"]).query)
+    google.nonce = google.nonce if google.claims_override.get("nonce") else q["nonce"][0]
+    resp = client.get("/send/auth/callback", params={"code": "c", "state": q["state"][0]})
+    if expect_ok:
+        assert resp.status_code == 200 and "Signed in as" in resp.text, resp.text
+    return resp
 
 
 @pytest.fixture
@@ -202,7 +228,7 @@ async def test_off_blocks_every_send_path(app, who, boxes, storage):
 # ---------------------------------------------------------------- confirm
 
 
-async def test_confirm_flow_sends_only_on_post(app, who, boxes, storage):
+async def test_confirm_flow_sends_only_on_post(app, who, boxes, storage, google):
     storage.set_send_policy(ALICE, "work", "confirm")
     box = boxes["alice@work.com"]
     box.drafts["d1"] = draft("d1", bcc="hidden@y.com")
@@ -212,7 +238,22 @@ async def test_confirm_flow_sends_only_on_post(app, who, boxes, storage):
     assert total_sent(boxes) == 0
 
     client = web(app)
-    page = client.get(urlparse(r["confirm_url"]).path + "?" + urlparse(r["confirm_url"]).query)
+    path = urlparse(r["confirm_url"]).path + "?" + urlparse(r["confirm_url"]).query
+    token = token_of(r["confirm_url"])
+    # Without an owner session the link reveals nothing and can't send.
+    page = client.get(path)
+    assert page.status_code == 401 and "Sign in with Google" in page.text
+    for secret in ("hidden@y.com", "a@x.com", "Quarterly", "Hello team"):
+        assert secret not in page.text
+    assert client.post("/send/confirm", data={"token": token}).status_code == 400
+    assert total_sent(boxes) == 0
+    cb = sign_in(client, google, token)
+    cookie = cb.headers["set-cookie"].lower()
+    for attr in ("httponly", "samesite=strict", "path=/send", "max-age=43200"):
+        assert attr in cookie, attr
+    assert "secure" not in cookie  # localhost
+    assert "location" not in cb.headers and "Continue" in cb.text  # no redirect (SameSite=Strict)
+    page = client.get(path)
     assert page.status_code == 200 and total_sent(boxes) == 0  # GET never sends
     assert "Quarterly &lt;script&gt;alert(1)&lt;/script&gt;" in page.text and "<script>" not in page.text
     assert "hidden@y.com" in page.text and "hidden (Bcc) recipients" in page.text
@@ -223,7 +264,6 @@ async def test_confirm_flow_sends_only_on_post(app, who, boxes, storage):
     assert page.headers["cache-control"] == "no-store"
     assert client.get(urlparse(r["confirm_url"]).path + "?" + urlparse(r["confirm_url"]).query).status_code == 200
 
-    token = token_of(r["confirm_url"])
     resp = client.post("/send/confirm", data={"token": token})
     assert resp.status_code == 200 and "Sent" in resp.text
     assert box.sent == [{"userId": "me", "body": {"id": "d1"}}]
@@ -280,7 +320,7 @@ async def test_confirm_token_tamper_and_purpose(app, who, boxes, storage, config
     assert total_sent(boxes) == 0
 
 
-async def test_confirm_bound_to_draft_content(app, who, boxes, storage):
+async def test_confirm_bound_to_draft_content(app, who, boxes, storage, google):
     storage.set_send_policy(ALICE, "work", "confirm")
     r = await call(app, "send_draft", alias="work", draft_id="d1")
     token = token_of(r["confirm_url"])
@@ -289,16 +329,19 @@ async def test_confirm_bound_to_draft_content(app, who, boxes, storage):
     box.drafts["d1"] = draft("d1", to="evil@z.com")
     box.drafts["d1"]["message"]["id"] = "msg-d1-v2"
     client = web(app)
+    sign_in(client, google, token)
     assert client.get(f"/send/confirm?token={token}").status_code == 409
     resp = client.post("/send/confirm", data={"token": token})
     assert "edited after this link was created" in resp.text and box.sent == []
 
 
-async def test_confirm_rechecks_policy_at_post(app, who, boxes, storage):
+async def test_confirm_rechecks_policy_at_post(app, who, boxes, storage, google):
     storage.set_send_policy(ALICE, "work", "confirm")
     r = await call(app, "send_draft", alias="work", draft_id="d1")
+    client = web(app)
+    sign_in(client, google, token_of(r["confirm_url"]))
     await call(app, "set_send_policy", alias="work", policy="off")  # lowering applies at once
-    resp = web(app).post("/send/confirm", data={"token": token_of(r["confirm_url"])})
+    resp = client.post("/send/confirm", data={"token": token_of(r["confirm_url"])})
     assert resp.status_code == 400 and "sending is now off" in resp.text
     assert total_sent(boxes) == 0
 
@@ -330,6 +373,7 @@ async def test_confirm_caps(config, storage, boxes, google, accounts, who):
     r = await call(app, "send_draft", alias="work", draft_id="d1")
     storage.reserve_send(ALICE, "work", 1, int(time.time()))  # cap used up meanwhile
     client = web(app)
+    sign_in(client, google, token_of(r["confirm_url"]))
     resp = client.post("/send/confirm", data={"token": token_of(r["confirm_url"])})
     assert "limit of 1 sends" in resp.text and box.sent == []
     with pytest.raises(ToolError, match="limit of 1 sends"):
@@ -388,60 +432,110 @@ async def test_raise_requires_owner_reauth(app, who, boxes, storage, google):
     assert r["status"] == "owner_approval_required" and r["ok"] is False
     assert storage.get_account(ALICE, "work").send_policy == "off"
     url = urlparse(r["approve_url"])
+    token = token_of(r["approve_url"])
     client = web(app)
 
     page = client.get(f"{url.path}?{url.query}")
-    assert page.status_code == 200 and "from <b>off</b> to <b>confirm</b>" in page.text
-    assert storage.get_account(ALICE, "work").send_policy == "off"  # GET changes nothing
-
-    # The apply endpoint with the raise token (or nothing) does nothing.
-    token = token_of(r["approve_url"])
-    assert client.post("/send/policy", data={"token": token}).status_code == 400
+    assert page.status_code == 401 and "Sign in with Google" in page.text
+    assert client.post("/send/policy", data={"token": token}).status_code == 400  # no session
     assert client.post("/send/policy", data={}).status_code == 400
     assert storage.get_account(ALICE, "work").send_policy == "off"
 
-    def start():
-        resp = client.post("/send/policy/start", data={"token": token})
-        assert resp.status_code == 303
-        loc = urlparse(resp.headers["location"])
-        q = parse_qs(loc.query)
-        assert loc.netloc == "accounts.google.com"
-        assert q["prompt"] == ["select_account"] and q["scope"] == ["openid email"]
-        assert q["login_hint"] == [ALICE] and q["code_challenge_method"] == ["S256"]
-        assert q["redirect_uri"] == ["http://localhost:8000/send/policy/callback"]
-        assert "access_type" not in q
-        return q["state"][0]
+    resp = client.post("/send/auth/start", data={"token": token})
+    loc = urlparse(resp.headers["location"])
+    q = parse_qs(loc.query)
+    assert resp.status_code == 303 and loc.netloc == "accounts.google.com"
+    assert q["prompt"] == ["select_account"] and q["scope"] == ["openid email"]
+    assert q["login_hint"] == [ALICE] and q["code_challenge_method"] == ["S256"] and q["nonce"][0]
+    assert q["redirect_uri"] == ["http://localhost:8000/send/auth/callback"]
+    assert "access_type" not in q
 
-    # Wrong Google account: refused.
+    # Wrong Google account: no session, nothing changes.
     google.email = BOB
-    resp = client.get("/send/policy/callback", params={"code": "c1", "state": start()})
-    assert resp.status_code == 400 and "only alice@example.com can approve" in resp.text
-    assert storage.get_account(ALICE, "work").send_policy == "off"
+    resp = sign_in(client, google, token, expect_ok=False)
+    assert resp.status_code == 400 and "this needs alice@example.com" in resp.text
+    assert "set-cookie" not in resp.headers
+    assert client.get(f"{url.path}?{url.query}").status_code == 401
 
-    # Unverified email: refused.
-    google.email, google.verified = ALICE, False
-    resp = client.get("/send/policy/callback", params={"code": "c2", "state": start()})
-    assert "not verified" in resp.text
-
-    # Right account: the callback only renders a POST form.
-    google.verified = True
-    state = start()
-    resp = client.get("/send/policy/callback", params={"code": "c3", "state": state})
-    assert resp.status_code == 200 and "Apply" in resp.text
-    assert google.token_forms[-1]["code_verifier"][0] and google.token_forms[-1]["code"] == ["c3"]
-    assert storage.get_account(ALICE, "work").send_policy == "off"
-    # The OAuth state is single-use.
-    assert client.get("/send/policy/callback", params={"code": "c4", "state": state}).status_code == 400
-
-    apply_token = resp.text.split("name='token' value='")[1].split("'")[0]
-    resp = client.post("/send/policy", data={"token": apply_token})
+    google.email = ALICE
+    sign_in(client, google, token)
+    page = client.get(f"{url.path}?{url.query}")
+    assert page.status_code == 200 and "from off to confirm" in page.text and "Apply" in page.text
+    assert storage.get_account(ALICE, "work").send_policy == "off"  # GET changes nothing
+    resp = client.post("/send/policy", data={"token": token})
     assert resp.status_code == 200 and "now has send policy &#x27;confirm&#x27;" in resp.text
     assert storage.get_account(ALICE, "work").send_policy == "confirm"
-    # Replays fail.
-    assert client.post("/send/policy", data={"token": apply_token}).status_code == 400
-    assert client.get(f"{url.path}?{url.query}").status_code == 400
-    rows = [x["detail"] for x in storage.audit_rows(ALICE) if x["tool"] == "set_send_policy"]
+    assert client.post("/send/policy", data={"token": token}).status_code == 400  # single use
+    rows = [x["detail"] for x in storage.audit_rows(ALICE) if x["tool"] in ("set_send_policy", "send_auth")]
     assert "off->confirm via=owner-reauth" in rows and "reauth email mismatch" in rows
+
+
+async def test_raise_needs_fresh_session(app, who, storage, google, monkeypatch):
+    r = await call(app, "set_send_policy", alias="work", policy="auto")
+    token = token_of(r["approve_url"])
+    client = web(app)
+    sign_in(client, google, token)
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 601)  # session still valid, but not fresh
+    assert client.get(f"/send/policy?token={token}").status_code == 400  # raise link expired too
+    monkeypatch.setattr(time, "time", real)
+    r = await call(app, "set_send_policy", alias="work", policy="auto")
+    token2 = token_of(r["approve_url"])
+    # Age the session in the DB instead of the clock.
+    storage._conn.execute("UPDATE owner_sessions SET created_at = created_at - 3600")
+    storage._conn.commit()
+    assert client.get(f"/send/policy?token={token2}").status_code == 401
+    assert client.post("/send/policy", data={"token": token2}).status_code == 400
+    assert storage.get_account(ALICE, "work").send_policy == "off"
+
+
+async def test_confirm_session_must_match_owner_and_be_live(app, who, boxes, storage, google):
+    storage.set_send_policy(ALICE, "work", "confirm")
+    storage.set_send_policy(BOB, "secret", "confirm")
+    a = await call(app, "send_draft", alias="work", draft_id="d1")
+    who["claims"] = {"email": BOB}
+    b = await call(app, "send_draft", alias="secret", draft_id="d1")
+    client = web(app)
+    google.email = BOB
+    sign_in(client, google, token_of(b["confirm_url"]))  # Bob has a session...
+    resp = client.post("/send/confirm", data={"token": token_of(a["confirm_url"])})
+    assert resp.status_code == 400 and "sign in as alice@example.com" in resp.text  # ...not Alice's
+    assert client.get(f"/send/confirm?token={token_of(a['confirm_url'])}").status_code == 401
+    # Expired session.
+    storage._conn.execute("UPDATE owner_sessions SET exp = 0")
+    storage._conn.commit()
+    resp = client.post("/send/confirm", data={"token": token_of(b["confirm_url"])})
+    assert resp.status_code == 400 and total_sent(boxes) == 0
+    # A forged cookie.
+    client.cookies.set("surfski_owner", "forged", path="/send")
+    assert client.post("/send/confirm", data={"token": token_of(b["confirm_url"])}).status_code == 400
+    assert total_sent(boxes) == 0
+
+
+async def test_secure_cookie_off_localhost(config, storage, boxes, google, accounts, who):
+    app = make_app(config, storage, boxes, google, base_url="https://mcp.example.com")
+    storage.set_send_policy(ALICE, "work", "confirm")
+    r = await call(app, "send_draft", alias="work", draft_id="d1")
+    cb = sign_in(web(app), google, token_of(r["confirm_url"]))
+    assert "secure" in cb.headers["set-cookie"].lower()
+
+
+@pytest.mark.parametrize("override,msg", [
+    ({"aud": "someone-else"}, "not issued for this server"),
+    ({"iss": "https://evil.example"}, "not issued for this server"),
+    ({"exp": "1"}, "too old"),
+    ({"iat": "1"}, "too old"),
+    ({"nonce": "wrong"}, "match this request"),
+    ({"email_verified": "false"}, "not verified"),
+    ({"auth_time": "1"}, "sign in again"),
+])
+async def test_id_token_checks(app, who, storage, google, override, msg):
+    storage.set_send_policy(ALICE, "work", "confirm")
+    r = await call(app, "send_draft", alias="work", draft_id="d1")
+    google.claims_override = override
+    resp = sign_in(web(app), google, token_of(r["confirm_url"]), expect_ok=False)
+    assert resp.status_code == 400 and msg in resp.text
+    assert "set-cookie" not in resp.headers
 
 
 async def test_policy_lowering_and_validation(app, who, storage):
@@ -490,7 +584,7 @@ def test_action_token_unit(config):
         snd.verify_action(b"another-secret-of-sufficient-length!!", tok, "x", now=9)
 
 
-async def test_confirm_post_errors_say_whether_link_was_used(app, who, boxes, storage):
+async def test_confirm_post_errors_say_whether_link_was_used(app, who, boxes, storage, google):
     from googleapiclient.errors import HttpError
     import httplib2
     storage.set_send_policy(ALICE, "work", "confirm")
@@ -498,6 +592,7 @@ async def test_confirm_post_errors_say_whether_link_was_used(app, who, boxes, st
     r = await call(app, "send_draft", alias="work", draft_id="d1")
     token = token_of(r["confirm_url"])
     client = web(app)
+    sign_in(client, google, token)
 
     real_send = box.send
     def failing_send(**kw):
@@ -517,6 +612,63 @@ async def test_confirm_post_errors_say_whether_link_was_used(app, who, boxes, st
     def get_404(**kw):
         raise HttpError(httplib2.Response({"status": 404}), b"")
     box.get = get_404
-    resp = web(app).post("/send/confirm", data={"token": token_of(r["confirm_url"])})
+    resp = client.post("/send/confirm", data={"token": token_of(r["confirm_url"])})
     assert "not found" in resp.text and "used up" not in resp.text
     box.get = original_get
+
+
+def with_headers(d, *extra):
+    d["message"]["payload"]["headers"] += [{"name": n, "value": v} for n, v in extra]
+    return d
+
+
+async def test_repeated_recipient_headers_are_all_counted(config, storage, boxes, google, accounts, who):
+    app = make_app(config, storage, boxes, google, allowed_recipient_domains=frozenset({"x.com"}))
+    storage.set_send_policy(ALICE, "work", "auto")
+    box = boxes["alice@work.com"]
+    box.drafts["rep"] = with_headers(draft("rep", cc=""), ("to", ", ".join(f"u{i}@x.com" for i in range(10))))
+    with pytest.raises(ToolError, match="11 recipients"):
+        await call(app, "send_draft", alias="work", draft_id="rep")
+    box.drafts["dom"] = with_headers(draft("dom", cc=""), ("TO", "evil@z.com"))
+    with pytest.raises(ToolError, match="not allowed by this server: z.com"):
+        await call(app, "send_draft", alias="work", draft_id="dom")
+    box.drafts["bcc2"] = with_headers(draft("bcc2", cc="", bcc="b1@x.com"), ("Bcc", "evil@z.com"))
+    with pytest.raises(ToolError, match="z.com"):
+        await call(app, "send_draft", alias="work", draft_id="bcc2")
+    box.drafts["bad"] = with_headers(draft("bad", cc=""), ("Cc", "not-an-address"))
+    with pytest.raises(ToolError, match="invalid recipient"):
+        await call(app, "send_draft", alias="work", draft_id="bad")
+    box.drafts["resent"] = with_headers(draft("resent", cc=""), ("Resent-To", "evil@x.com"))
+    with pytest.raises(ToolError, match="Resent-To header"):
+        await call(app, "send_draft", alias="work", draft_id="resent")
+    assert box.sent == []
+
+
+async def test_confirm_page_shows_every_recipient_header(app, who, boxes, storage, google):
+    storage.set_send_policy(ALICE, "work", "confirm")
+    box = boxes["alice@work.com"]
+    box.drafts["rep"] = with_headers(draft("rep", bcc="b1@x.com"), ("To", "second@x.com"), ("bcc", "b2@y.com"))
+    r = await call(app, "send_draft", alias="work", draft_id="rep")
+    client = web(app)
+    sign_in(client, google, token_of(r["confirm_url"]))
+    page = client.get(f"/send/confirm?token={token_of(r['confirm_url'])}").text
+    for addr in ("a@x.com", "second@x.com", "b@x.com", "b1@x.com", "b2@y.com"):
+        assert addr in page
+    assert "Recipients</dt><dd>5:" in page
+    # A repeated header added after issuance would change the message id anyway; and a
+    # draft that breaks the caps is refused at POST even with a session.
+    box.drafts["rep"] = with_headers(draft("rep"), *[("To", f"u{i}@x.com") for i in range(10)])
+    resp = client.post("/send/confirm", data={"token": token_of(r["confirm_url"])})
+    assert resp.status_code == 400 and box.sent == []
+
+
+async def test_refused_send_reports_kept_draft(config, storage, boxes, google, accounts, who):
+    app = make_app(config, storage, boxes, google, allowed_recipient_domains=frozenset({"x.com"}))
+    storage.set_send_policy(ALICE, "work", "auto")
+    box = boxes["alice@work.com"]
+    with pytest.raises(ToolError, match=r"Nothing was sent; draft new1 was kept \(see list_drafts\)"):
+        await call(app, "send_email", alias="work", to="evil@z.com", subject="s", body="b")
+    assert "new1" in box.drafts and box.sent == []
+    with pytest.raises(ToolError, match="draft new2 was kept"):
+        await call(app, "forward_message", alias="work", message_id="m1", to="evil@z.com", send=True)
+    assert "new2" in box.drafts and box.sent == []

@@ -64,7 +64,7 @@ def test_sending_settings(tmp_path):
                              ALLOWED_RECIPIENT_DOMAINS=" Example.com, @corp.org ,"))
     assert c.sending_enabled is True and c.send_daily_cap == 5 and c.send_max_recipients == 3
     assert c.allowed_recipient_domains == {"example.com", "corp.org"}
-    assert c.send_policy_redirect_uri == "http://localhost:8000/send/policy/callback"
+    assert c.send_auth_redirect_uri == "http://localhost:8000/send/auth/callback"
     for bad in ({"SENDING_ENABLED": "maybe"}, {"SEND_DAILY_CAP": "x"}, {"SEND_MAX_RECIPIENTS": "0"}):
         with pytest.raises(ConfigError):
             load_config(make_env(tmp_path, **bad))
