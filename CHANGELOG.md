@@ -58,7 +58,6 @@ mailboxes per user, with per-user isolation.
   completed by a middleware without re-running the tool, with a single-use continuation bound to the
   owner, the tool and its exact arguments, then the shared recheck. Decline keeps the draft; a
   malformed answer gets the link; nothing is ever sent without an explicit `true`.
-
 - **Calendar module** (#19), behind `FEATURES=mail,calendar`: `enable_calendar` / `disable_calendar`
   (per-mailbox Google re-consent adding `calendar.readonly` + `calendar.events`), `list_calendars`,
   `list_events`, `get_event`, cross-account `find_free_time` (merged free/busy, working hours, DST-safe),
@@ -69,7 +68,6 @@ mailboxes per user, with per-user isolation.
   `CALENDAR_INVITE_DAILY_CAP`, cancellations included). Patches and deletes send `If-Match`; `delete_event`
   emails nobody by default. Times are ISO 8601 with offsets plus the calendar's IANA zone; naive inputs
   are rejected, and free/busy arithmetic is done in UTC so DST days have their real length.
-
 - Versioned releases: `surfski --version`, the version in the MCP server info and in
   `surfski_build_info`, this changelog, a release workflow that checks the tag against
   `pyproject.toml` and publishes a GitHub Release from the changelog, and `RELEASING.md` (#11).
@@ -82,37 +80,32 @@ mailboxes per user, with per-user isolation.
   memory. Logs never contain tokens, auth codes, message bodies or email addresses; audit-row details never contain them either (the audit `owner` column is the caller's own email, and is replaced in pseudonymize mode).
 - Fail-closed configuration: the server refuses to start with missing or malformed secrets or an
   empty allowlist; public mail providers can't be allowlisted as domains.
-- Write features (sending, triage) are off by default and need both an operator switch and a
-  per-mailbox opt-in confirmed by the owner outside the conversation.
+- Write features (sending, triage, calendar writes) are off by default: sending and triage need
+  an operator switch plus a per-mailbox opt-in confirmed by the owner outside the conversation;
+  calendar needs `FEATURES` to include it and per-mailbox consent, and its writes default to the
+  `draft` policy (confirm before writing).
 - The unsubscribe POST is SSRF-hardened (https, public addresses only, pinned connection, redirect
   and size limits).
 - Hardened container: non-root uid 10001, read-only root filesystem, `cap_drop: ALL`,
   `no-new-privileges`, published on `127.0.0.1` only.
-- Follow-ups from the #33 review: send continuations are only resumable when `SENDING_ENABLED` is on,
-  and Landlock path rules the extraction worker couldn't add are logged as a warning (they can make
-  extraction fail) instead of at debug.
-
-- `EXTRACT_SANDBOX_STRICT=true` now requires the `full` sandbox level (Landlock filesystem confinement
-  and a kernel network block), not filesystem confinement alone. The worker counts Landlock path rules
-  it couldn't add, and the startup probe logs the count (#33 review of #43).
-
-- The attachment extraction worker confines itself with Landlock before parsing: read-only access to
-  the Python installation and system libraries only, so a parser exploit can't read `DATA_DIR` (the
-  SQLite database, the OAuth store) or write anywhere, and no TCP with Landlock ABI 4+. A seccomp
-  filter blocks `socket()`, `io_uring_setup()` and path `truncate()`. The protection level is logged at
-  startup and exported as `surfski_extract_sandbox_info`; `EXTRACT_SANDBOX_STRICT=true` refuses to read
-  attachments when Landlock is unavailable. CI verifies it in the hardened container (#43).
-- README: pending confirmation links stay valid during a token key rotation while the old key is set (#19).
-
-- Confirmation-link data in `action_tokens` (draft ids, PKCE verifiers, proposed calendar events) is
-  encrypted with the owner's token key and erased as soon as the link is used or expires (#19).
-
 - Attachment text extraction runs in a short-lived subprocess with a wall-clock timeout and rlimits
-  (address space, CPU, no file writes, no new processes, few open files) and at most 2 at a time;
+  (address space, CPU, no file writes, no new processes, few open files), at most 2 at a time;
   timeouts, OOM and crashes become a clean tool error. Its environment carries no secrets, its
   output is size-capped and type-checked, and the server is non-dumpable on Linux so a worker can't
-  read the server's environment or memory. Configure with `EXTRACT_SANDBOX`,
-  `EXTRACT_TIMEOUT_S` and `EXTRACT_MEMORY_MB` (#30).
+  read the server's environment or memory. Configure with `EXTRACT_SANDBOX`, `EXTRACT_TIMEOUT_S`
+  and `EXTRACT_MEMORY_MB` (#30).
+- The extraction worker confines itself with Landlock before parsing: read-only access to the
+  Python installation and system libraries only, so a parser exploit can't read `DATA_DIR` (the
+  SQLite database, the OAuth store) or write anywhere, and no TCP with Landlock ABI 4+. A seccomp
+  filter blocks `socket()`, `io_uring_setup()` and path `truncate()`. The protection level is logged
+  at startup (including any Landlock path rules that couldn't be added, as a warning) and exported as
+  `surfski_extract_sandbox_info`. `EXTRACT_SANDBOX_STRICT=true` refuses to read attachments below
+  the `full` level (Landlock filesystem confinement plus a kernel network block). CI verifies it in
+  the hardened container (#43).
+- Confirmation-link data in `action_tokens` (draft ids, PKCE verifiers, proposed calendar events) is
+  encrypted with the owner's token key and erased as soon as the link is used or expires; pending
+  links stay valid during a token key rotation while the old key is set (#19).
+- Send continuations are only resumable when `SENDING_ENABLED` is on (#33).
 - The Docker actions in the CI and release workflows are pinned to full commit SHAs (#30).
 - Log redaction also hides `Authorization: …` headers and `Bearer <token>` values (#11).
 
