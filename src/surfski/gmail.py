@@ -952,3 +952,29 @@ def op_delete_draft(svc, draft_id: str) -> dict:
 
 def gmail_drafts_url(email: str) -> str:
     return f"https://mail.google.com/mail/u/{parseaddr(email)[1] or email}/#drafts"
+
+
+def op_contact_messages(svc, query: str, max_threads: int, max_messages: int,
+                        headers: list[str]) -> dict:
+    """Header metadata of recent messages matching `query` (#18): at most `max_threads`
+    threads.get calls and `max_messages` messages. Returns {"messages": [...],
+    "threads": n} with each message as {"headers", "internal_date", "sent"}."""
+    users = svc.users()
+    resp = users.threads().list(userId="me", q=query, maxResults=max_threads).execute()
+    out: list[dict] = []
+    fetched = 0
+    for t in (resp.get("threads", []) or [])[:max_threads]:
+        if len(out) >= max_messages:
+            break
+        full = users.threads().get(userId="me", id=t["id"], format="metadata",
+                                   metadataHeaders=headers).execute()
+        fetched += 1
+        for m in full.get("messages", []) or []:
+            if len(out) >= max_messages:
+                break
+            out.append({
+                "headers": (m.get("payload") or {}).get("headers") or [],
+                "internal_date": int(m.get("internalDate") or 0),
+                "sent": "SENT" in (m.get("labelIds") or []),
+            })
+    return {"messages": out, "threads": fetched}

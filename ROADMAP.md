@@ -88,8 +88,8 @@ See [Calendar module](#calendar-module).
 - **Attachments on drafts**: attach files from existing messages when drafting, replying or forwarding.
 - **`unsubscribe`**: parse `List-Unsubscribe` and `List-Unsubscribe-Post` (one-click, RFC 8058), and
   run it only after confirmation.
-- **Recipient lookup**: resolve "Alice" to an address from the caller's own mail history. It needs no
-  new scope. The People API (`contacts.readonly`, sensitive) is optional later.
+- ✅ **Recipient lookup** (`find_contact`, #18): resolve "Alice" to an address from the caller's own mail
+  history. It needs no new scope. The People API (`contacts.readonly`, sensitive) is optional later.
 - **Calendar module**: see the [design below](#calendar-module).
 - **Metrics endpoint** (Prometheus) without personal data.
 - Versioned releases and a changelog.

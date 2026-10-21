@@ -26,6 +26,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 
 from . import attachments as att
+from . import contacts as cts
 from . import gmail as g
 from . import sending as snd
 from .audit import install_log_redaction, write_audit
@@ -1061,6 +1062,76 @@ def create_app(
         for alias, r in results.items():
             r["email"] = emails[alias]
         return {"results": {k: results[k] for k in sorted(results)}}
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    async def find_contact(
+        name_or_partial: Annotated[str, Field(
+            description="A person's name (any script) or part of their address, e.g. 'Alice', '王伟', 'acme.com'")],
+        aliases: Annotated[list[str] | None, Field(
+            description="Mailboxes to search (default: all of yours)")] = None,
+        max_results: Annotated[int, Field(ge=1, le=50)] = 10,
+        include_self: Annotated[bool, Field(
+            description="Also return your own mailbox and send-as addresses")] = False,
+        include_noreply: Annotated[bool, Field(
+            description="Also return no-reply / mailer-daemon style addresses")] = False,
+    ) -> dict:
+        """Find likely email addresses for a person from the From/To/Cc/Reply-To headers
+        of your own recent mail (no contacts access needed). Matches the display name or
+        address, ranked by how often and how recently they appear, with a boost for people
+        you've written to. Use it to fill in recipients; confirm with the user when several
+        addresses are plausible. Each mailbox scans at most its 50 most recent matching
+        threads (200 messages)."""
+        owner = require_owner("find_contact")
+        try:
+            term = cts.clean_term(name_or_partial)
+        except ValueError as e:
+            raise ToolError(str(e)) from None
+        all_accounts = storage.list_accounts(owner)
+        if aliases:
+            selected = []
+            for alias in dict.fromkeys(aliases):
+                acct = resolve(owner, alias)  # ToolError for an alias that isn't the caller's
+                selected.append(acct)
+        else:
+            selected = all_accounts
+        query = cts.gmail_query(term)
+        acc: dict[str, dict] = {}
+        exclude: set[str] = {a.email.lower() for a in all_accounts}
+        errors: dict[str, str] = {}
+        scanned: dict[str, int] = {}
+
+        async def one(acct):
+            def fn(svc, a):
+                r = g.op_contact_messages(svc, query, cts.MAX_THREADS, cts.MAX_MESSAGES, cts.CONTACT_HEADERS)
+                try:
+                    r["self"] = [i["address"] for i in identities(owner, a.alias, svc)]
+                except Exception:  # noqa: BLE001  (settings scope unticked: own address only)
+                    r["self"] = []
+                return r
+
+            try:
+                r = await gmail_call(
+                    owner, acct.alias, "find_contact", "lookup", fn,
+                    result_detail=lambda r: f"threads={r['threads']} messages={len(r['messages'])}",
+                )
+            except ToolError as e:
+                errors[acct.alias] = str(e)
+                return
+            scanned[acct.alias] = len(r["messages"])
+            exclude.update(x.lower() for x in r["self"])
+            cts.collect(r["messages"], term, acct.alias, acc)
+
+        async with anyio.create_task_group() as tg:
+            for acct in selected:
+                tg.start_soon(one, acct)
+        for a in all_accounts:  # send-as addresses already known for unscanned mailboxes
+            exclude.update(i["address"] for i in (send_as_cache.get(owner, a.alias) or []))
+        contacts = cts.rank(acc, exclude=set() if include_self else exclude,
+                            include_noreply=include_noreply, max_results=max_results)
+        out: dict[str, Any] = {"contacts": contacts, "messages_scanned": dict(sorted(scanned.items()))}
+        if errors:
+            out["errors"] = dict(sorted(errors.items()))
+        return out
 
     @mcp.tool(annotations={"readOnlyHint": True})
     async def get_thread(
