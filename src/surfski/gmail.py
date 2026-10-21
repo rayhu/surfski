@@ -480,11 +480,33 @@ def signature_text(identity: dict) -> str:
     return html_to_text(identity.get("signature") or "")
 
 
+def strip_signature(body: str, candidates: list[dict]) -> str:
+    """Remove one trailing '-- \n<signature>' block whose signature belongs to one of
+    the candidate identities (checked in order)."""
+    trimmed = body.rstrip()
+    for ident in candidates:
+        sig = signature_text(ident)
+        if not sig:
+            continue
+        block = f"-- \n{sig}"
+        if trimmed == block:
+            return ""
+        if trimmed.endswith("\n" + block):
+            return trimmed[: -len(block)].rstrip()
+    return body
+
+
 def append_signature(body: str, identity: dict) -> str:
+    """Append the identity's signature unless the body already ends with exactly
+    that signature block."""
     sig = signature_text(identity)
-    if not sig or sig in body:
+    if not sig:
         return body
-    return f"{body.rstrip()}\n\n-- \n{sig}"
+    trimmed = body.rstrip()
+    block = f"-- \n{sig}"
+    if trimmed == block or trimmed.endswith("\n" + block):
+        return body
+    return f"{trimmed}\n\n{block}" if trimmed else block
 
 
 # ---------------------------------------------------------------- operations
@@ -625,6 +647,7 @@ def op_update_draft(
     default_from: str,
     choose_from: Callable[[str], tuple[dict, str] | None] | None = None,
     include_signature: bool = False,
+    known_identities: list[dict] | None = None,
     to: str | None,
     subject: str | None,
     body: str | None,
@@ -659,10 +682,17 @@ def op_update_draft(
     if not _addr_list(new_to):
         raise GmailError("the draft has no recipients; pass 'to'")
     from_value = h.get("from") or default_from
-    chosen = choose_from(parseaddr(from_value)[1].lower()) if choose_from else None
-    new_body = extract_body(payload) if body is None else body
+    prev_addr = parseaddr(from_value)[1].lower()
+    chosen = choose_from(prev_addr) if choose_from else None
+    new_body = (extract_body(payload) if body is None else body).replace("\r\n", "\n")
     if chosen:
         from_value = from_header(chosen[0])
+        if chosen[0]["address"] != prev_addr or include_signature:
+            # Drop the previous identity's signature block (or, failing that, any known
+            # identity's) so a sender switch doesn't leave the old signature behind.
+            known = known_identities or []
+            prev = [i for i in known if i["address"] == prev_addr]
+            new_body = strip_signature(new_body, prev + known)
         if include_signature:
             new_body = append_signature(new_body, chosen[0])
     mime = build_mime(

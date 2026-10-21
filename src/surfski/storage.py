@@ -141,8 +141,16 @@ class Storage:
             for table, col, decl in MIGRATIONS:
                 cols = {r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")}
                 if col not in cols:
-                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+                    self._add_column(table, col, decl)
             self._conn.commit()
+
+    def _add_column(self, table: str, col: str, decl: str) -> None:
+        """ALTER TABLE ADD COLUMN, tolerating a concurrent process that added it first."""
+        try:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
 
     @contextmanager
     def _tx(self):

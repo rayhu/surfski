@@ -17,7 +17,8 @@ from .test_server import ALICE, BOB, call, who  # noqa: F401  (fixture re-export
 
 IDENTITIES = {
     "alice@work.com": [
-        {"sendAsEmail": "alice@work.com", "displayName": "Alice", "isPrimary": True, "isDefault": True},
+        {"sendAsEmail": "alice@work.com", "displayName": "Alice", "isPrimary": True, "isDefault": True,
+         "signature": "<b>Alice</b> Wong"},
         {"sendAsEmail": "Sales@Work.org", "displayName": "张三", "verificationStatus": "accepted",
          "signature": "<div>张三<br>Sales &amp; Support</div>"},
         {"sendAsEmail": "pending@work.org", "displayName": "P", "verificationStatus": "pending"},
@@ -317,3 +318,55 @@ def test_strict_fake_send_as_list_params():
     svc.users().settings().sendAs().list(userId="me").execute()
     with pytest.raises(TypeError):
         svc.users().settings().sendAs().list(userId="me", maxResults=5)
+
+
+def sig_draft(box, draft_id, from_value, text):
+    box.drafts[draft_id] = {"id": draft_id, "message": {"id": "m", "threadId": "t1", "payload": {
+        "mimeType": "text/plain",
+        "headers": [{"name": "From", "value": from_value}, {"name": "To", "value": "c@x.com"},
+                    {"name": "Subject", "value": "Hi"}],
+        "body": {"data": b64(text)},
+    }}}
+
+
+async def test_switching_identity_replaces_signature(app, who, boxes):
+    box = boxes["alice@work.com"]
+    sig_draft(box, "s1", "张三 <sales@work.org>", "Hello\r\n\r\n-- \r\n张三\r\nSales & Support\r\n")
+    r = await call(app, "update_draft", alias="work", draft_id="s1", from_address="alice@work.com",
+                   include_signature=True)
+    assert r["from"] == "alice@work.com"
+    assert parse(box.updated[-1]).get_content().rstrip() == "Hello\n\n-- \nAlice Wong"
+    # switching back without include_signature drops the old block and adds none
+    await call(app, "update_draft", alias="work", draft_id="s1", from_address="sales@work.org")
+    assert parse(box.updated[-1]).get_content().rstrip() == "Hello"
+
+
+async def test_unknown_previous_identity_strips_any_known_signature(app, who, boxes):
+    box = boxes["alice@work.com"]
+    # From is an address that is no longer a send-as identity; its body ends with Sales' signature.
+    sig_draft(box, "s2", "Old <old@work.org>", "Body\n\n-- \n张三\nSales & Support")
+    await call(app, "update_draft", alias="work", draft_id="s2", from_address="alice@work.com",
+               include_signature=True)
+    assert parse(box.updated[-1]).get_content().rstrip() == "Body\n\n-- \nAlice Wong"
+
+
+async def test_signature_text_inside_body_does_not_suppress(app, who, boxes):
+    await call(app, "create_draft", alias="work", to="c@x.com", subject="s",
+               body="Please ask Alice Wong soon.", from_address="alice@work.com", include_signature=True)
+    content = parse(boxes["alice@work.com"].created[-1]).get_content().rstrip()
+    assert content == "Please ask Alice Wong soon.\n\n-- \nAlice Wong"
+    box = boxes["alice@work.com"]
+    sig_draft(box, "s3", "Alice <alice@work.com>", "Contact Alice Wong today")
+    await call(app, "update_draft", alias="work", draft_id="s3", include_signature=True)
+    assert parse(box.updated[-1]).get_content().rstrip() == "Contact Alice Wong today\n\n-- \nAlice Wong"
+    # re-applying doesn't duplicate
+    await call(app, "update_draft", alias="work", draft_id="s3", include_signature=True)
+    assert parse(box.updated[-1]).get_content().count("-- \nAlice Wong") == 1
+
+
+async def test_stored_default_not_silently_dropped_when_send_as_fails(app, who, boxes, storage):
+    storage.set_default_from(ALICE, "work", "sales@work.org")
+    boxes["alice@work.com"].send_as_error = HttpError(httplib2.Response({"status": 403}), b"")
+    with pytest.raises(ToolError, match="couldn't read the send-as addresses"):
+        await call(app, "create_draft", alias="work", to="c@x.com", subject="s", body="b")
+    assert boxes["alice@work.com"].created == []

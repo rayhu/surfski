@@ -263,9 +263,12 @@ def create_app(
         def choose(recipients: list[str]):
             try:
                 ids = identities(owner, acct.alias, svc)
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
                 if strict:
-                    raise
+                    err = g.map_google_error(e, acct.alias)
+                    raise g.GmailError(
+                        f"couldn't read the send-as addresses to verify the From address ({err})"
+                    ) from None
                 ids = []  # e.g. settings scope unticked: fall back to the account email
             return g.resolve_identity(
                 ids,
@@ -558,8 +561,11 @@ def create_app(
         def fn(svc, acct):
             r = g.op_create_draft(
                 svc,
+                # A stored default counts as an explicit choice: if send-as can't be
+                # read we error instead of silently sending from another address.
                 choose_from=create_chooser(
-                    owner, acct, svc, from_address, strict=bool(from_address or include_signature)
+                    owner, acct, svc, from_address,
+                    strict=bool(from_address or include_signature or acct.default_from),
                 ),
                 include_signature=include_signature,
                 to=to,
@@ -629,9 +635,11 @@ def create_app(
 
         def fn(svc, acct):
             choose = None
+            ids: list[dict] = []
             if from_address or include_signature:
+                ids = identities(owner, acct.alias, svc)
+
                 def choose(current_from: str):
-                    ids = identities(owner, acct.alias, svc)
                     labels = storage.get_address_labels(owner, acct.alias)
                     if from_address:
                         return g.match_identity(ids, from_address, labels)
@@ -643,7 +651,7 @@ def create_app(
                     )
             r = g.op_update_draft(
                 svc, draft_id=draft_id, default_from=acct.email,
-                choose_from=choose, include_signature=include_signature,
+                choose_from=choose, include_signature=include_signature, known_identities=ids,
                 to=to, subject=subject, body=body, cc=cc, bcc=bcc,
             )
             r["gmail_url"] = g.gmail_drafts_url(acct.email)

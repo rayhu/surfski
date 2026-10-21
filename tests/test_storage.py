@@ -132,3 +132,11 @@ def test_migration_on_existing_db(tmp_path):
         s.set_address_label(B, "work", "x@y.z", "x")
     assert s.get_address_labels(B, "work") == {}
     s.close()
+
+
+def test_add_column_tolerates_concurrent_migration(storage):
+    # Simulates two processes racing past the PRAGMA check: the second ALTER must not fail.
+    storage._add_column("accounts", "default_from", "TEXT")
+    storage._add_column("accounts", "default_from", "TEXT")
+    with pytest.raises(sqlite3.OperationalError):
+        storage._add_column("no_such_table", "x", "TEXT")
