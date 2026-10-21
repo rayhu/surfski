@@ -7,62 +7,9 @@ All notable changes to Surfski are documented here. The format follows
 
 ## [Unreleased]
 
-### Added
+_Nothing yet._
 
-- **In-client confirmation on 2026-07-28 connections** (#33): `confirm` sends (`send_draft`,
-  `send_email`, `forward_message` with `send=true`) and draft-policy calendar writes return an
-  `InputRequiredResult` (SEP-2322) with the same sanitized form when the client supports form
-  elicitation, instead of always falling back to the confirm link. The client's second call is
-  completed by a middleware without re-running the tool, with a single-use continuation bound to the
-  owner, the tool and its exact arguments, then the shared recheck. Decline keeps the draft; a
-  malformed answer gets the link; nothing is ever sent without an explicit `true`.
-
-- **Calendar module** (#19), behind `FEATURES=mail,calendar`: `enable_calendar` / `disable_calendar`
-  (per-mailbox Google re-consent adding `calendar.readonly` + `calendar.events`), `list_calendars`,
-  `list_events`, `get_event`, cross-account `find_free_time` (merged free/busy, working hours, DST-safe),
-  and `create_event`, `update_event`, `respond_to_event`, `delete_event` under a per-mailbox
-  `calendar_policy` (`draft` by default: confirmed in the client or on a one-time owner-session link;
-  `auto` raised only after owner re-auth via `set_calendar_policy`). Attendees outside the mailbox's
-  domain follow the sending safeguards (`SEND_MAX_RECIPIENTS`, `ALLOWED_RECIPIENT_DOMAINS`, new
-  `CALENDAR_INVITE_DAILY_CAP`, cancellations included). Patches and deletes send `If-Match`; `delete_event`
-  emails nobody by default. Times are ISO 8601 with offsets plus the calendar's IANA zone; naive inputs
-  are rejected, and free/busy arithmetic is done in UTC so DST days have their real length.
-
-- Versioned releases: `surfski --version`, the version in the MCP server info and in
-  `surfski_build_info`, this changelog, a release workflow that checks the tag against
-  `pyproject.toml` and publishes a GitHub Release from the changelog, and `RELEASING.md` (#11).
-
-### Security
-
-- Follow-ups from the #33 review: send continuations are only resumable when `SENDING_ENABLED` is on,
-  and Landlock path rules the extraction worker couldn't add are logged as a warning (they can make
-  extraction fail) instead of at debug.
-
-- `EXTRACT_SANDBOX_STRICT=true` now requires the `full` sandbox level (Landlock filesystem confinement
-  and a kernel network block), not filesystem confinement alone. The worker counts Landlock path rules
-  it couldn't add, and the startup probe logs the count (#33 review of #43).
-
-- The attachment extraction worker confines itself with Landlock before parsing: read-only access to
-  the Python installation and system libraries only, so a parser exploit can't read `DATA_DIR` (the
-  SQLite database, the OAuth store) or write anywhere, and no TCP with Landlock ABI 4+. A seccomp
-  filter blocks `socket()`, `io_uring_setup()` and path `truncate()`. The protection level is logged at
-  startup and exported as `surfski_extract_sandbox_info`; `EXTRACT_SANDBOX_STRICT=true` refuses to read
-  attachments when Landlock is unavailable. CI verifies it in the hardened container (#43).
-- README: pending confirmation links stay valid during a token key rotation while the old key is set (#19).
-
-- Confirmation-link data in `action_tokens` (draft ids, PKCE verifiers, proposed calendar events) is
-  encrypted with the owner's token key and erased as soon as the link is used or expires (#19).
-
-- Attachment text extraction runs in a short-lived subprocess with a wall-clock timeout and rlimits
-  (address space, CPU, no file writes, no new processes, few open files) and at most 2 at a time;
-  timeouts, OOM and crashes become a clean tool error. Its environment carries no secrets, its
-  output is size-capped and type-checked, and the server is non-dumpable on Linux so a worker can't
-  read the server's environment or memory. Configure with `EXTRACT_SANDBOX`,
-  `EXTRACT_TIMEOUT_S` and `EXTRACT_MEMORY_MB` (#30).
-- The Docker actions in the CI and release workflows are pinned to full commit SHAs (#30).
-- Log redaction also hides `Authorization: …` headers and `Bearer <token>` values (#11).
-
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-10-21
 
 The first release: a self-hosted remote MCP server that gives Claude access to many Gmail
 mailboxes per user, with per-user isolation.
@@ -104,6 +51,28 @@ mailboxes per user, with per-user isolation.
 - **Backups** (#5): `scripts/backup.sh` with a consistent SQLite snapshot, retention and restore.
 - **CI and images** (#4): pytest, a Docker smoke test and shellcheck on every PR; multi-arch
   (amd64/arm64) images on GHCR for release tags.
+- **In-client confirmation on 2026-07-28 connections** (#33): `confirm` sends (`send_draft`,
+  `send_email`, `forward_message` with `send=true`) and draft-policy calendar writes return an
+  `InputRequiredResult` (SEP-2322) with the same sanitized form when the client supports form
+  elicitation, instead of always falling back to the confirm link. The client's second call is
+  completed by a middleware without re-running the tool, with a single-use continuation bound to the
+  owner, the tool and its exact arguments, then the shared recheck. Decline keeps the draft; a
+  malformed answer gets the link; nothing is ever sent without an explicit `true`.
+
+- **Calendar module** (#19), behind `FEATURES=mail,calendar`: `enable_calendar` / `disable_calendar`
+  (per-mailbox Google re-consent adding `calendar.readonly` + `calendar.events`), `list_calendars`,
+  `list_events`, `get_event`, cross-account `find_free_time` (merged free/busy, working hours, DST-safe),
+  and `create_event`, `update_event`, `respond_to_event`, `delete_event` under a per-mailbox
+  `calendar_policy` (`draft` by default: confirmed in the client or on a one-time owner-session link;
+  `auto` raised only after owner re-auth via `set_calendar_policy`). Attendees outside the mailbox's
+  domain follow the sending safeguards (`SEND_MAX_RECIPIENTS`, `ALLOWED_RECIPIENT_DOMAINS`, new
+  `CALENDAR_INVITE_DAILY_CAP`, cancellations included). Patches and deletes send `If-Match`; `delete_event`
+  emails nobody by default. Times are ISO 8601 with offsets plus the calendar's IANA zone; naive inputs
+  are rejected, and free/busy arithmetic is done in UTC so DST days have their real length.
+
+- Versioned releases: `surfski --version`, the version in the MCP server info and in
+  `surfski_build_info`, this changelog, a release workflow that checks the tag against
+  `pyproject.toml` and publishes a GitHub Release from the changelog, and `RELEASING.md` (#11).
 
 ### Security
 
@@ -119,6 +88,33 @@ mailboxes per user, with per-user isolation.
   and size limits).
 - Hardened container: non-root uid 10001, read-only root filesystem, `cap_drop: ALL`,
   `no-new-privileges`, published on `127.0.0.1` only.
+- Follow-ups from the #33 review: send continuations are only resumable when `SENDING_ENABLED` is on,
+  and Landlock path rules the extraction worker couldn't add are logged as a warning (they can make
+  extraction fail) instead of at debug.
+
+- `EXTRACT_SANDBOX_STRICT=true` now requires the `full` sandbox level (Landlock filesystem confinement
+  and a kernel network block), not filesystem confinement alone. The worker counts Landlock path rules
+  it couldn't add, and the startup probe logs the count (#33 review of #43).
+
+- The attachment extraction worker confines itself with Landlock before parsing: read-only access to
+  the Python installation and system libraries only, so a parser exploit can't read `DATA_DIR` (the
+  SQLite database, the OAuth store) or write anywhere, and no TCP with Landlock ABI 4+. A seccomp
+  filter blocks `socket()`, `io_uring_setup()` and path `truncate()`. The protection level is logged at
+  startup and exported as `surfski_extract_sandbox_info`; `EXTRACT_SANDBOX_STRICT=true` refuses to read
+  attachments when Landlock is unavailable. CI verifies it in the hardened container (#43).
+- README: pending confirmation links stay valid during a token key rotation while the old key is set (#19).
+
+- Confirmation-link data in `action_tokens` (draft ids, PKCE verifiers, proposed calendar events) is
+  encrypted with the owner's token key and erased as soon as the link is used or expires (#19).
+
+- Attachment text extraction runs in a short-lived subprocess with a wall-clock timeout and rlimits
+  (address space, CPU, no file writes, no new processes, few open files) and at most 2 at a time;
+  timeouts, OOM and crashes become a clean tool error. Its environment carries no secrets, its
+  output is size-capped and type-checked, and the server is non-dumpable on Linux so a worker can't
+  read the server's environment or memory. Configure with `EXTRACT_SANDBOX`,
+  `EXTRACT_TIMEOUT_S` and `EXTRACT_MEMORY_MB` (#30).
+- The Docker actions in the CI and release workflows are pinned to full commit SHAs (#30).
+- Log redaction also hides `Authorization: …` headers and `Bearer <token>` values (#11).
 
 ### Changed
 
