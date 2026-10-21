@@ -265,7 +265,8 @@ def summarize_thread(thread: dict) -> dict:
         "subject": h.get("subject", ""),
         "from": h.get("from", ""),
         "date": lh.get("date", h.get("date", "")),
-        "snippet": last.get("snippet") or thread.get("snippet", ""),
+        # Gmail returns snippets HTML-escaped (e.g. "&#39;").
+        "snippet": unescape(last.get("snippet") or thread.get("snippet", "")),
         "label_ids": sorted(labels),
         "message_count": len(msgs),
     }

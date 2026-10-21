@@ -141,3 +141,8 @@ def test_invalid_grant_mapping():
 
 def test_drafts_url():
     assert g.gmail_drafts_url("me@x.com") == "https://mail.google.com/mail/u/me@x.com/#drafts"
+
+
+def test_snippet_html_unescaped():
+    t = {"id": "t", "messages": [{"snippet": "doesn&#39;t &amp; won&#39;t &lt;b&gt;", "payload": {"headers": []}}]}
+    assert g.summarize_thread(t)["snippet"] == "doesn't & won't <b>"
