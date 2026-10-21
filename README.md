@@ -234,12 +234,12 @@ that tells Claude to forward something to an attacker):
   draft and returns a one-time link; nothing is sent until you open it, sign in, review
   From/To/Cc/**Bcc**, subject, attachments and the start of the body, and press **Send**), or `auto`
   (sent directly, within the caps). MCP clients still ask you to approve each send tool call.
-- **Owner sign-in on every confirm and approval page.** Opening a link shows nothing about the
+- **Owner sign-in before any confirm or approval page.** Opening a link shows nothing about the
   email until you sign in with Google as the mailbox owner (`/send/auth/callback`, which you must
   register on your OAuth client). That sets a session cookie for `/send` pages only (HttpOnly,
   SameSite=Strict, Secure on https, 12 h, stored server-side). Send and Apply require that session
-  for the same owner as the link, so **a leaked link alone can't send**.
-- **Claude can't raise a policy.** `set_send_policy` lowers it immediately but, to raise it, returns
+  for the same owner as the link, so **a leaked link alone can't send**. You sign in once per 12-hour session, not on every link.
+- **Tool calls alone can't raise a policy.** `set_send_policy` lowers it immediately but, to raise it, returns
   a link that needs a Google sign-in from the last 10 minutes as the owner, then an **Apply** click.
 - **Links** are HMAC-signed (key derived from `STATE_SECRET`, separate from linking), single-use,
   expire in 10 minutes, and are bound to the owner, alias, mailbox address and the exact draft
