@@ -815,6 +815,14 @@ LabelArg = Annotated[str, Field(max_length=g.LABEL_NAME_MAX,
                                 description="A user label's name (case-insensitive) or id")]
 
 
+CalTZ = Annotated[str | None, Field(
+    description="IANA zone (e.g. 'America/Los_Angeles') for times given without an offset")]
+CalId = Annotated[str, Field(max_length=300, description="Calendar id from list_calendars")]
+EventId = Annotated[str, Field(max_length=1024)]
+AttendeeList = Annotated[list[str] | None, Field(max_length=100, description="Attendee email addresses")]
+NotifyFlag = Annotated[bool, Field(description="Let Google email the attendees (invitations/updates)")]
+
+
 def refs(attachments: list[AttachmentRef] | None) -> list[dict] | None:
     return [a.model_dump() for a in attachments] if attachments else None
 
@@ -1318,10 +1326,6 @@ def create_app(
     def register_calendar_tools() -> None:
         READ = {"readOnlyHint": True, "openWorldHint": False}
         WRITE = {"destructiveHint": True, "openWorldHint": True}
-        TZ = Annotated[str | None, Field(
-            description="IANA zone (e.g. 'America/Los_Angeles') for times given without an offset")]
-        CAL_ID = Annotated[str, Field(max_length=300, description="Calendar id from list_calendars")]
-        EVENT_ID = Annotated[str, Field(max_length=1024)]
 
         def calendar_factory(owner: str, alias: str):
             """Builds the Calendar service only for a calendar-enabled mailbox (fresh read,
@@ -1360,10 +1364,10 @@ def create_app(
             alias: str,
             time_min: Annotated[str, Field(description="ISO 8601 start with offset, e.g. 2026-10-21T00:00:00-07:00")],
             time_max: Annotated[str, Field(description="ISO 8601 end with offset")],
-            calendar_id: CAL_ID = "primary",
+            calendar_id: CalId = "primary",
             query: Annotated[str | None, Field(max_length=200, description="Free-text search")] = None,
             max_results: Annotated[int, Field(ge=1, le=cal.MAX_LIST_RESULTS)] = 25,
-            time_zone: TZ = None,
+            time_zone: CalTZ = None,
             page_token: str | None = None,
         ) -> dict:
             """List events (recurring ones expanded) between time_min and time_max, ordered by
@@ -1381,7 +1385,7 @@ def create_app(
                 result_detail=lambda r: f"events={len(r['events'])}")
 
         @mcp.tool(annotations=READ)
-        async def get_event(alias: str, event_id: EVENT_ID, calendar_id: CAL_ID = "primary") -> dict:
+        async def get_event(alias: str, event_id: EventId, calendar_id: CalId = "primary") -> dict:
             """Read one event: times (ISO 8601 with offset, plus the calendar's IANA zone),
             attendees and their responses, location, description, Meet link."""
             owner = require_owner("get_event")
@@ -1395,7 +1399,7 @@ def create_app(
             duration_minutes: Annotated[int, Field(ge=5, le=1440)],
             aliases: Annotated[list[str] | None, Field(
                 max_length=20, description="Mailboxes to check (default: all of yours with calendar on)")] = None,
-            time_zone: TZ = None,
+            time_zone: CalTZ = None,
             working_hours: Annotated[str | None, Field(
                 description="Only inside these local hours each day, e.g. '09:00-17:00' (in time_zone)")] = None,
             include_weekends: Annotated[bool, Field(
@@ -1588,8 +1592,6 @@ def create_app(
                     return {"status": "done", "written": True, "confirm_channel": "elicitation", **result}
             return issue_calendar_link(owner, hd, p, reason)
 
-        ATTENDEES = Annotated[list[str] | None, Field(max_length=100, description="Attendee email addresses")]
-        NOTIFY = Annotated[bool, Field(description="Let Google email the attendees (invitations/updates)")]
 
         @mcp.tool(annotations=WRITE, description=(
             "Create an event. start/end are ISO 8601 with an offset (or pass time_zone); with "
@@ -1602,14 +1604,14 @@ def create_app(
             summary: Annotated[str, Field(max_length=500)],
             start: str,
             end: str,
-            time_zone: TZ = None,
-            calendar_id: CAL_ID = "primary",
+            time_zone: CalTZ = None,
+            calendar_id: CalId = "primary",
             description: Annotated[str | None, Field(max_length=8000)] = None,
             location: Annotated[str | None, Field(max_length=500)] = None,
-            attendees: ATTENDEES = None,
+            attendees: AttendeeList = None,
             add_meet: Annotated[bool, Field(description="Add a Google Meet link")] = False,
             all_day: bool = False,
-            notify_attendees: NOTIFY = True,
+            notify_attendees: NotifyFlag = True,
         ) -> dict:
             att = early(cal.clean_attendees, attendees)
             early(cal.time_body, start, end, time_zone, all_day)  # clear errors before any Google call
@@ -1641,18 +1643,18 @@ def create_app(
             "is refused if the event was edited after it was shown for confirmation. " + CALENDAR_SAFETY))
         async def update_event(
             alias: str,
-            event_id: EVENT_ID,
-            calendar_id: CAL_ID = "primary",
+            event_id: EventId,
+            calendar_id: CalId = "primary",
             summary: Annotated[str | None, Field(max_length=500)] = None,
             start: str | None = None,
             end: str | None = None,
-            time_zone: TZ = None,
+            time_zone: CalTZ = None,
             all_day: bool = False,
             description: Annotated[str | None, Field(max_length=8000)] = None,
             location: Annotated[str | None, Field(max_length=500)] = None,
-            attendees: ATTENDEES = None,
+            attendees: AttendeeList = None,
             add_meet: Annotated[bool, Field(description="Add a Google Meet link")] = False,
-            notify_attendees: NOTIFY = True,
+            notify_attendees: NotifyFlag = True,
         ) -> dict:
             if (start is None) != (end is None):
                 raise ToolError("pass both start and end to move an event")
@@ -1705,9 +1707,9 @@ def create_app(
             "create_event. " + CALENDAR_SAFETY))
         async def respond_to_event(
             alias: str,
-            event_id: EVENT_ID,
+            event_id: EventId,
             response: Literal["accepted", "declined", "tentative"],
-            calendar_id: CAL_ID = "primary",
+            calendar_id: CalId = "primary",
             notify_organizer: Annotated[bool, Field(description="Email the organizer your answer")] = True,
         ) -> dict:
             def build(svc, a):
@@ -1739,9 +1741,9 @@ def create_app(
             "like create_event. " + CALENDAR_SAFETY))
         async def delete_event(
             alias: str,
-            event_id: EVENT_ID,
-            calendar_id: CAL_ID = "primary",
-            notify_attendees: NOTIFY = True,
+            event_id: EventId,
+            calendar_id: CalId = "primary",
+            notify_attendees: NotifyFlag = True,
         ) -> dict:
             def build(svc, a):
                 cur = cal.op_get_raw(svc, calendar_id, event_id)

@@ -1,4 +1,4 @@
-"""Strict, discovery-validated fake of the googleapiclient Gmail v1 service.
+"""Strict, discovery-validated fakes of googleapiclient services (Gmail v1, Calendar v3).
 
 Every method call is checked against the bundled Gmail discovery document the
 same way the real client does it: unknown keyword arguments, missing required
@@ -25,8 +25,12 @@ from googleapiclient.discovery_cache import get_static_doc
 
 
 @lru_cache(maxsize=None)
+def discovery(api: str, version: str) -> dict:
+    return json.loads(get_static_doc(api, version))
+
+
 def gmail_discovery() -> dict:
-    return json.loads(get_static_doc("gmail", "v1"))
+    return discovery("gmail", "v1")
 
 
 def _validate(path: str, method: dict, kwargs: dict) -> None:
@@ -48,7 +52,7 @@ def _validate(path: str, method: dict, kwargs: dict) -> None:
 
 
 class _Resource:
-    def __init__(self, root: StrictGmail, path: str, doc: dict):
+    def __init__(self, root: StrictService, path: str, doc: dict):
         self._root, self._path, self._doc = root, path, doc
 
     def __getattr__(self, name: str):
@@ -58,14 +62,16 @@ class _Resource:
         method = self._doc.get("methods", {}).get(name)
         if method is not None:
             return self._root._method(f"{self._path}.{name}".lstrip("."), method)
-        raise AttributeError(f"Gmail resource '{self._path or 'root'}' has no attribute '{name}'")
+        raise AttributeError(f"{self._root.api} resource '{self._path or 'root'}' has no attribute '{name}'")
 
 
-class StrictGmail(_Resource):
+class StrictService(_Resource):
+    api, version = "gmail", "v1"
+
     def __init__(self, handlers: dict[str, Callable[..., Any]] | None = None):
         self.handlers: dict[str, Callable[..., Any]] = dict(handlers or {})
         self.calls: list[tuple[str, dict]] = []
-        super().__init__(self, "", gmail_discovery())
+        super().__init__(self, "", discovery(self.api, self.version))
 
     def _method(self, path: str, method: dict):
         def call(**kwargs):
@@ -80,3 +86,13 @@ class StrictGmail(_Resource):
 
     def calls_to(self, path: str) -> list[dict]:
         return [kw for p, kw in self.calls if p == path]
+
+
+class StrictGmail(StrictService):
+    api, version = "gmail", "v1"
+
+
+class StrictCalendar(StrictService):
+    """Calendar v3, e.g. StrictCalendar({"events.list": ...}).events().list(...)."""
+
+    api, version = "calendar", "v3"
