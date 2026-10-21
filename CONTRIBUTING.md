@@ -25,6 +25,9 @@ uv run pytest
 
 1. Open an issue first for anything larger than a bug fix. Check [ROADMAP.md](ROADMAP.md).
 2. Include tests, and update `README.md` if behavior or config changes.
-3. Keep commits focused, with a clear message.
+3. Add a line under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) (Added / Changed / Fixed /
+   Security). Releases are cut as described in [RELEASING.md](RELEASING.md).
+4. Keep commits focused, with a clear message. The PR template asks for Summary, Testing,
+   Technical decisions and Security.
 
 By contributing you agree your work is licensed under the MIT License.

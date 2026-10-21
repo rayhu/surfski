@@ -25,7 +25,10 @@ EXIT_OK, EXIT_FAIL, EXIT_USAGE = 0, 1, 2
 
 
 def _parser() -> argparse.ArgumentParser:
+    from .version import __version__
+
     p = argparse.ArgumentParser(prog="surfski", description="Surfski MCP server and admin tools.")
+    p.add_argument("--version", action="version", version=f"surfski {__version__}")
     sub = p.add_subparsers(dest="cmd", metavar="{serve,admin}")
     sub.add_parser("serve", help="run the MCP server (the default)")
 

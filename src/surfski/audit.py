@@ -20,6 +20,10 @@ def write_audit(
 
 
 _QUERY_RE = re.compile(r"((?:\s|^|https?://[^\s/?\"]+)/[^\s?\"]*)\?[^\s\"]*")
+# Credentials in headers that end up in a log line: "Authorization: <anything>" and any
+# "Bearer <token>" (also inside reprs like {'authorization': 'Bearer abc'}).
+_AUTH_HEADER_RE = re.compile(r"(?i)\b(authorization['\"]?\s*[:=]\s*['\"]?)(?!<redacted>)[^'\"\r\n,}]+")
+_BEARER_RE = re.compile(r"(?i)\b(bearer)\s+(?!<redacted>)[A-Za-z0-9._~+/=-]{8,}")
 _SECRET_RE = re.compile(
     r"(?i)\b(code|state|access_token|refresh_token|id_token|client_secret|token)=([^&\s\"]+)"
 )
@@ -27,6 +31,8 @@ _SECRET_RE = re.compile(
 
 def redact(text: str) -> str:
     text = _QUERY_RE.sub(r"\1?<redacted>", text)
+    text = _AUTH_HEADER_RE.sub(r"\1<redacted>", text)
+    text = _BEARER_RE.sub(r"\1 <redacted>", text)
     return _SECRET_RE.sub(r"\1=<redacted>", text)
 
 
