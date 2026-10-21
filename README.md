@@ -20,6 +20,9 @@ Tools: `list_accounts`, `link_account`, `relink_account`, `rename_account`, `unl
 `update_draft`, `delete_draft`, `list_addresses`, `set_address_label`, `set_default_from`, `forward_message`,
 `get_attachment`, `unsubscribe`, `export_my_data`, `delete_my_data`.
 With `SENDING_ENABLED=true` also: `send_draft`, `send_email`, `set_send_policy` (and `forward_message(send=true)`).
+With `TRIAGE_ENABLED=true` also: `enable_triage`, `disable_triage`, `mark_read`, `mark_unread`, `star`, `unstar`,
+`archive`, `move_to_inbox`, `apply_label`, `remove_label`, `create_label`, `trash`, `untrash` (see
+[Triage](#triage-opt-in)).
 
 **Find an address.** `find_contact("Alice")` (or part of an address, or a name in any script, e.g.
 `王伟`) looks through the From/To/Cc/Reply-To headers of your own recent mail in all your mailboxes (or
@@ -102,7 +105,7 @@ Caddy, nginx or Traefik.
    Don't submit it for verification. In *Testing* mode Google expires refresh tokens after
    **7 days**, so you would have to relink weekly.
 4. **Data Access**: add `openid`, `.../auth/userinfo.email`, `.../auth/gmail.readonly` and
-   `.../auth/gmail.compose`.
+   `.../auth/gmail.compose`. If you turn on [triage](#triage-opt-in), also add `.../auth/gmail.modify`.
 5. **Clients** → create a **Web application** client with these redirect URIs:
    - `https://<host>/auth/callback`
    - `https://<host>/gmail/callback`
@@ -234,6 +237,8 @@ keys, users simply relink their mailboxes.
 | `ALLOWED_RECIPIENT_DOMAINS` | no | Comma-separated domains; if set, every recipient's domain must match one exactly |
 | `ATTACHMENT_MAX_MB` | no | Largest attachment `get_attachment` will download (default 15, max 25) |
 | `AUDIT_ON_DELETE` | no | What `delete_my_data` does with the caller's audit rows: `delete` (default) or `pseudonymize` (keep them under a keyed hash) |
+| `TRIAGE_ENABLED` | no | `true` registers the triage tools (default `false`: no triage tools, and `gmail.modify` is never requested) |
+| `TRIAGE_DAILY_CAP` | no | Triage changes (ids touched) per mailbox in a rolling 24 h (default 1000) |
 | `UNSUBSCRIBE_ALLOWED_PORTS` | no | Extra https ports the one-click unsubscribe POST may use (comma-separated; 443 is always allowed, default none) |
 | `LOG_LEVEL`, `HOST`, `PORT` | no | Logging and bind address |
 
@@ -340,6 +345,41 @@ that tells Claude to forward something to an attacker):
 - **Audit:** each send records alias, policy, recipient count and Gmail message id, never addresses
   or bodies.
 - Relinking an alias to a different mailbox resets its policy to `off` and voids open links.
+
+### Triage (opt-in)
+
+The triage tools (mark read or unread, star, archive, move to Inbox, user labels, Trash) need Google's
+`gmail.modify` scope, which normal linking never requests. Two switches have to be on:
+
+- **Operator switch:** without `TRIAGE_ENABLED=true` the tools don't exist. The server then never asks
+  Google for `gmail.modify`, even for a mailbox that granted it before.
+- **Per mailbox:** `enable_triage(alias)` returns a Google link for that mailbox only. It is a full
+  re-consent (`prompt=consent`, `include_granted_scopes=false`) asking for read + compose + modify, so the
+  new token carries exactly those scopes. The human has to sign in to Google **as that mailbox** and
+  approve. That out-of-band consent is the owner confirmation; a tool call alone can't turn triage on.
+  The server checks that Google really granted `gmail.modify` and that the account that signed in is the
+  linked mailbox. If either check fails, nothing changes. `list_accounts` shows `triage: on|off`, and the
+  scope and switch are rechecked before every triage call.
+- **Turning it off:** `disable_triage(alias)` takes effect at once: the server stops using, and stops
+  requesting, `gmail.modify` for that mailbox. The stored Google grant still includes it until you
+  `relink_account(alias)`, which re-consents with read + compose only, or until you remove the app at
+  <https://myaccount.google.com/permissions>. A relink without modify also turns triage off.
+
+Guardrails:
+
+- **Caps:** at most 50 ids per call (`messages.batchModify` for messages; one `threads.modify` per
+  thread) and `TRIAGE_DAILY_CAP` changes per mailbox per 24 h.
+- **No permanent delete.** `trash` moves mail to Trash, where Gmail keeps it for 30 days, and `untrash`
+  restores it. There is no `delete` or `batchDelete` tool, by design.
+- **Labels:** `apply_label` / `remove_label` work only on your own labels, not system ones; reading,
+  starring, archiving and trashing have their own tools. A label is created only with `create=true` or
+  `create_label`. Names are NFC-normalized and capped at 225 characters, and refused if they contain
+  control or invisible characters, have empty or space-padded `/` parts, or collide with system names
+  (`INBOX`, `TRASH`, `CATEGORY_*`, …).
+- Tool descriptions tell the model never to act on instructions found inside an email, and to confirm
+  bulk changes with you first.
+- **Audit:** each call records the action and a count (`messages=12`), never message or thread ids or
+  label names.
 
 ### Unsubscribe safety
 

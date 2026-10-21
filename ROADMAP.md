@@ -83,8 +83,8 @@ See [Calendar module](#calendar-module).
   domain match on the primary address; public mail providers are refused.
 - **Admin CLI** (`surfski admin …`): list owners and aliases, force-unlink, rotate
   `TOKEN_ENCRYPTION_KEY` by re-encrypting existing rows.
-- **Mailbox triage, opt-in**: `mark_read`, `star`, `archive`, `apply_label`. It needs `gmail.modify`,
-  which is requested by relinking only for mailboxes that turn it on.
+- ✅ **Mailbox triage, opt-in** (#8): read/unread, star, archive, labels and Trash behind `TRIAGE_ENABLED`, plus
+  a per-mailbox `enable_triage` Google re-consent for `gmail.modify`. There are caps and no permanent delete.
 - ✅ **Attachments on drafts** (#16): `create_draft`, `update_draft`, `send_email` and `forward_message`
   attach files from existing messages in the same mailbox (`{message_id, part_id}`). `update_draft` now
   keeps a draft's attachments and can add or remove them. 20 MB total.

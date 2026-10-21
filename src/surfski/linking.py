@@ -15,7 +15,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from .storage import Storage, validate_alias
+from .storage import GMAIL_MODIFY_SCOPE, Storage, validate_alias
 
 GMAIL_SCOPES = (
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -88,7 +88,11 @@ def start_link(
     login_hint: str | None = None,
     hd: str | None = None,
     now: float | None = None,
+    triage_email: str | None = None,
 ) -> LinkStart:
+    """With triage_email (#8), the link also requests gmail.modify and the callback only
+    accepts that exact mailbox. It is a full re-consent (prompt=consent,
+    include_granted_scopes=false): the new refresh token carries exactly the scopes listed."""
     alias = validate_alias(alias)
     owner = owner.lower()
     nonce = secrets.token_urlsafe(24)
@@ -98,12 +102,16 @@ def start_link(
     payload = {"owner": owner, "alias": alias, "nonce": nonce, "exp": exp}
     if hd:  # the caller's verified Google hosted domain, rechecked by the callback
         payload["hd"] = hd.strip().lower()
+    scopes = GMAIL_SCOPES
+    if triage_email:
+        payload["triage"] = triage_email.lower()
+        scopes = GMAIL_SCOPES + (GMAIL_MODIFY_SCOPE,)
     state = sign_state(state_secret, payload)
     params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "response_type": "code",
-        "scope": " ".join(GMAIL_SCOPES),
+        "scope": " ".join(scopes),
         "access_type": "offline",
         "prompt": "consent",
         "include_granted_scopes": "false",
@@ -133,6 +141,7 @@ async def exchange_code(
     redirect_uri: str,
     code: str,
     code_verifier: str,
+    require_modify: bool = False,
 ) -> dict:
     resp = await http.post(
         TOKEN_ENDPOINT,
@@ -159,6 +168,11 @@ async def exchange_code(
         raise LinkError(
             "Not all Gmail permissions were granted (need read and compose). Link again "
             "and tick every checkbox on the consent screen."
+        )
+    if require_modify and GMAIL_MODIFY_SCOPE not in granted:
+        raise LinkError(
+            "Triage was not enabled: Google did not grant the Gmail modify permission. Ask "
+            "Claude for a new enable_triage link and tick every checkbox. Nothing changed."
         )
     return tokens
 

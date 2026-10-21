@@ -494,3 +494,21 @@ async def test_update_fails_instead_of_dropping_unreadable_attachment(app, who, 
     box.messages["m1"]["payload"]["parts"][1]["body"] = {"size": 0}
     r = await call(app, "forward_message", alias="work", message_id="m1", to="erin@x.com")
     assert r["skipped"] == [{"filename": "报告 Q1.pdf", "reason": "no content available"}]
+
+
+async def test_attachment_list_capped_at_50_with_count_kept(app, who, boxes, storage):
+    storage.set_send_policy(ALICE, "work", "confirm")
+    names = many_attachments_draft(boxes["alice@work.com"], n=60)
+    human = Human("decline")
+    await call_with(app, human, "send_draft", alias="work", draft_id="dm")
+    lines = human.prompts[0].split("\n")
+    head = lines.index("Attachments (60 attachments, 59 KB):")
+    listed = lines[head + 1: head + 52]
+    assert len([x for x in listed if x.startswith("│ ")]) == 51
+    assert listed[-1] == "│ …and 10 more" and listed[-2].startswith("│ file-49-")
+    assert "payroll.xlsx" not in human.prompts[0]  # the 60th file is summarized by the count
+    assert lines[head + 52].startswith("Recipients:")
+    assert any(line.endswith("Bcc 0; 60 attachments, 59 KB.") for line in lines)
+    info = {"attachments": names, "attachment_bytes": 60_000}
+    count, shown = srv.attachment_summary(info)
+    assert count == "60 attachments, 59 KB" and len(shown) == 51
