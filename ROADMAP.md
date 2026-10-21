@@ -72,7 +72,7 @@ See [Calendar module](#calendar-module).
   with no binary pass-through by default.
 - ✅ **`delete_my_data`**: unlink and revoke every mailbox for the caller, and purge their rows.
 - **Published container image** (GHCR) and **CI** that runs pytest and the image build on every PR.
-- **Backup helper**: a `scripts/backup.sh` that tars the data volume and refuses to include the env file.
+- ✅ **Backup helper**: a `scripts/backup.sh` that tars the data volume and refuses to include the env file.
 
 ## Phase 2: self-host polish
 

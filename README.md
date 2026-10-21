@@ -150,10 +150,32 @@ With the prebuilt image, run `git pull && sudo docker compose -p surfski pull &&
 
 ### Backups
 
-Back up the `surfski_surfski-data` volume, for example with a nightly `tar` from a throwaway
-container. **The backup is useless without `TOKEN_ENCRYPTION_KEY` and `STORAGE_ENCRYPTION_KEY`.
-Keep the env file in a separate place, such as a password manager, never in the same backup.**
-If you lose the keys, users simply relink their mailboxes.
+`scripts/backup.sh` backs up the `surfski_surfski-data` volume to
+`/var/backups/surfski/surfski-data-YYYYmmdd-HHMMSS.tgz` (mode 600) and deletes archives older than
+14 days. It takes a consistent SQLite snapshot with Python's online backup API inside the Surfski
+image, so the server can keep running, and adds `oauth/` as files. It refuses to run if anything
+named `env`/`*.env` is in the volume. `--dry-run` shows what it would do; `--help` lists options
+(`--dest`, `--keep`, `--volume`, `--image`).
+
+Nightly at 03:15 from root's crontab (it uses the local `surfski:latest` image that `docker compose build` creates):
+
+```cron
+15 3 * * * /opt/surfski/scripts/backup.sh --keep 14 >> /var/log/surfski-backup.log 2>&1
+```
+
+Restore:
+
+```bash
+docker compose stop app
+sudo scripts/backup.sh --restore /var/backups/surfski/surfski-data-20260101-031500.tgz --yes
+# add --force if the volume isn't empty; its contents are replaced
+docker compose start app
+```
+
+**The backup is useless without `TOKEN_ENCRYPTION_KEY` and `STORAGE_ENCRYPTION_KEY`, and it never
+contains them. Keep the env file in a separate place, such as a password manager, never in the same
+backup.** Restore with the same keys that were in use when the backup was made. If you lose the
+keys, users simply relink their mailboxes.
 
 ## Configuration reference
 

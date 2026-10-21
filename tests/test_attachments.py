@@ -366,3 +366,21 @@ def test_pdf_decompression_limits_applied(monkeypatch):
     att.extract_text(make_pdf(["x"]), "application/pdf", "a.pdf", charset=None, max_chars=100)
     assert seen["zlib_maximum_output_length"] == 20 * 1024 * 1024
     assert seen["lzw_maximum_output_length"] == seen["maximum_declared_stream_length"] == 20 * 1024 * 1024
+
+
+def test_deep_nesting_refused():
+    deep = b"<w:p>" * 300 + b"<w:r><w:t>x</w:t></w:r>" + b"</w:p>" * 300
+    with pytest.raises(att.ExtractError, match="nests deeper than 256 levels"):
+        att.extract_text(_docx_with_body(deep), DOCX, "d.docx", charset=None, max_chars=1000)
+    ok = b"<w:p>" * 200 + b"<w:r><w:t>fine</w:t></w:r>" + b"</w:p>" * 200
+    assert "fine" in att.extract_text(_docx_with_body(ok), DOCX, "d.docx", charset=None, max_chars=1000).text
+
+
+def test_attribute_heavy_element_refused():
+    attrs = b" ".join(b'a%d="v"' % i for i in range(1001))
+    doc = _docx_with_body(b"<w:p " + attrs + b"><w:r><w:t>x</w:t></w:r></w:p>")
+    with pytest.raises(att.ExtractError, match="too many attributes"):
+        att.extract_text(doc, DOCX, "d.docx", charset=None, max_chars=1000)
+    attrs = b" ".join(b'a%d="v"' % i for i in range(1000))
+    doc = _docx_with_body(b"<w:p " + attrs + b"><w:r><w:t>ok</w:t></w:r></w:p>")
+    assert att.extract_text(doc, DOCX, "d.docx", charset=None, max_chars=1000).text == "ok"
