@@ -102,7 +102,8 @@ class Config:
     extract_sandbox: str = "subprocess"
     extract_timeout_s: float = 20.0
     extract_memory_mb: int = 512
-    extract_sandbox_strict: bool = False  # refuse to extract unless Landlock confines the worker (#43)
+    # Refuse to extract unless the worker reaches the "full" sandbox level (#43, #33 review).
+    extract_sandbox_strict: bool = False
     metrics_token: str = ""
     # Modules served by this deployment (#19): "mail" always, "calendar" opt-in.
     features: frozenset[str] = frozenset({"mail"})

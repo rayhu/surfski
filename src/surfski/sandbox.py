@@ -10,7 +10,7 @@ discarded (only a class name such as "timeout" or "MemoryError" is ever reported
 The child also confines itself with Landlock and seccomp (#43, `confine.py`). `probe()`
 runs one trivial extraction at startup to learn the protection level the kernel gives;
 that level, not one reported by a worker that parsed untrusted input, feeds the logs and
-metrics. With `strict=True` the worker refuses to parse unless Landlock applied."""
+metrics. With `strict=True` the worker refuses to parse unless the level is "full"."""
 
 from __future__ import annotations
 
@@ -32,8 +32,9 @@ TOO_COMPLEX = "the file was too complex to read safely"
 # Overridable by tests to inject a misbehaving worker.
 WORKER_ARGV = [sys.executable, "-I", "-B", "-m", "surfski.extract_worker"]
 _logged_skips: set[str] = set()
-SANDBOX_UNAVAILABLE = ("attachment reading is disabled: the extraction sandbox (Landlock) is not "
-                       "available on this server and EXTRACT_SANDBOX_STRICT is on")
+SANDBOX_UNAVAILABLE = ("attachment reading is disabled: the extraction sandbox (Landlock filesystem "
+                       "confinement plus a kernel network block) is not fully available on this "
+                       "server and EXTRACT_SANDBOX_STRICT is on")
 
 
 class Sandbox:
@@ -143,7 +144,7 @@ class Sandbox:
             raise att.ExtractError(f"{TOO_COMPLEX} ({reason})")
         if result.get("ok") is not True:
             if result.get("error") == "sandbox":
-                log.error("extraction refused: Landlock is unavailable and EXTRACT_SANDBOX_STRICT is on")
+                log.error("extraction refused: sandbox level below full and EXTRACT_SANDBOX_STRICT is on")
                 raise att.ExtractError(SANDBOX_UNAVAILABLE)
             if result.get("error") == "extract" and isinstance(result.get("message"), str):
                 raise att.ExtractError(result["message"][:300] or "could not read the file")
@@ -180,9 +181,12 @@ class Sandbox:
         msg = ("extraction sandbox protection: %s (Landlock ABI %s, filesystem %s, TCP %s, seccomp %s)",
                p["level"], p["landlock_abi"], "restricted" if p.get("landlock_fs") else "open",
                "blocked" if p.get("landlock_net") else "open", "on" if p["seccomp"] else "off")
+        if p.get("rules_failed"):
+            log.debug("extraction sandbox: %d Landlock path rule(s) could not be added; those paths "
+                      "are unreadable by the worker", p["rules_failed"])
         if p["level"] == "full":
             log.info(*msg)
-        elif self.strict and not p.get("landlock_fs"):
+        elif self.strict:
             log.error(*msg)
             log.error("EXTRACT_SANDBOX_STRICT is on: get_attachment will refuse to read files")
         else:
@@ -248,7 +252,10 @@ def protection_of(result: dict) -> dict | None:
     flags = {k: p.get(k) for k in ("landlock_fs", "landlock_net", "seccomp")}
     if not all(isinstance(v, bool) for v in flags.values()):
         return None
-    return {"level": p["level"], "landlock_abi": abi, **flags}
+    failed = p.get("rules_failed", 0)
+    if not isinstance(failed, int) or isinstance(failed, bool) or not 0 <= failed < 1000:
+        return None
+    return {"level": p["level"], "landlock_abi": abi, **flags, "rules_failed": failed}
 
 
 def validated(result: dict, max_chars: int) -> att.Extracted | None:

@@ -1,6 +1,6 @@
 """Confirm-mode sends via MCP elicitation (#27). The client is fastmcp's in-memory
 Client with an elicitation_handler, on a handshake-era protocol (2026-07-28 connections
-have no back-channel for server-initiated requests and must fall back to the link)."""
+have no back-channel for server-initiated requests; they use an input-required result, #33)."""
 
 import time
 from dataclasses import replace
@@ -189,11 +189,12 @@ async def test_client_without_elicitation_gets_link(app, who, boxes, storage):
     assert any("reason=client-not-capable" in d for d in audit(storage))
 
 
-async def test_modern_protocol_gets_link(app, who, boxes, storage):
+async def test_modern_protocol_without_elicitation_gets_link(app, who, boxes, storage):
+    # 2026-07-28 with an elicitation-capable client uses an input-required result instead
+    # (#33, tests/test_input_required.py).
     confirm(storage)
-    human = Human("accept")
-    r = await call_with(app, human, "send_draft", mode="auto", alias="work", draft_id="d1")
-    assert r["status"] == "confirmation_required" and human.prompts == [] and total_sent(boxes) == 0
+    r = await call_with(app, None, "send_draft", mode="auto", alias="work", draft_id="d1")
+    assert r["status"] == "confirmation_required" and total_sent(boxes) == 0
 
 
 async def test_elicitation_error_falls_back_to_link_never_sends(app, who, boxes, storage, google):

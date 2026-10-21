@@ -123,9 +123,11 @@ def exposes(path: str | os.PathLike, allowed: list[str] | None = None) -> str | 
     return None
 
 
-def landlock_restrict(paths: list[str], abi: int) -> bool:
+def landlock_restrict(paths: list[str], abi: int, failures: list[str] | None = None) -> bool:
     """Read-only access beneath `paths`, nothing else; TCP bind/connect denied when abi >= 4.
+    Paths whose rule couldn't be added are appended to `failures` (they stay unreadable).
     Returns True once the process is restricted."""
+    failures = failures if failures is not None else []
     ctypes, libc = _libc()
     fs = handled_fs(abi)
     net = (NET_BIND_TCP | NET_CONNECT_TCP) if abi >= 4 else 0
@@ -143,13 +145,15 @@ def landlock_restrict(paths: list[str], abi: int) -> bool:
             try:
                 fd = os.open(p, o_path | os.O_CLOEXEC)
             except OSError:
+                failures.append(p)
                 continue
             try:
                 # struct landlock_path_beneath_attr { __u64 allowed_access; __s32 parent_fd; } packed
                 rule = ctypes.create_string_buffer(struct.pack("=Qi", access, fd), 12)
-                libc.syscall(SYS_LANDLOCK_ADD_RULE, ctypes.c_int(ruleset),
-                             ctypes.c_int(LANDLOCK_RULE_PATH_BENEATH), rule, ctypes.c_uint32(0))
-                # A path whose rule fails is simply not readable; the rest still applies.
+                if libc.syscall(SYS_LANDLOCK_ADD_RULE, ctypes.c_int(ruleset),
+                                ctypes.c_int(LANDLOCK_RULE_PATH_BENEATH), rule, ctypes.c_uint32(0)) != 0:
+                    # Not readable then; the rest still applies. Reported as rules_failed.
+                    failures.append(p)
             finally:
                 os.close(fd)
         if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
@@ -214,11 +218,13 @@ def level_of(landlock_fs: bool, net_blocked: bool) -> str:
 
 def confine() -> dict:
     """Apply Landlock and seccomp to this (single-threaded) process, as far as supported.
-    Returns {"level", "landlock_abi", "landlock_fs", "landlock_net", "seccomp"}."""
+    Returns {"level", "landlock_abi", "landlock_fs", "landlock_net", "seccomp", "rules_failed"}.
+    The worker has no logging (stderr is discarded), so rule failures are counted and the
+    parent logs them."""
     import threading
 
     report = {"level": "basic", "landlock_abi": 0, "landlock_fs": False, "landlock_net": False,
-              "seccomp": False}
+              "seccomp": False, "rules_failed": 0}
     if not sys.platform.startswith("linux"):
         return report
     # Both mechanisms only bind the calling thread; a second thread would stay unconfined.
@@ -227,10 +233,12 @@ def confine() -> dict:
     abi = landlock_abi()
     report["landlock_abi"] = abi
     if abi > 0:
+        failures: list[str] = []
         try:
-            report["landlock_fs"] = landlock_restrict(allowed_paths(), abi)
+            report["landlock_fs"] = landlock_restrict(allowed_paths(), abi, failures)
         except Exception:  # noqa: BLE001
             report["landlock_fs"] = False
+        report["rules_failed"] = len(failures)
         report["landlock_net"] = report["landlock_fs"] and abi >= 4
     try:
         report["seccomp"] = seccomp_restrict()

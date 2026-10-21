@@ -25,14 +25,14 @@ LATENCY_BUCKETS = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
 TOOL_OUTCOMES = frozenset({"ok", "error", "internal_error"})
 GMAIL_STATUS = frozenset({"400", "401", "403", "404", "429", "4xx", "5xx", "refresh", "storage", "other"})
 SEND_POLICIES = frozenset({"auto", "confirm"})
-SEND_OUTCOMES = frozenset({"sent", "failed", "declined", "link_issued"})
+SEND_OUTCOMES = frozenset({"sent", "failed", "declined", "link_issued", "input_requested"})
 ATTACHMENT_METHODS = frozenset({"text", "html", "pdf", "docx", "xlsx", "pptx", "none", "unknown"})
 ATTACHMENT_OUTCOMES = frozenset({"ok", "metadata_only", "error"})
 UNSUB_METHODS = frozenset({"one_click", "mailto", "manual", "none"})
 UNSUB_OUTCOMES = frozenset({"preview", "ok", "failed", "manual", "not_available", "draft_created",
                             "sent", "confirmation_required", "declined"})
 CAL_ACTIONS = frozenset({"create", "update", "respond", "delete"})
-CAL_OUTCOMES = frozenset({"written", "failed", "declined", "link_issued"})
+CAL_OUTCOMES = frozenset({"written", "failed", "declined", "link_issued", "input_requested"})
 SANDBOX_LEVELS = frozenset({"full", "filesystem", "network", "basic", "none", "unknown"})
 
 

@@ -510,3 +510,61 @@ def test_strict_config(tmp_path):
                 {"EXTRACT_SANDBOX_STRICT": "true", "EXTRACT_SANDBOX": "inprocess"}):
         with pytest.raises(ConfigError, match="EXTRACT_SANDBOX_STRICT"):
             load_config(make_env(tmp_path, **bad))
+
+
+# ---------------------------------------------------------------- #33 review of #43
+
+FS_ONLY = """
+import sys
+from surfski import confine, extract_worker
+from surfski.attachments import extract_text
+confine.landlock_abi_real = confine.landlock_abi
+confine.landlock_abi = lambda: min(confine.landlock_abi_real(), 3)  # no Landlock TCP rules
+confine.seccomp_restrict = lambda: False  # and no seccomp: filesystem-only protection
+sys.exit(extract_worker.main(extract=extract_text))
+"""
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_strict_requires_full_level_not_just_filesystem(monkeypatch, caplog, strict):
+    require_landlock()
+    import logging
+    monkeypatch.setattr(sb, "WORKER_ARGV", [sys.executable, "-I", "-B", "-c", FS_ONLY])
+    caplog.set_level(logging.INFO, "surfski.sandbox")
+    box = Sandbox(strict=strict)
+    p = box.probe()
+    assert p["level"] == "filesystem" and p["landlock_fs"] and not p["seccomp"]
+    if strict:
+        with pytest.raises(att.ExtractError, match="not fully available"):
+            box.extract(b"hi", "text/plain", "a.txt", charset=None, max_chars=10)
+        assert "EXTRACT_SANDBOX_STRICT is on" in caplog.text
+    else:
+        assert box.extract(b"hi", "text/plain", "a.txt", charset=None, max_chars=10).text == "hi"
+
+
+def test_rules_failed_is_reported_and_type_checked(monkeypatch, caplog):
+    import json
+    import logging
+    base = {"level": "full", "landlock_abi": 5, "landlock_fs": True, "landlock_net": True, "seccomp": True}
+    assert sb.protection_of({"protection": {**base, "rules_failed": 2}})["rules_failed"] == 2
+    assert sb.protection_of({"protection": base})["rules_failed"] == 0
+    for bad in ("2", True, -1, 10_000):
+        assert sb.protection_of({"protection": {**base, "rules_failed": bad}}) is None
+    result = {"ok": True, "text": "probe", "method": "text", "protection": {**base, "rules_failed": 3}}
+    script = f"import sys; sys.stdout.write({json.dumps(json.dumps(result))})"
+    monkeypatch.setattr(sb, "WORKER_ARGV", [sys.executable, "-I", "-B", "-c", script])
+    caplog.set_level(logging.DEBUG, "surfski.sandbox")
+    assert Sandbox().probe()["rules_failed"] == 3
+    assert "3 Landlock path rule(s) could not be added" in caplog.text
+
+
+def test_confine_counts_rule_failures(monkeypatch):
+    require_landlock()
+    import subprocess
+    code = ("import json, surfski.confine as c\n"
+            "c.allowed_paths = lambda: [c.sys.prefix, '/nonexistent-surfski-path']\n"
+            "print(json.dumps(c.confine()))")
+    out = subprocess.run([sys.executable, "-I", "-B", "-c", code], capture_output=True, text=True)
+    import json
+    rep = json.loads(out.stdout)
+    assert rep["landlock_fs"] and rep["rules_failed"] == 1, out.stderr
