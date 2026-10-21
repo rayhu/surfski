@@ -94,7 +94,10 @@ See [Calendar module](#calendar-module).
   policy; plain web links are returned, never opened.
 - ✅ **Recipient lookup** (`find_contact`, #18): resolve "Alice" to an address from the caller's own mail
   history. It needs no new scope. The People API (`contacts.readonly`, sensitive) is optional later.
-- **Calendar module**: see the [design below](#calendar-module).
+- ✅ **Calendar module** (#19): `FEATURES=mail,calendar`, per-mailbox `enable_calendar`, read tools,
+  cross-account `find_free_time`, and writes under a `draft`/`auto` calendar policy with the sending
+  safeguards. See the [design below](#calendar-module). The calendar-only `/calendar/mcp` endpoint is
+  deferred to the calendar-only hosted offering.
 - ✅ **Metrics endpoint** (#10): Prometheus `/metrics` behind `METRICS_ENABLED` and a Bearer
   `METRICS_TOKEN`; tool calls, latency, Gmail errors, sends, triage, attachments, unsubscribe and
   counts, with no personal data in any label.
@@ -282,6 +285,10 @@ separate project.
   requests only those scopes. Adding calendar to an already linked account uses Google incremental
   authorization (`include_granted_scopes=true` for that upgrade only). Store granted capabilities per
   account, and have `list_accounts` show them.
+  *As built (#19):* calendar is added with `enable_calendar`, a full re-consent with the exact scope
+  set (`include_granted_scopes=false`, like `enable_triage`), so the stored grant always matches what
+  the server believes; the existing mail scopes (and `gmail.modify` when triage is on) are requested
+  again in the same consent.
 - **Endpoints:** `/mcp` exposes every enabled module. An optional `/calendar/mcp` exposes calendar
   only, for a calendar-only connector or hosted product. It's the same code with a different tool set
   and OAuth client.

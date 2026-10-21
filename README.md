@@ -23,6 +23,9 @@ With `SENDING_ENABLED=true` also: `send_draft`, `send_email`, `set_send_policy` 
 With `TRIAGE_ENABLED=true` also: `enable_triage`, `disable_triage`, `mark_read`, `mark_unread`, `star`, `unstar`,
 `archive`, `move_to_inbox`, `apply_label`, `remove_label`, `create_label`, `trash`, `untrash` (see
 [Triage](#triage-opt-in)).
+With `FEATURES=mail,calendar` also: `enable_calendar`, `disable_calendar`, `set_calendar_policy`,
+`list_calendars`, `list_events`, `get_event`, `find_free_time`, `create_event`, `update_event`,
+`respond_to_event`, `delete_event` (see [Calendar](#calendar-opt-in)).
 
 **Find an address.** `find_contact("Alice")` (or part of an address, or a name in any script, e.g.
 `王伟`) looks through the From/To/Cc/Reply-To headers of your own recent mail in all your mailboxes (or
@@ -98,18 +101,20 @@ Caddy, nginx or Traefik.
 
 ### 1. Google Cloud (one time)
 
-1. Create a project and enable the **Gmail API**.
+1. Create a project and enable the **Gmail API** (and the **Google Calendar API** if you set
+   `FEATURES=mail,calendar`).
 2. Google Auth Platform → **Branding**: set the app name, support email, home page, privacy policy
    link and authorized domain.
 3. **Audience**: choose **External**, then click **Publish app** to move it to *In production*.
    Don't submit it for verification. In *Testing* mode Google expires refresh tokens after
    **7 days**, so you would have to relink weekly.
 4. **Data Access**: add `openid`, `.../auth/userinfo.email`, `.../auth/gmail.readonly` and
-   `.../auth/gmail.compose`. If you turn on [triage](#triage-opt-in), also add `.../auth/gmail.modify`.
+   `.../auth/gmail.compose`. If you turn on [triage](#triage-opt-in), also add `.../auth/gmail.modify`; for the
+   [calendar module](#calendar-opt-in), `.../auth/calendar.readonly` and `.../auth/calendar.events`.
 5. **Clients** → create a **Web application** client with these redirect URIs:
    - `https://<host>/auth/callback`
    - `https://<host>/gmail/callback`
-   - `https://<host>/send/auth/callback` (only needed if you set `SENDING_ENABLED=true`)
+   - `https://<host>/send/auth/callback` (only needed with `SENDING_ENABLED=true` or `FEATURES=mail,calendar`)
 6. If you use Google Workspace, the admin should go to Admin console → Security → API controls →
    Manage third-party app access, add the app by client ID and mark it **Trusted**. Otherwise
    Workspace policy may block mailbox linking.
@@ -309,6 +314,8 @@ connector (Settings → Connectors). Nothing else is lost: linked mailboxes are 
 | `AUDIT_ON_DELETE` | no | What `delete_my_data` does with the caller's audit rows: `delete` (default) or `pseudonymize` (keep them under a keyed hash) |
 | `TRIAGE_ENABLED` | no | `true` registers the triage tools (default `false`: no triage tools, and `gmail.modify` is never requested) |
 | `TRIAGE_DAILY_CAP` | no | Triage changes (ids touched) per mailbox in a rolling 24 h (default 1000) |
+| `FEATURES` | no | Modules to serve: `mail` (default) or `mail,calendar`. Without `calendar` no calendar tool or page exists and calendar scopes are never requested. See [Calendar](#calendar-opt-in) |
+| `CALENDAR_INVITE_DAILY_CAP` | no | Calendar writes per mailbox in a rolling 24 h that involve attendees outside the mailbox's domain (default 20) |
 | `METRICS_ENABLED` | no | `true` serves Prometheus metrics at `/metrics` (default `false`: the route doesn't exist). See [Metrics](#metrics) |
 | `METRICS_TOKEN` | with metrics | Bearer token required on every `/metrics` request (≥32 chars; the server refuses to start without it when metrics are on) |
 | `UNSUBSCRIBE_ALLOWED_PORTS` | no | Extra https ports the one-click unsubscribe POST may use (comma-separated; 443 is always allowed, default none) |
@@ -381,7 +388,9 @@ set -a; source ./local.env; set +a; uv run surfski
   - *Protecting the server's secrets:* on Linux the server marks itself non-dumpable at startup
     (`prctl(PR_SET_DUMPABLE, 0)`), so another process of the same uid, such as a compromised
     worker, can't read its `/proc/<pid>/environ` (where the keys arrived) or its memory, or ptrace
-    it. It also removes the secret settings from `os.environ` once the config is loaded.
+    it. It also removes the secret settings from `os.environ` once the config is loaded. A side
+    effect: profilers and debuggers that attach to a running process, such as `py-spy` or `gdb`,
+    can't attach to the server either (run them as root, or start the server under them).
   - **Limit:** the worker still runs as the same uid as the server. A parser exploit could still
     read files that user can read, including the SQLite database (encrypted refresh tokens) and the
     OAuth store under `DATA_DIR`. The next step is seccomp, namespaces or a separate uid for the
@@ -483,6 +492,52 @@ Guardrails:
   bulk changes with you first.
 - **Audit:** each call records the action and a count (`messages=12`), never message or thread ids or
   label names.
+
+### Calendar (opt-in)
+
+Google Calendar lives in the same server as an optional module (`FEATURES=mail,calendar`). It uses the
+same linked mailboxes, aliases, owner isolation and encrypted tokens.
+
+- **Per mailbox:** `enable_calendar(alias)` returns a Google link for that mailbox only, asking for
+  `calendar.readonly` + `calendar.events`. Like `enable_triage` it is a full re-consent
+  (`include_granted_scopes=false`) with the exact scope set, and keeps `gmail.modify` if triage is on
+  (and `enable_triage` keeps calendar). The callback checks that both calendar scopes were granted and
+  that the account that signed in is the linked mailbox (`getProfile`); otherwise nothing changes.
+  `link_account` and `relink_account` never ask for calendar scopes, so a relink turns calendar off.
+  `disable_calendar(alias)` applies at once. `list_accounts` shows `calendar: on|off` and the
+  `calendar_policy`. Calendar access tokens are requested with the calendar scopes only and cached
+  separately from Gmail's.
+- **Reads:** `list_calendars`, `list_events` (recurring events expanded, up to 100 per page),
+  `get_event`. Times come back as ISO 8601 with an offset in the calendar's IANA zone, plus that zone
+  (`time_zone`); all-day events have dates and `all_day: true`. Inputs need an explicit offset (`Z`,
+  `-07:00`) or a `time_zone`; a bare local time is rejected.
+- **`find_free_time`:** one `freebusy.query` per mailbox (the caller's calendar-enabled mailboxes, or
+  the `aliases` given), busy blocks merged across accounts, free blocks of at least
+  `duration_minutes` returned, optionally only inside `working_hours` (computed per local day, so DST
+  is handled) and without weekends. Window up to 31 days. If a mailbox can't be read, the result says
+  `complete: false` instead of treating its time as free.
+- **Writes** (`create_event`, `update_event`, `respond_to_event`, `delete_event`) follow the mailbox's
+  `calendar_policy`:
+  - `draft` (default): nothing is written by the tool. The user approves in the MCP client
+    (elicitation, if it supports it) or opens a one-time `/send/calendar/confirm` link, signs in with
+    Google as the owner and presses Confirm. The link is single-use, expires in 10 minutes and is bound
+    to a hash of the exact change. At commit the server rechecks the allowlist, that the mailbox is
+    still linked to the same address with calendar on, that the event wasn't edited since (etag), and
+    the caps.
+  - `auto`: written directly, within the caps. `set_calendar_policy(alias, "auto")` only returns a link
+    where the owner re-authenticates and presses Apply; lowering to `draft` applies at once. Calendar
+    links have their own purposes, so they can never be used on the mail send pages.
+- **Attendees are treated like recipients:** at most `SEND_MAX_RECIPIENTS` attendees; attendees outside
+  the mailbox's domain (everyone but the mailbox on gmail.com and other public domains) must match
+  `ALLOWED_RECIPIENT_DOMAINS` if it's set; and writes that involve them count against
+  `CALENDAR_INVITE_DAILY_CAP`. Google only emails attendees (`sendUpdates=all`) when
+  `notify_attendees` / `notify_organizer` is true; otherwise `sendUpdates=none`.
+- **Audit and metrics** record the action and counts (`action=create attendees=2 external=1
+  notify=all`), never titles, attendees, locations or calendar ids. `surfski_calendar_writes_total`
+  counts writes by action and outcome. `export_my_data` includes the capability flags, and
+  `delete_my_data` purges the calendar rows.
+- **Not yet:** a calendar-only `/calendar/mcp` endpoint and calendar-only deployments (`FEATURES` must
+  include `mail`).
 
 ### Metrics
 

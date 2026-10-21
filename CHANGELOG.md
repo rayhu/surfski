@@ -9,6 +9,16 @@ All notable changes to Surfski are documented here. The format follows
 
 ### Added
 
+- **Calendar module** (#19), behind `FEATURES=mail,calendar`: `enable_calendar` / `disable_calendar`
+  (per-mailbox Google re-consent adding `calendar.readonly` + `calendar.events`), `list_calendars`,
+  `list_events`, `get_event`, cross-account `find_free_time` (merged free/busy, working hours, DST-safe),
+  and `create_event`, `update_event`, `respond_to_event`, `delete_event` under a per-mailbox
+  `calendar_policy` (`draft` by default: confirmed in the client or on a one-time owner-session link;
+  `auto` raised only after owner re-auth via `set_calendar_policy`). Attendees outside the mailbox's
+  domain follow the sending safeguards (`SEND_MAX_RECIPIENTS`, `ALLOWED_RECIPIENT_DOMAINS`, new
+  `CALENDAR_INVITE_DAILY_CAP`). Times are ISO 8601 with offsets plus the calendar's IANA zone; naive
+  inputs are rejected.
+
 - Versioned releases: `surfski --version`, the version in the MCP server info and in
   `surfski_build_info`, this changelog, a release workflow that checks the tag against
   `pyproject.toml` and publishes a GitHub Release from the changelog, and `RELEASING.md` (#11).
