@@ -39,8 +39,11 @@ See [Calendar module](#calendar-module).
 
 - **surfski.io** is a static marketing and docs site on Cloudflare Pages (Astro + Starlight, i18n),
   kept in a separate private repo. It has no auth and no user data.
-- **app.surfski.io** is this Python server: it serves `/mcp`, the OAuth callbacks, the confirmation
-  pages and the future user dashboard, all on one origin. It is deployed only when the hosted beta starts:
+- **app.surfski.io** is this open-source Python server, and it **only does MCP**. It serves `/mcp` plus
+  the minimal pages MCP flows need: the OAuth callbacks and the one-time confirmation pages for
+  linking, sending and raising policies. There is no separate web dashboard. Users manage accounts,
+  aliases and policies through MCP tools in their AI client. Marketing, docs and any commercial
+  pages live on the static site. It is deployed only when the hosted beta starts:
   - on a **dedicated** host, not shared with unrelated workloads. This limits the blast radius and
     keeps CASA scope small. A small EC2 instance running Docker Compose and Caddy is the starting
     point, ideally in a **separate AWS account**;
