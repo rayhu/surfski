@@ -1,5 +1,6 @@
 """scripts/backup.sh, driven offline with a fake `docker` on PATH (#5)."""
 
+import io
 import os
 import shutil
 import stat
@@ -92,7 +93,8 @@ def test_real_run_uses_volume_ro_and_private_dest(sh, tmp_path):
     assert stat.S_IMODE(dest.stat().st_mode) == 0o700
 
 
-@pytest.mark.parametrize("bad", ["env", ".env", "prod.env", "oauth/keys.env"])
+@pytest.mark.parametrize("bad", ["env", ".env", "prod.env", "oauth/keys.env", "ENV", "env.bak",
+                                 ".env.local", "prod.ENV", "oauth/.Env.prod"])
 def test_refuses_env_files_in_volume(sh, tmp_path, bad):
     p, calls = sh("--dest", str(tmp_path / "b"), SHIM_LISTING=f"data.db\\noauth\\n{bad}\\n")
     assert p.returncode == 3 and "looks like a secrets file" in p.stderr
@@ -120,8 +122,10 @@ def test_restore_guards(sh, tmp_path):
     assert "restore" not in modes(calls)
     p, calls = sh("--restore", str(archive), "--yes", SHIM_PS="abc123\n")
     assert p.returncode == 3 and "stop it first" in p.stderr and "restore" not in modes(calls)
-    p, calls = sh("--restore", str(archive), "--yes", SHIM_RUN_EXIT="3")
+    p, calls = sh("--restore", str(archive), "--yes", SHIM_RUN_EXIT="4")
     assert p.returncode == 3 and "add --force" in p.stderr
+    p, calls = sh("--restore", str(archive), "--yes", "--force", SHIM_RUN_EXIT="3")
+    assert p.returncode == 3 and "volume was not changed" in p.stderr
     p, calls = sh("--restore", str(archive), "--yes", "--force")
     assert p.returncode == 0 and modes(calls)[-1] == "restore"
     r = calls[-1]
@@ -136,3 +140,111 @@ def test_restore_dry_run(sh, tmp_path):
     assert p.returncode == 0 and "SURFSKI_BACKUP_MODE=restore" in p.stdout
     assert "restore" not in modes(calls)
     assert "filter=" in p.stdout  # tarfile's data filter: no absolute paths, .., or links
+
+
+def test_existing_dest_is_never_chmodded(sh, tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o777)
+    p, calls = sh("--dest", str(shared))
+    assert p.returncode == 0, p.stderr
+    assert stat.S_IMODE(shared.stat().st_mode) == 0o777  # untouched
+    assert "accessible to other users" in p.stderr
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    p, _ = sh("--dest", str(private))
+    assert p.returncode == 0 and "accessible" not in p.stderr
+    p, _ = sh("--dry-run", "--dest", str(tmp_path / "new"))
+    assert "+ mkdir -p -m 700" in p.stdout and "+ chmod" not in p.stdout
+
+
+def test_mount_separators_rejected(sh, tmp_path):
+    assert sh("--dest", f"{tmp_path}/a:b")[0].returncode == 2
+    assert sh("--dest", f"{tmp_path}/a,b")[0].returncode == 2
+    assert sh("--restore", f"{tmp_path}/x:y.tgz", "--yes")[0].returncode == 2
+
+
+# ---- the Python run inside the container, executed locally on temp dirs ----
+
+
+def embedded(var: str) -> str:
+    text = SCRIPT.read_text()
+    start = text.index(f"{var}=$(cat <<'PY'\n") + len(f"{var}=$(cat <<'PY'\n")
+    return text[start:text.index("\nPY\n)", start)]
+
+
+def run_py(var, **env):
+    import sys
+    e = dict(os.environ, **env)
+    return subprocess.run([sys.executable, "-I", "-c", embedded(var)], capture_output=True, text=True,
+                          env=e, timeout=30)
+
+
+def make_volume(path: Path):
+    import sqlite3
+    path.mkdir()
+    c = sqlite3.connect(path / "data.db")
+    c.execute("create table t(x)")
+    c.executemany("insert into t values (?)", [(i,) for i in range(50)])
+    c.commit()
+    c.close()
+    (path / "oauth").mkdir()
+    (path / "oauth" / "c.json").write_text("{}")
+
+
+def test_python_backup_and_restore_roundtrip(tmp_path):
+    import sqlite3
+    import tarfile
+    vol, out, dst = tmp_path / "vol", tmp_path / "out", tmp_path / "dst"
+    make_volume(vol)
+    out.mkdir()
+    dst.mkdir()
+    owner = f"{os.getuid()}:{os.getgid()}"
+    p = run_py("PY_BACKUP", DATA_DIR=str(vol), OUT_DIR=str(out), OUT_NAME="a.tgz", HOST_OWNER=owner,
+               TMPDIR=str(tmp_path))
+    assert p.returncode == 0, p.stderr
+    archive = out / "a.tgz"
+    assert stat.S_IMODE(archive.stat().st_mode) == 0o600 and not list(out.glob("*.partial"))
+    assert sorted(tarfile.open(archive).getnames()) == ["data.db", "oauth/c.json"]
+    p = run_py("PY_RESTORE", DATA_DIR=str(dst), IN_DIR=str(out), ARCHIVE_NAME="a.tgz", FORCE="0")
+    assert p.returncode == 0, p.stderr
+    assert sqlite3.connect(dst / "data.db").execute("select count(*) from t").fetchone() == (50,)
+    # Non-empty target without --force.
+    p = run_py("PY_RESTORE", DATA_DIR=str(dst), IN_DIR=str(out), ARCHIVE_NAME="a.tgz", FORCE="0")
+    assert p.returncode == 4
+
+
+def test_python_backup_refuses_secrets_and_cleans_partial(tmp_path):
+    vol, out = tmp_path / "vol", tmp_path / "out"
+    make_volume(vol)
+    out.mkdir()
+    (vol / "oauth" / "Prod.ENV").write_text("SECRET=1")
+    p = run_py("PY_BACKUP", DATA_DIR=str(vol), OUT_DIR=str(out), OUT_NAME="a.tgz", HOST_OWNER="0:0")
+    assert p.returncode == 3 and "looks like a secrets file" in p.stderr and list(out.iterdir()) == []
+    (vol / "oauth" / "Prod.ENV").unlink()
+    p = run_py("PY_BACKUP", DATA_DIR=str(vol), OUT_DIR=str(out), OUT_NAME="a.tgz", HOST_OWNER="bad")
+    assert p.returncode != 0 and list(out.iterdir()) == []  # failed late: no .partial left behind
+
+
+@pytest.mark.parametrize("bad_member", ["../evil.txt", "/etc/evil", "link", "x.env"])
+def test_python_restore_validates_everything_before_emptying(tmp_path, bad_member):
+    import tarfile
+    dst, src = tmp_path / "dst", tmp_path / "in"
+    make_volume(dst)
+    src.mkdir()
+    with tarfile.open(src / "bad.tgz", "w:gz") as tar:
+        good = tarfile.TarInfo("data.db")
+        good.size = 4
+        tar.addfile(good, io.BytesIO(b"abcd"))
+        bad = tarfile.TarInfo(bad_member)
+        if bad_member == "link":
+            bad.type, bad.linkname = tarfile.SYMTYPE, "/etc/passwd"
+            tar.addfile(bad)
+        else:
+            bad.size = 1
+            tar.addfile(bad, io.BytesIO(b"x"))
+    before = sorted(str(p.relative_to(dst)) for p in dst.rglob("*"))
+    p = run_py("PY_RESTORE", DATA_DIR=str(dst), IN_DIR=str(src), ARCHIVE_NAME="bad.tgz", FORCE="1")
+    assert p.returncode == 3 and "volume was not changed" in p.stderr
+    assert sorted(str(p.relative_to(dst)) for p in dst.rglob("*")) == before
+    assert (dst / "oauth" / "c.json").read_text() == "{}"

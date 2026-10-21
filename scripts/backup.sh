@@ -68,6 +68,9 @@ done
 
 case "$KEEP" in ''|*[!0-9]*) die "--keep must be a whole number of days" 2 ;; esac
 case "$VOLUME" in ''|*[!A-Za-z0-9_.-]*) die "invalid volume name: $VOLUME" 2 ;; esac
+# Paths go into `docker run -v SRC:DST`; a ':' or ',' would change the mount.
+case "$DEST" in *:*|*,*) die "--dest must not contain ':' or ','" 2 ;; esac
+case "$RESTORE" in *:*|*,*) die "--restore path must not contain ':' or ','" 2 ;; esac
 
 # Runs a command, or only prints it with --dry-run.
 run() {
@@ -78,10 +81,12 @@ run() {
   fi
 }
 
+# Case-insensitive: env, env.*, .env*, *.env* (e.g. ENV, env.bak, .env.local, prod.ENV).
 is_secret_name() {
-  local base="${1##*/}"
+  local base
+  base="$(printf '%s' "${1##*/}" | tr '[:upper:]' '[:lower:]')"
   case "$base" in
-    env|.env|*.env) return 0 ;;
+    env|env.*|.env*|*.env*) return 0 ;;
   esac
   return 1
 }
@@ -107,63 +112,89 @@ PY
 
 PY_BACKUP=$(cat <<'PY'
 import os, sqlite3, sys, tarfile
-out = "/out/" + os.environ["OUT_NAME"]
+DATA, OUT = os.environ.get("DATA_DIR", "/data"), os.environ.get("OUT_DIR", "/out")
+out = os.path.join(OUT, os.environ["OUT_NAME"])
 skip = {"data.db", "data.db-journal", "data.db-wal", "data.db-shm"}
 def secret(name):
-    b = os.path.basename(name)
-    return b in ("env", ".env") or b.endswith(".env")
+    b = os.path.basename(name).lower()
+    return b == "env" or b.startswith(("env.", ".env")) or ".env" in b
 members = []
-for root, dirs, files in os.walk("/data"):
+for root, dirs, files in os.walk(DATA):
     for name in files:
-        rel = os.path.relpath(os.path.join(root, name), "/data")
+        rel = os.path.relpath(os.path.join(root, name), DATA)
         if secret(rel):
-            sys.exit(f"refusing: {rel} looks like a secrets file")
+            print(f"refusing: {rel} looks like a secrets file", file=sys.stderr)
+            sys.exit(3)
         if rel not in skip:
             members.append(rel)
-os.makedirs("/tmp/snap", exist_ok=True)
-if os.path.exists("/data/data.db"):
-    src = sqlite3.connect("file:/data/data.db?mode=ro", uri=True)
-    dst = sqlite3.connect("/tmp/snap/data.db")
-    with dst:
-        src.backup(dst)  # online backup: a consistent snapshot even while the server writes
-    dst.close(); src.close()
+snap = os.path.join(os.environ.get("TMPDIR", "/tmp"), "surfski-snap.db")
+partial = out + ".partial"
 os.umask(0o077)
-with tarfile.open(out + ".partial", "w:gz") as tar:
-    if os.path.exists("/tmp/snap/data.db"):
-        tar.add("/tmp/snap/data.db", arcname="data.db")
-    for rel in sorted(members):
-        tar.add(os.path.join("/data", rel), arcname=rel, recursive=False)
-uid, gid = (int(x) for x in os.environ["HOST_OWNER"].split(":"))
-os.chmod(out + ".partial", 0o600)
-os.chown(out + ".partial", uid, gid)
-os.replace(out + ".partial", out)
+try:
+    if os.path.exists(os.path.join(DATA, "data.db")):
+        src = sqlite3.connect(f"file:{DATA}/data.db?mode=ro", uri=True)
+        dst = sqlite3.connect(snap)
+        with dst:
+            src.backup(dst)  # online backup: a consistent snapshot even while the server writes
+        dst.close(); src.close()
+    with tarfile.open(partial, "w:gz") as tar:
+        if os.path.exists(snap):
+            tar.add(snap, arcname="data.db")
+        for rel in sorted(members):
+            tar.add(os.path.join(DATA, rel), arcname=rel, recursive=False)
+    uid, gid = (int(x) for x in os.environ["HOST_OWNER"].split(":"))
+    os.chmod(partial, 0o600)
+    os.chown(partial, uid, gid)
+    os.replace(partial, out)
+except BaseException:
+    if os.path.exists(partial):
+        os.remove(partial)
+    raise
+finally:
+    if os.path.exists(snap):
+        os.remove(snap)
 print(f"wrote {out} ({len(members) + 1} entries)")
 PY
 )
 
 PY_RESTORE=$(cat <<'PY'
 import os, shutil, sys, tarfile
-archive, force = "/in/" + os.environ["ARCHIVE_NAME"], os.environ["FORCE"] == "1"
-existing = os.listdir("/data")
+DATA, IN = os.environ.get("DATA_DIR", "/data"), os.environ.get("IN_DIR", "/in")
+archive, force = os.path.join(IN, os.environ["ARCHIVE_NAME"]), os.environ["FORCE"] == "1"
+existing = os.listdir(DATA)
 if existing and not force:
-    sys.exit(3)
+    sys.exit(4)  # mapped to "not empty, add --force" by the shell script
 def secret(name):
-    b = os.path.basename(name)
-    return b in ("env", ".env") or b.endswith(".env")
-with tarfile.open(archive, "r:gz") as tar:
+    b = os.path.basename(name).lower()
+    return b == "env" or b.startswith(("env.", ".env")) or ".env" in b
+def refuse(msg):
+    print(f"refusing: {msg}; the volume was not changed", file=sys.stderr)
+    sys.exit(3)
+try:
+    tar = tarfile.open(archive, "r:gz")
     members = tar.getmembers()
-    for m in members:
-        if secret(m.name) or not (m.isfile() or m.isdir()):
-            sys.exit(f"refusing: unexpected archive entry {m.name!r}")
-    for name in existing:
-        p = os.path.join("/data", name)
-        shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.remove(p)
-    tar.extractall("/data", filter="data")  # no absolute paths, no .., no links/devices
-for root, dirs, files in os.walk("/data"):
-    for name in dirs + files:
-        os.chown(os.path.join(root, name), 10001, 10001)
-        os.chmod(os.path.join(root, name), 0o700 if name in dirs else 0o600)
-os.chown("/data", 10001, 10001)
+except (tarfile.TarError, OSError, EOFError) as e:
+    refuse(f"can't read the archive ({e})")
+# Validate EVERY entry before touching the volume.
+for m in members:
+    if secret(m.name) or not (m.isfile() or m.isdir()) or m.name.startswith("/") \
+            or ".." in m.name.split("/"):
+        refuse(f"unexpected archive entry {m.name!r}")
+    try:
+        tarfile.data_filter(m, DATA)  # no absolute paths, no .., no links/devices
+    except tarfile.FilterError as e:
+        refuse(f"unsafe archive entry {m.name!r} ({e})")
+for name in existing:
+    p = os.path.join(DATA, name)
+    shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.remove(p)
+tar.extractall(DATA, filter="data")
+tar.close()
+if os.geteuid() == 0:
+    for root, dirs, files in os.walk(DATA):
+        for name in dirs + files:
+            os.chown(os.path.join(root, name), 10001, 10001)
+            os.chmod(os.path.join(root, name), 0o700 if name in dirs else 0o600)
+    os.chown(DATA, 10001, 10001)
 print(f"restored {len(members)} entries")
 PY
 )
@@ -199,7 +230,8 @@ EOF
     -v "$VOLUME":/data -v "$dir":/in:ro --entrypoint python "$IMAGE" -I -c "$PY_RESTORE"
   code=$?
   set -e
-  [ "$code" -eq 3 ] && die "volume '$VOLUME' is not empty; add --force to replace its contents" 3
+  [ "$code" -eq 4 ] && die "volume '$VOLUME' is not empty; add --force to replace its contents" 3
+  [ "$code" -eq 3 ] && die "the archive was refused (see above); the volume was not changed" 3
   [ "$code" -eq 0 ] || die "restore failed (exit $code)"
   echo "Restore done. Start the server: docker compose start app"
   exit 0
@@ -218,15 +250,27 @@ done <<<"$files"
 umask 077
 stamp="$(date +%Y%m%d-%H%M%S)"
 name="surfski-data-$stamp.tgz"
-run mkdir -p "$DEST"
-run chmod 700 "$DEST"
+if [ -d "$DEST" ]; then
+  # Never chmod an existing directory (think --dest /tmp as root); just warn.
+  if [ -n "$(find "$DEST" -maxdepth 0 \( -perm -g=r -o -perm -g=w -o -perm -g=x \
+             -o -perm -o=r -o -perm -o=w -o -perm -o=x \) 2>/dev/null)" ]; then
+    echo "backup.sh: warning: $DEST is accessible to other users; archives are still written with mode 600" >&2
+  fi
+else
+  run mkdir -p -m 700 "$DEST"
+fi
 if [ "$DRY_RUN" -eq 0 ]; then
   DEST="$(cd "$DEST" && pwd)"
+  trap 'rm -f "$DEST/$name.partial"' EXIT
 fi
+set +e
 run docker run --rm --network none --user 0:0 -e SURFSKI_BACKUP_MODE=backup \
   -e OUT_NAME="$name" -e HOST_OWNER="$(id -u):$(id -g)" \
-  -v "$VOLUME":/data:ro -v "$DEST":/out --entrypoint python "$IMAGE" -I -c "$PY_BACKUP" \
-  || die "backup failed; nothing was written"
+  -v "$VOLUME":/data:ro -v "$DEST":/out --entrypoint python "$IMAGE" -I -c "$PY_BACKUP"
+code=$?
+set -e
+[ "$code" -eq 3 ] && die "refusing to back up a secrets file (see above); nothing was written" 3
+[ "$code" -eq 0 ] || die "backup failed; nothing was written"
 if [ "$KEEP" -gt 0 ]; then
   run find "$DEST" -maxdepth 1 -type f -name 'surfski-data-*.tgz' -mtime "+$KEEP" -delete
 fi
