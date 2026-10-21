@@ -1,5 +1,7 @@
 # Surfski
 
+[![CI](https://github.com/rayhu/surfski/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rayhu/surfski/actions/workflows/ci.yml)
+
 **Many Gmail inboxes, one Claude connector.** · [surfski.io](https://surfski.io)
 
 Surfski is a small, self-hosted **remote MCP server**. You add it to Claude once as a custom connector.
@@ -103,6 +105,20 @@ sudo docker compose -p surfski up -d --build
 curl -s 127.0.0.1:38000/healthz
 ```
 
+**Prebuilt image (optional).** Instead of building locally, you can use the multi-arch
+(amd64/arm64) image published on each release. In `compose.yaml`, replace `build: .` and
+`image: surfski:latest` with:
+
+```yaml
+    image: ghcr.io/rayhu/surfski:latest   # or pin a release, e.g. ghcr.io/rayhu/surfski:v0.1.0
+```
+
+Then start it without `--build`:
+
+```bash
+sudo docker compose -p surfski up -d
+```
+
 Point your reverse proxy at `127.0.0.1:38000`. `deploy/Caddyfile.snippet` is a Caddy example.
 **Don't enable response compression** on this route, because the MCP stream uses SSE.
 
@@ -119,6 +135,8 @@ When you link a mailbox, sign in **as that mailbox** and tick **both** permissio
 ```bash
 git pull && sudo docker compose -p surfski up -d --build
 ```
+
+With the prebuilt image, run `sudo docker compose -p surfski pull && sudo docker compose -p surfski up -d` instead.
 
 ### Backups
 
