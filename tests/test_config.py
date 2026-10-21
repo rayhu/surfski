@@ -85,3 +85,13 @@ def test_unsubscribe_allowed_ports(tmp_path):
     for bad in ("https", "0", "70000"):
         with pytest.raises(ConfigError, match="UNSUBSCRIBE_ALLOWED_PORTS"):
             load_config(make_env(tmp_path, UNSUBSCRIBE_ALLOWED_PORTS=bad))
+
+
+def test_triage_switch(tmp_path):
+    cfg = load_config(make_env(tmp_path))
+    assert cfg.triage_enabled is False and cfg.triage_daily_cap == 1000
+    cfg = load_config(make_env(tmp_path, TRIAGE_ENABLED="true", TRIAGE_DAILY_CAP="200"))
+    assert cfg.triage_enabled and cfg.triage_daily_cap == 200
+    for key, bad in (("TRIAGE_ENABLED", "maybe"), ("TRIAGE_DAILY_CAP", "0"), ("TRIAGE_DAILY_CAP", "x")):
+        with pytest.raises(ConfigError, match=key):
+            load_config(make_env(tmp_path, **{key: bad}))

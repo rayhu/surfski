@@ -66,6 +66,12 @@ CREATE TABLE IF NOT EXISTS sends (
   alias TEXT NOT NULL,
   ts INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS modifications (
+  owner TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  n INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS address_labels (
   owner TEXT NOT NULL,
   alias TEXT NOT NULL,
@@ -82,9 +88,12 @@ MIGRATIONS = [
     ("accounts", "send_policy", "TEXT NOT NULL DEFAULT 'off'"),
     # Google hosted domain verified at sign-in (#6): domain-allowlisted sessions need it.
     ("owner_sessions", "hd", "TEXT"),
+    # Opt-in mailbox triage (#8): 'on' only after the owner granted gmail.modify for it.
+    ("accounts", "triage", "TEXT NOT NULL DEFAULT 'off'"),
 ]
 
-ACCOUNT_COLS = "owner, alias, email, scopes, created_at, last_used_at, default_from, send_policy"
+ACCOUNT_COLS = "owner, alias, email, scopes, created_at, last_used_at, default_from, send_policy, triage"
+GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 SEND_POLICIES = ("off", "confirm", "auto")  # ordered from least to most permissive
 
 
@@ -124,6 +133,12 @@ class Account:
     last_used_at: str | None
     default_from: str | None = None
     send_policy: str = "off"
+    triage: str = "off"
+
+    @property
+    def triage_active(self) -> bool:
+        """Triage was enabled by the owner AND Google granted gmail.modify for this mailbox."""
+        return self.triage == "on" and GMAIL_MODIFY_SCOPE in self.scopes.split()
 
     def public(self) -> dict:
         return {
@@ -218,7 +233,7 @@ class Storage:
                 # send policy don't apply, and pending action links must die with it.
                 c.execute("DELETE FROM address_labels WHERE owner = ? AND alias = ?", (owner, alias))
                 c.execute(
-                    "UPDATE accounts SET default_from = NULL, send_policy = 'off' "
+                    "UPDATE accounts SET default_from = NULL, send_policy = 'off', triage = 'off' "
                     "WHERE owner = ? AND alias = ?",
                     (owner, alias),
                 )
@@ -385,6 +400,40 @@ class Storage:
                     (owner, alias, address, label),
                 )
 
+    # ---- triage (#8) ----
+
+    def set_triage(self, owner: str, alias: str, on: bool) -> None:
+        owner, alias = owner.lower(), validate_alias(alias)
+        with self._tx() as c:
+            self._require_account(c, owner, alias)
+            c.execute("UPDATE accounts SET triage = ? WHERE owner = ? AND alias = ?",
+                      ("on" if on else "off", owner, alias))
+
+    def reserve_modifications(self, owner: str, alias: str, n: int, cap: int, now: int) -> int | None:
+        """Atomically check the rolling-24 h modification count and record n more.
+        Returns the reservation rowid, or None if it would exceed the cap."""
+        with self._tx() as c:
+            (used,) = c.execute(
+                "SELECT COALESCE(SUM(n), 0) FROM modifications WHERE owner = ? AND alias = ? AND ts > ?",
+                (owner.lower(), alias, now - 86400),
+            ).fetchone()
+            if used + n > cap:
+                return None
+            return c.execute("INSERT INTO modifications (owner, alias, ts, n) VALUES (?, ?, ?, ?)",
+                             (owner.lower(), alias, now, n)).lastrowid
+
+    def release_modifications(self, rowid: int) -> None:
+        with self._tx() as c:
+            c.execute("DELETE FROM modifications WHERE rowid = ?", (rowid,))
+
+    def modifications_today(self, owner: str, alias: str, now: int) -> int:
+        with self._tx() as c:
+            (used,) = c.execute(
+                "SELECT COALESCE(SUM(n), 0) FROM modifications WHERE owner = ? AND alias = ? AND ts > ?",
+                (owner.lower(), alias, now - 86400),
+            ).fetchone()
+        return used
+
     # ---- sending (#2) ----
 
     def set_send_policy(self, owner: str, alias: str, policy: str) -> None:
@@ -510,7 +559,7 @@ class Storage:
     # That guard only works if the column is literally named `owner`: any new table
     # holding per-user data must use that name (see CONTRIBUTING.md).
     OWNER_TABLES = ("accounts", "address_labels", "pending_links", "action_tokens",
-                    "owner_sessions", "sends", "audit_log")
+                    "owner_sessions", "sends", "modifications", "audit_log")
 
     def purge_owner(
         self, owner: str, audit_pseudonym: str | None = None

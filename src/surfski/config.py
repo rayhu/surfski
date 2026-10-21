@@ -89,6 +89,9 @@ class Config:
     attachment_max_bytes: int = 15 * 1024 * 1024
     # Extra https ports the one-click unsubscribe POST may use (#17); 443 is always allowed.
     unsubscribe_allowed_ports: frozenset[int] = frozenset()
+    # Opt-in mailbox triage (#8). Off by default: no triage tools, never gmail.modify.
+    triage_enabled: bool = False
+    triage_daily_cap: int = 1000
 
     def is_allowed(self, email: str | None, *, email_verified: Any, hd: str | None) -> bool:
         """The single allowlist check. Allowed if the caller's primary address is listed in
@@ -231,6 +234,16 @@ def load_config(env: dict[str, str] | None = None) -> Config:
     if any(not 0 < p < 65536 for p in unsub_ports):
         raise ConfigError("UNSUBSCRIBE_ALLOWED_PORTS must be ports between 1 and 65535")
 
+    triage_enabled = env.get("TRIAGE_ENABLED", "false").strip().lower()
+    if triage_enabled not in ("true", "false", "1", "0", "yes", "no", ""):
+        raise ConfigError("TRIAGE_ENABLED must be true or false")
+    try:
+        triage_cap = int(env.get("TRIAGE_DAILY_CAP", "1000"))
+    except ValueError as e:
+        raise ConfigError("TRIAGE_DAILY_CAP must be an integer") from e
+    if triage_cap < 1:
+        raise ConfigError("TRIAGE_DAILY_CAP must be at least 1")
+
     return Config(
         base_url=base_url,
         google_client_id=env["GOOGLE_CLIENT_ID"].strip(),
@@ -256,4 +269,6 @@ def load_config(env: dict[str, str] | None = None) -> Config:
         audit_on_delete=audit_on_delete,
         attachment_max_bytes=int(attachment_mb * 1024 * 1024),
         unsubscribe_allowed_ports=unsub_ports,
+        triage_enabled=triage_enabled in ("true", "1", "yes"),
+        triage_daily_cap=triage_cap,
     )

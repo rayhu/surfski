@@ -13,6 +13,7 @@ import mimetypes
 import re
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from email.headerregistry import Address
 from email.message import EmailMessage
@@ -1138,3 +1139,88 @@ def op_contact_messages(svc, query: str, max_threads: int, max_messages: int,
                 "sent": "SENT" in (m.get("labelIds") or []),
             })
     return {"messages": out, "threads": fetched}
+
+
+# ---------------------------------------------------------------- triage (#8)
+
+TRIAGE_MAX_IDS = 50
+LABEL_NAME_MAX = 225
+# System label names (and the CATEGORY_ prefix) can't be created or used as user labels.
+RESERVED_LABELS = {"inbox", "spam", "trash", "unread", "starred", "important", "sent", "draft",
+                   "drafts", "chat", "chats", "all mail", "scheduled", "snoozed", "muted"}
+
+
+def validate_label_name(name: str) -> str:
+    """A Gmail user label name, or GmailError. NFC-normalized; no control, format or line
+    characters; no empty '/'-separated segments; not a system label name."""
+    name = unicodedata.normalize("NFC", name or "").strip()
+    if not name:
+        raise GmailError("the label name is empty")
+    if len(name) > LABEL_NAME_MAX:
+        raise GmailError(f"label names are at most {LABEL_NAME_MAX} characters")
+    if any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in name):
+        raise GmailError("the label name contains control or invisible characters")
+    if "  " in name or any(not seg.strip() or seg != seg.strip() for seg in name.split("/")):
+        raise GmailError("label names can't have empty or space-padded '/' parts or double spaces")
+    if name.lower() in RESERVED_LABELS or name.upper().startswith("CATEGORY_"):
+        raise GmailError(f"'{name}' is a Gmail system label name; use the dedicated tool instead")
+    return name
+
+
+def check_ids(ids: list[str] | None, what: str) -> list[str]:
+    out = list(dict.fromkeys(i.strip() for i in (ids or []) if i and i.strip()))
+    if not out:
+        raise GmailError(f"give at least one {what}")
+    if len(out) > TRIAGE_MAX_IDS:
+        raise GmailError(f"at most {TRIAGE_MAX_IDS} {what}s per call; split the request")
+    if any(len(i) > 64 or not re.fullmatch(r"[A-Za-z0-9_-]+", i) for i in out):
+        raise GmailError(f"invalid {what}")
+    return out
+
+
+def op_modify_labels(svc, kind: str, ids: list[str], add: list[str], remove: list[str]) -> int:
+    """Add/remove label ids. Messages go in one batchModify; threads one modify each."""
+    users = svc.users()
+    if kind == "messages":
+        body: dict[str, Any] = {"ids": ids}
+        if add:
+            body["addLabelIds"] = add
+        if remove:
+            body["removeLabelIds"] = remove
+        users.messages().batchModify(userId="me", body=body).execute()
+    else:
+        body = {}
+        if add:
+            body["addLabelIds"] = add
+        if remove:
+            body["removeLabelIds"] = remove
+        for tid in ids:
+            users.threads().modify(userId="me", id=tid, body=body).execute()
+    return len(ids)
+
+
+def op_trash(svc, kind: str, ids: list[str], untrash: bool = False) -> int:
+    """Move to Trash (recoverable for 30 days) or back. Never deletes permanently."""
+    res = svc.users().messages() if kind == "messages" else svc.users().threads()
+    for i in ids:
+        (res.untrash if untrash else res.trash)(userId="me", id=i).execute()
+    return len(ids)
+
+
+def op_resolve_user_label(svc, label: str, create: bool) -> tuple[str, bool]:
+    """(label id, created) for a user label given by id or name (case-insensitive).
+    System labels are refused: they have dedicated tools."""
+    labels = svc.users().labels().list(userId="me").execute().get("labels", []) or []
+    ref = (label or "").strip()
+    for lb in labels:
+        if lb.get("id") == ref or (lb.get("name") or "").casefold() == unicodedata.normalize("NFC", ref).casefold():
+            if lb.get("type") != "user":
+                raise GmailError(f"'{ref}' is a Gmail system label; use mark_read, star, archive "
+                                 "or trash instead")
+            return lb["id"], False
+    if not create:
+        raise GmailError(f"no label '{ref}' in this mailbox; pass create=true to create it")
+    name = validate_label_name(ref)
+    made = svc.users().labels().create(userId="me", body={
+        "name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show"}).execute()
+    return made["id"], True
