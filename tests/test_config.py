@@ -1,0 +1,56 @@
+import pytest
+
+from bonobo_mcp.audit import redact
+from bonobo_mcp.config import CLAUDE_REDIRECT_URIS, ConfigError, load_config
+from tests.conftest import make_env
+
+
+@pytest.mark.parametrize("key", ["GOOGLE_CLIENT_SECRET", "JWT_SIGNING_KEY", "STATE_SECRET",
+                                 "TOKEN_ENCRYPTION_KEY", "STORAGE_ENCRYPTION_KEY", "ALLOWED_USERS"])
+def test_missing_secret_fails_closed(tmp_path, key):
+    with pytest.raises(ConfigError, match=key):
+        load_config(make_env(tmp_path, **{key: ""}))
+
+
+def test_bad_fernet_key(tmp_path):
+    with pytest.raises(ConfigError, match="Fernet"):
+        load_config(make_env(tmp_path, TOKEN_ENCRYPTION_KEY="nope"))
+
+
+def test_https_required_for_non_local(tmp_path):
+    with pytest.raises(ConfigError, match="https"):
+        load_config(make_env(tmp_path, BASE_URL="http://mcp.example.com"))
+
+
+def test_redirect_allowlist(tmp_path):
+    prod = load_config(make_env(tmp_path, BASE_URL="https://mcp.example.com/"))
+    assert prod.allowed_client_redirect_uris == CLAUDE_REDIRECT_URIS
+    assert prod.gmail_redirect_uri == "https://mcp.example.com/gmail/callback"
+    local = load_config(make_env(tmp_path))
+    assert "http://localhost:*" in local.allowed_client_redirect_uris
+
+
+def test_allowed_users_normalized(tmp_path):
+    c = load_config(make_env(tmp_path, ALLOWED_USERS=" Alice@Example.com , "))
+    assert c.allowed_users == {"alice@example.com"}
+
+
+def test_redact():
+    line = '127.0.0.1 - "GET /gmail/callback?code=4/abc&state=xyz HTTP/1.1" 200'
+    out = redact(line)
+    assert "4/abc" not in out and "xyz" not in out and "/gmail/callback" in out
+
+
+def test_redact_absolute_url_and_quiet_loggers(caplog):
+    import logging
+
+    from bonobo_mcp.audit import install_log_redaction
+
+    out = redact("HTTP Request: GET https://oauth2.googleapis.com/tokeninfo?access_token=ya29.X")
+    assert "ya29.X" not in out and "oauth2.googleapis.com/tokeninfo" in out
+
+    install_log_redaction()
+    with caplog.at_level(logging.DEBUG):
+        logging.getLogger("httpx2").info("HTTP Request: GET https://x/?access_token=ya29.Y")
+        logging.getLogger("fastmcp").warning("callback /auth/callback?code=4/zzz&state=q")
+    assert "ya29.Y" not in caplog.text and "4/zzz" not in caplog.text

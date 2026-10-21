@@ -1,0 +1,74 @@
+import os
+import sqlite3
+import stat
+
+import pytest
+from cryptography.fernet import Fernet
+
+from bonobo_mcp.storage import AccountNotFound, Storage, StorageError, TokenCipher
+
+A, B = "alice@example.com", "bob@example.com"
+
+
+def test_owner_isolation(storage):
+    storage.upsert_account(A, "work", "alice@work.com", "rt-a", "s")
+    storage.upsert_account(B, "work", "bob@work.com", "rt-b", "s")
+    storage.upsert_account(B, "personal", "bob@gmail.com", "rt-b2", "s")
+
+    assert [a.alias for a in storage.list_accounts(A)] == ["work"]
+    assert {a.alias for a in storage.list_accounts(B)} == {"work", "personal"}
+    assert storage.get_account(A, "work").email == "alice@work.com"
+    assert storage.get_refresh_token(A, "work") == "rt-a"
+    assert storage.get_refresh_token(B, "work") == "rt-b"
+
+    # A cannot reach B's aliases in any way
+    with pytest.raises(AccountNotFound):
+        storage.get_account(A, "personal")
+    with pytest.raises(AccountNotFound):
+        storage.get_refresh_token(A, "personal")
+    assert storage.delete_account(A, "personal") is False
+    assert storage.get_refresh_token(B, "personal") == "rt-b2"
+
+
+def test_owner_case_insensitive(storage):
+    storage.upsert_account("Alice@Example.com", "work", "x@y.com", "rt", "s")
+    assert storage.get_account("alice@example.com", "work").alias == "work"
+
+
+def test_alias_validation(storage):
+    for bad in ["", "Has Space", "a" * 33, "x;drop", "../etc"]:
+        with pytest.raises(ValueError):
+            storage.upsert_account(A, bad, "x@y.com", "rt", "s")
+    storage.upsert_account(A, "Work_1-a", "x@y.com", "rt", "s")  # lowercased
+    assert storage.get_account(A, "work_1-a")
+
+
+def test_refresh_token_encrypted_at_rest(tmp_path, storage):
+    storage.upsert_account(A, "work", "x@y.com", "super-secret-rt", "s")
+    raw = sqlite3.connect(tmp_path / "data.db").execute(
+        "SELECT refresh_token_enc FROM accounts"
+    ).fetchone()[0]
+    assert b"super-secret-rt" not in raw
+    assert stat.S_IMODE(os.stat(tmp_path / "data.db").st_mode) == 0o600
+
+
+def test_per_owner_keys(tmp_path):
+    ka, kd = Fernet.generate_key().decode(), Fernet.generate_key().decode()
+    s = Storage(tmp_path / "x.db", TokenCipher(kd, {B: ka}))
+    s.upsert_account(B, "work", "b@w.com", "rt-b", "s")
+    s.upsert_account(A, "work", "a@w.com", "rt-a", "s")
+    assert s.get_refresh_token(B, "work") == "rt-b"
+    # B's token isn't decryptable with the default key
+    s2 = Storage(tmp_path / "x.db", TokenCipher(kd))
+    with pytest.raises(StorageError):
+        s2.get_refresh_token(B, "work")
+    assert s2.get_refresh_token(A, "work") == "rt-a"
+
+
+def test_upsert_overwrites(storage):
+    storage.upsert_account(A, "work", "old@w.com", "rt1", "s")
+    storage.touch_account(A, "work")
+    storage.upsert_account(A, "work", "new@w.com", "rt2", "s")
+    acct = storage.get_account(A, "work")
+    assert acct.email == "new@w.com" and acct.last_used_at is None
+    assert storage.get_refresh_token(A, "work") == "rt2"

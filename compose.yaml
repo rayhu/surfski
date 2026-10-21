@@ -1,0 +1,36 @@
+name: bonobo
+
+services:
+  app:
+    build: .
+    image: bonobo:latest
+    restart: unless-stopped
+    env_file: /etc/bonobo/env
+    environment:
+      # Inside the container the app must listen on all interfaces; only the
+      # host loopback port below is published.
+      HOST: 0.0.0.0
+      PORT: "8000"
+      DATA_DIR: /data
+    ports:
+      - "127.0.0.1:38000:8000"
+    volumes:
+      - bonobo-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).read()==b'ok' else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    # Own default network only: no shared networks with other stacks, never mount docker.sock.
+
+volumes:
+  bonobo-data:

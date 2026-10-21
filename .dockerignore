@@ -1,0 +1,14 @@
+.git
+.venv
+.claude
+.pytest_cache
+**/__pycache__
+*.db
+*.db-*
+env
+*.env
+.env*
+etc/
+deploy/
+tests/
+compose.yaml

@@ -1,0 +1,6 @@
+# Example site block for a host-level Caddy (or adapt for nginx/Traefik).
+# The app publishes only 127.0.0.1:38000; Caddy terminates TLS.
+# No `encode gzip`: MCP Streamable HTTP uses SSE, and compression can buffer the stream.
+mcp.example.com {
+	reverse_proxy 127.0.0.1:38000
+}
