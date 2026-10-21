@@ -3,8 +3,10 @@ cross-owner read path."""
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -39,6 +41,26 @@ CREATE TABLE IF NOT EXISTS pending_links (
 CREATE TABLE IF NOT EXISTS audit_log (
   ts TEXT, owner TEXT, tool TEXT, alias TEXT, detail TEXT, ok INTEGER
 );
+CREATE TABLE IF NOT EXISTS action_tokens (
+  nonce TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  purpose TEXT NOT NULL,
+  exp INTEGER NOT NULL,
+  used INTEGER NOT NULL DEFAULT 0,
+  data TEXT
+);
+CREATE TABLE IF NOT EXISTS owner_sessions (
+  id_hash TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  exp INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sends (
+  owner TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  ts INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS address_labels (
   owner TEXT NOT NULL,
   alias TEXT NOT NULL,
@@ -50,9 +72,13 @@ CREATE TABLE IF NOT EXISTS address_labels (
 """
 
 # Columns added after the first release; applied with a guarded ALTER TABLE.
-MIGRATIONS = [("accounts", "default_from", "TEXT")]
+MIGRATIONS = [
+    ("accounts", "default_from", "TEXT"),
+    ("accounts", "send_policy", "TEXT NOT NULL DEFAULT 'off'"),
+]
 
-ACCOUNT_COLS = "owner, alias, email, scopes, created_at, last_used_at, default_from"
+ACCOUNT_COLS = "owner, alias, email, scopes, created_at, last_used_at, default_from, send_policy"
+SEND_POLICIES = ("off", "confirm", "auto")  # ordered from least to most permissive
 
 
 class StorageError(Exception):
@@ -90,6 +116,7 @@ class Account:
     created_at: str
     last_used_at: str | None
     default_from: str | None = None
+    send_policy: str = "off"
 
     def public(self) -> dict:
         return {
@@ -98,6 +125,7 @@ class Account:
             "created_at": self.created_at,
             "last_used_at": self.last_used_at,
             "default_from": self.default_from,
+            "send_policy": self.send_policy,
         }
 
 
@@ -179,11 +207,16 @@ class Storage:
                 "SELECT email FROM accounts WHERE owner = ? AND alias = ?", (owner, alias)
             ).fetchone()
             if prev and prev["email"] != email:
-                # A different mailbox under the same alias: its labels/default don't apply.
+                # A different mailbox under the same alias: its labels, default From and
+                # send policy don't apply, and pending action links must die with it.
                 c.execute("DELETE FROM address_labels WHERE owner = ? AND alias = ?", (owner, alias))
                 c.execute(
-                    "UPDATE accounts SET default_from = NULL WHERE owner = ? AND alias = ?",
+                    "UPDATE accounts SET default_from = NULL, send_policy = 'off' "
+                    "WHERE owner = ? AND alias = ?",
                     (owner, alias),
+                )
+                c.execute(
+                    "UPDATE action_tokens SET used = 1 WHERE owner = ? AND alias = ?", (owner, alias)
                 )
             c.execute(
                 """INSERT INTO accounts (owner, alias, email, refresh_token_enc, scopes, created_at)
@@ -249,6 +282,9 @@ class Storage:
             c.execute(
                 "DELETE FROM address_labels WHERE owner = ? AND alias = ?", (owner.lower(), alias)
             )
+            c.execute(
+                "UPDATE action_tokens SET used = 1 WHERE owner = ? AND alias = ?", (owner.lower(), alias)
+            )
         return cur.rowcount > 0
 
     def rename_account(self, owner: str, old_alias: str, new_alias: str) -> None:
@@ -274,6 +310,13 @@ class Storage:
             c.execute(
                 "UPDATE address_labels SET alias = ? WHERE owner = ? AND alias = ?",
                 (new_alias, owner, old_alias),
+            )
+            c.execute(
+                "UPDATE sends SET alias = ? WHERE owner = ? AND alias = ?", (new_alias, owner, old_alias)
+            )
+            # Links name the old alias; kill them rather than let them dangle.
+            c.execute(
+                "UPDATE action_tokens SET used = 1 WHERE owner = ? AND alias = ?", (owner, old_alias)
             )
 
     # ---- send-from settings (always owner-scoped) ----
@@ -326,6 +369,103 @@ class Storage:
                     "INSERT INTO address_labels (owner, alias, address, label) VALUES (?, ?, ?, ?)",
                     (owner, alias, address, label),
                 )
+
+    # ---- sending (#2) ----
+
+    def set_send_policy(self, owner: str, alias: str, policy: str) -> None:
+        if policy not in SEND_POLICIES:
+            raise ValueError(f"send policy must be one of {', '.join(SEND_POLICIES)}")
+        owner, alias = owner.lower(), validate_alias(alias)
+        with self._tx() as c:
+            self._require_account(c, owner, alias)
+            c.execute(
+                "UPDATE accounts SET send_policy = ? WHERE owner = ? AND alias = ?",
+                (policy, owner, alias),
+            )
+
+    def add_action_token(
+        self, nonce: str, owner: str, alias: str, purpose: str, exp: int, data: str
+    ) -> None:
+        with self._tx() as c:
+            c.execute("DELETE FROM action_tokens WHERE exp < strftime('%s','now') - 86400")
+            c.execute(
+                "INSERT INTO action_tokens (nonce, owner, alias, purpose, exp, used, data) "
+                "VALUES (?, ?, ?, ?, ?, 0, ?)",
+                (nonce, owner.lower(), alias, purpose, exp, data),
+            )
+
+    def peek_action_token(self, nonce: str, owner: str, alias: str, purpose: str, now: int) -> str | None:
+        """Return the token's data if it exists, matches and is unused and unexpired."""
+        with self._tx() as c:
+            row = c.execute(
+                "SELECT data FROM action_tokens WHERE nonce = ? AND owner = ? AND alias = ? "
+                "AND purpose = ? AND used = 0 AND exp >= ?",
+                (nonce, owner.lower(), alias, purpose, now),
+            ).fetchone()
+        return row["data"] if row else None
+
+    def consume_action_token(self, nonce: str, owner: str, alias: str, purpose: str, now: int) -> str | None:
+        """Atomically mark a matching, unused, unexpired token used; returns its data."""
+        with self._tx() as c:
+            row = c.execute(
+                "SELECT data FROM action_tokens WHERE nonce = ? AND owner = ? AND alias = ? "
+                "AND purpose = ? AND used = 0 AND exp >= ?",
+                (nonce, owner.lower(), alias, purpose, now),
+            ).fetchone()
+            if not row:
+                return None
+            cur = c.execute("UPDATE action_tokens SET used = 1 WHERE nonce = ? AND used = 0", (nonce,))
+            return row["data"] if cur.rowcount == 1 else None
+
+    def create_owner_session(self, owner: str, ttl: int, now: int) -> str:
+        """New browser session for /send pages. Returns the raw id (cookie value);
+        only its sha256 is stored."""
+        raw = secrets.token_urlsafe(32)
+        with self._tx() as c:
+            c.execute("DELETE FROM owner_sessions WHERE exp < ?", (now,))
+            c.execute(
+                "INSERT INTO owner_sessions (id_hash, owner, created_at, exp) VALUES (?, ?, ?, ?)",
+                (hashlib.sha256(raw.encode()).hexdigest(), owner.lower(), now, now + ttl),
+            )
+        return raw
+
+    def get_owner_session(self, raw: str | None, now: int) -> tuple[str, int] | None:
+        """(owner, created_at) for a live session, else None."""
+        if not raw:
+            return None
+        with self._tx() as c:
+            row = c.execute(
+                "SELECT owner, created_at FROM owner_sessions WHERE id_hash = ? AND exp >= ?",
+                (hashlib.sha256(raw.encode()).hexdigest(), now),
+            ).fetchone()
+        return (row["owner"], row["created_at"]) if row else None
+
+    def reserve_send(self, owner: str, alias: str, cap: int, now: int) -> int | None:
+        """Atomically count sends in the rolling 24 h and, if under cap, record one.
+        Returns the reservation rowid, or None when the cap is reached."""
+        with self._tx() as c:
+            (n,) = c.execute(
+                "SELECT COUNT(*) FROM sends WHERE owner = ? AND alias = ? AND ts > ?",
+                (owner.lower(), alias, now - 86400),
+            ).fetchone()
+            if n >= cap:
+                return None
+            cur = c.execute(
+                "INSERT INTO sends (owner, alias, ts) VALUES (?, ?, ?)", (owner.lower(), alias, now)
+            )
+            return cur.lastrowid
+
+    def release_send(self, rowid: int) -> None:
+        with self._tx() as c:
+            c.execute("DELETE FROM sends WHERE rowid = ?", (rowid,))
+
+    def sends_today(self, owner: str, alias: str, now: int) -> int:
+        with self._tx() as c:
+            (n,) = c.execute(
+                "SELECT COUNT(*) FROM sends WHERE owner = ? AND alias = ? AND ts > ?",
+                (owner.lower(), alias, now - 86400),
+            ).fetchone()
+        return n
 
     # ---- pending links ----
 

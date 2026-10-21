@@ -391,3 +391,13 @@ async def test_signature_edited_in_gmail_after_draft(app, who, boxes, services):
     # Same identity (no switch): no refresh and no signature_replaced flag.
     r = await call(app, "update_draft", alias="work", draft_id="e1", subject="x")
     assert "signature_replaced" not in r
+
+
+async def test_signature_replaced_omitted_when_old_identity_had_none(app, who, boxes):
+    box = boxes["alice@work.com"]
+    box.identities[1]["signature"] = ""  # sales has no signature
+    sig_draft(box, "n1", "张三 <sales@work.org>", "Body")
+    r = await call(app, "update_draft", alias="work", draft_id="n1", from_address="alice@work.com",
+                   include_signature=True)
+    assert "signature_replaced" not in r
+    assert parse(box.updated[-1]).get_content().rstrip() == "Body\n\n-- \nAlice Wong"
