@@ -8,7 +8,6 @@ import html
 import logging
 import secrets
 import threading
-import textwrap
 import time
 import unicodedata
 from collections.abc import Callable
@@ -142,6 +141,15 @@ def caller_email(claims: dict) -> tuple[str | None, Any]:
     return (email.strip().lower() if isinstance(email, str) else None), verified
 
 
+def caller_hd(claims: dict) -> str | None:
+    """Google's hosted-domain claim (`hd`, the Workspace org's primary domain), from the
+    token claims, the userinfo data fastmcp's Google provider attaches, or upstream claims."""
+    for src in (claims, claims.get("google_user_data"), claims.get("upstream_claims")):
+        if isinstance(src, dict) and isinstance(src.get("hd"), str) and src["hd"].strip():
+            return src["hd"].strip().lower()
+    return None
+
+
 PAGE_HEADERS = {
     "Cache-Control": "no-store",
     # Links carry one-time tokens: never leak them, never let another site frame
@@ -212,7 +220,9 @@ def daily_cap_error(config: Config, alias: str) -> g.GmailError:
 _LINE_BREAKS = ("\r\n", "\r", "\x85", "\u2028", "\u2029", "\x0b", "\x0c")
 # Elicitation prompt layout: body lines are hard-wrapped so a client's soft wrap can't
 # start a visual line without the fence prefix; free-text header values are capped.
+# BODY_WRAP is the display width (columns) of a whole fenced line, prefix included.
 BODY_WRAP = 76
+BODY_PREFIX = "│ "
 FIELD_MAX = 200
 
 
@@ -238,6 +248,46 @@ def clean_body(text: str) -> str:
         text = text.replace(br, "\n")
     text = "".join(c if c == "\n" or unicodedata.category(c) != "Cc" else " " for c in text)
     return "\n".join(" ".join(line.split()) for line in text.split("\n"))
+
+
+def char_width(c: str) -> int:
+    """Terminal-style display width: 0 for combining marks, 2 for East Asian wide/fullwidth."""
+    if unicodedata.combining(c):
+        return 0
+    return 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+
+
+def display_width(text: str) -> int:
+    return sum(char_width(c) for c in text)
+
+
+def wrap_display(line: str, width: int) -> list[str]:
+    """Greedy word wrap by display width; words wider than `width` are broken."""
+    out: list[str] = []
+    cur, cur_w = "", 0
+    for word in line.split(" "):
+        word_w = display_width(word)
+        gap = 1 if cur else 0
+        if cur_w + gap + word_w <= width:
+            cur, cur_w = (cur + " " + word if cur else word), cur_w + gap + word_w
+            continue
+        if cur:
+            out.append(cur)
+        while word_w > width:
+            piece, piece_w = "", 0
+            for c in word:
+                if piece_w + char_width(c) > width:
+                    break
+                piece, piece_w = piece + c, piece_w + char_width(c)
+            if not piece:  # width narrower than one character: emit it anyway, never loop
+                piece = word[0]
+            out.append(piece)
+            word = word[len(piece):]
+            word_w = display_width(word)
+        cur, cur_w = word, word_w
+    if cur or not out:
+        out.append(cur)
+    return out
 
 
 def _no_markup(value: str) -> str:
@@ -300,8 +350,8 @@ def confirm_message(acct, info: dict, recipients: list[str]) -> str:
         lines += [bcc_warning]
     lines += ["", f"Message (first {PREVIEW_CHARS} characters):", BODY_BEGIN]
     for line in _no_markup(preview).split("\n"):
-        pieces = textwrap.wrap(line, BODY_WRAP, break_long_words=True, break_on_hyphens=False)
-        lines += ["│ " + piece for piece in pieces or [""]]
+        budget = BODY_WRAP - display_width(BODY_PREFIX)
+        lines += [BODY_PREFIX + piece for piece in wrap_display(line, budget)]
     lines += [BODY_END, "",
               f"Summary (from the server): sends to {len(recipients)} recipient(s): "
               f"To {counts['to']}, Cc {counts['cc']}, Bcc {counts['bcc']}."]
@@ -328,6 +378,7 @@ def commit_confirmed_send(
     draft_id: str,
     message_id: str,
     changed_error: str,
+    hd: str | None,
     before_send: Callable[[int], None] | None = None,
 ) -> tuple[dict, int, str]:
     """Send a draft a human just confirmed, after rechecking everything: the mailbox is
@@ -336,8 +387,9 @@ def commit_confirmed_send(
     g.GmailError (user-facing) and sends nothing if any check fails. `before_send(now)`
     runs after the cap reservation and right before sending (the link path burns its
     token there); if it raises, the reservation is released.
-    Returns (sent, recipient_count, policy)."""
-    if owner not in config.allowed_users:
+    `hd` is the owner's Google hosted domain as verified by Google (from the tool call's
+    token or the owner's /send session). Returns (sent, recipient_count, policy)."""
+    if not config.is_allowed(owner, email_verified=True, hd=hd):
         raise g.GmailError("this Google account is no longer allowed to use this server; nothing was sent")
     try:
         acct = storage.get_account(owner, alias)
@@ -495,8 +547,10 @@ def create_app(
     # handy for tests/ops
     mcp.surfski = {"storage": storage, "config": config, "token_cache": token_cache,
                    "send_as_cache": send_as_cache}
-    # Sessions of owners removed from ALLOWED_USERS (or expired) are useless; drop them.
-    storage.prune_owner_sessions(config.allowed_users, int(time.time()))
+    # Sessions of owners no longer allowed (or expired) are useless; drop them.
+    # Sessions are only created after Google verified the email; `hd` was recorded then.
+    storage.prune_owner_sessions(
+        lambda owner, hd: config.is_allowed(owner, email_verified=True, hd=hd), int(time.time()))
 
     # -- identity
 
@@ -504,17 +558,29 @@ def create_app(
         token = get_access_token()
         if token is None:
             raise ToolError("not authenticated")
-        email, verified = caller_email(token.claims or {})
+        claims = token.claims or {}
+        email, verified = caller_email(claims)
         if not email:
             raise ToolError("not authenticated: no email in token")
         if verified is not None and not _is_true(verified):
             raise ToolError("your Google email is not verified")
-        if email not in config.allowed_users:
+        if not config.is_allowed(email, email_verified=verified, hd=caller_hd(claims)):
             log.warning("rejected non-allowlisted caller tool=%s", tool)
+            if email not in config.allowed_users and email.rpartition("@")[2] in config.allowed_domains:
+                if not _is_true(verified):
+                    raise ToolError("your Google email is not verified")
+                raise ToolError("only Google Workspace accounts managed by your organization's domain "
+                                "may use this server (personal Google accounts on a company address "
+                                "are not allowed)")
             raise ToolError("this Google account is not allowed to use this server")
         if not limiter.allow(email):
             raise ToolError("rate limit exceeded; slow down and retry in a minute")
         return email
+
+    def current_hd() -> str | None:
+        """The calling user's verified hosted domain (call only after require_owner)."""
+        token = get_access_token()
+        return caller_hd((token.claims or {}) if token else {})
 
     def resolve(owner: str, alias: str):
         try:
@@ -637,9 +703,9 @@ def create_app(
                 f"{e}. Nothing was sent; draft {draft_id} was kept (see list_drafts)."
             ) from None
 
-    def issue_confirm_link(owner: str, p: dict, reason: str) -> dict:
+    def issue_confirm_link(owner: str, hd: str | None, p: dict, reason: str) -> dict:
         """The owner-session-bound confirm link (the fallback channel)."""
-        if owner not in config.allowed_users:
+        if not config.is_allowed(owner, email_verified=True, hd=hd):
             raise ToolError("this Google account is not allowed to use this server; nothing was sent")
         try:
             a = storage.get_account(owner, p["alias"])
@@ -651,7 +717,7 @@ def create_app(
         token = snd.issue_action(
             storage, config.state_secret, owner=owner, alias=a.alias, email=a.email,
             purpose=snd.PURPOSE_SEND,
-            data={"draft_id": p["draft_id"], "message_id": p["message_id"]},
+            data={"draft_id": p["draft_id"], "message_id": p["message_id"], "hd": hd},
         )
         write_audit(storage, owner, p["tool"], a.alias,
                     f"policy=confirm recipients={p['recipients']} draft={p['draft_id']} "
@@ -676,6 +742,7 @@ def create_app(
         if p is None:
             return r
         tool, alias, draft_id = p["tool"], p["alias"], p["draft_id"]
+        hd = current_hd()
         reason = elicitation_unavailable(config)
         if reason is None:
             try:
@@ -694,7 +761,7 @@ def create_app(
                 try:
                     sent, n, policy = await anyio.to_thread.run_sync(lambda: commit_confirmed_send(
                         config, storage, make_service, owner=owner, alias=alias, email=p["email"],
-                        draft_id=draft_id, message_id=p["message_id"],
+                        draft_id=draft_id, message_id=p["message_id"], hd=hd,
                         changed_error="not sent: the draft was edited after it was shown for "
                                       "confirmation",
                     ))
@@ -710,7 +777,7 @@ def create_app(
                             "channel=elicitation result=accepted", True)
                 return {**r, "status": "sent", "sent": True, "draft_id": draft_id,
                         "confirm_channel": "elicitation", **sent}
-        return {**r, **issue_confirm_link(owner, p, reason)}
+        return {**r, **issue_confirm_link(owner, hd, p, reason)}
 
     # -- account tools
 
@@ -817,6 +884,7 @@ def create_app(
             owner=owner,
             alias=alias,
             login_hint=login_hint,
+            hd=current_hd(),
         )
         write_audit(storage, owner, tool, alias, "link started", True)
         return {
@@ -1360,7 +1428,7 @@ def create_app(
                 return {"ok": True, "send_policy": policy}
             token = snd.issue_action(
                 storage, config.state_secret, owner=owner, alias=acct.alias, email=acct.email,
-                purpose=snd.PURPOSE_RAISE, data={"policy": policy},
+                purpose=snd.PURPOSE_RAISE, data={"policy": policy, "hd": current_hd()},
             )
             write_audit(storage, owner, "set_send_policy", acct.alias,
                         f"{acct.send_policy}->{policy} requested", True)
@@ -1404,7 +1472,8 @@ def create_app(
         try:
             payload, verifier = consume_state(storage, config.state_secret, state)
             owner, alias = payload["owner"], payload["alias"]
-            if owner not in config.allowed_users:
+            # hd was recorded from the caller's Google-verified token when the link started.
+            if not config.is_allowed(owner, email_verified=True, hd=payload.get("hd")):
                 raise LinkError("this account is not allowed to use this server")
             async with http_factory() as http:
                 tokens = await exchange_code(
@@ -1450,7 +1519,9 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
     def load_action(token: str | None, purpose: str):
         payload = snd.verify_action(config.state_secret, token or "", purpose)
         owner, alias = payload["o"], payload["a"]
-        if owner not in config.allowed_users:
+        data = snd.token_data(storage.peek_action_token(payload["n"], owner, alias, purpose, int(time.time())))
+        # The token's server-side data holds the hd verified when the tool minted it.
+        if not config.is_allowed(owner, email_verified=True, hd=(data or {}).get("hd")):
             raise snd.ActionError("this Google account is no longer allowed to use this server")
         try:
             acct = storage.get_account(owner, alias)
@@ -1458,16 +1529,16 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
             raise snd.ActionError("this mailbox is no longer linked") from None
         if acct.email != payload["e"]:
             raise snd.ActionError("this mailbox was relinked since the link was made; ask Claude for a new one")
-        data = snd.token_data(storage.peek_action_token(payload["n"], owner, alias, purpose, int(time.time())))
         if data is None:
             raise snd.ActionError("this link was already used or has expired; ask Claude for a new one")
         return payload, acct, data
 
-    def session_for(request: Request, owner: str, max_age: int | None = None) -> bool:
+    def session_for(request: Request, owner: str, max_age: int | None = None):
+        """The owner's live /send session (owner, created_at, hd), or None."""
         s = storage.get_owner_session(request.cookies.get(snd.SESSION_COOKIE), int(time.time()))
-        if not s or s[0] != owner or owner not in config.allowed_users:
-            return False
-        return max_age is None or time.time() - s[1] <= max_age
+        if not s or s[0] != owner or not config.is_allowed(owner, email_verified=True, hd=s[2]):
+            return None
+        return s if max_age is None or time.time() - s[1] <= max_age else None
 
     def signin_page(title: str, token: str, owner: str, why: str) -> HTMLResponse:
         inner = (
@@ -1536,7 +1607,7 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
             if auth is None:
                 raise snd.ActionError("this sign-in was already used or has expired; start again from the link")
             async with http_factory() as http:
-                email = await snd.reauth_email(
+                email, hd = await snd.reauth_email(
                     http, client_id=config.google_client_id, client_secret=config.google_client_secret,
                     redirect_uri=config.send_auth_redirect_uri, code=q["code"],
                     code_verifier=auth["verifier"], nonce=auth["nonce"],
@@ -1544,11 +1615,11 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
             if email != owner:
                 write_audit(storage, owner, "send_auth", alias, "reauth email mismatch", False)
                 raise snd.ActionError(f"you signed in as {email}, but this needs {owner}. Nothing changed.")
-            if owner not in config.allowed_users:
+            if not config.is_allowed(owner, email_verified=True, hd=hd):  # reauth_email checked verified
                 raise snd.ActionError("this Google account is not allowed to use this server")
         except Exception as err:  # noqa: BLE001
             return error_page("Not signed in", err)
-        sid = storage.create_owner_session(owner, snd.SESSION_TTL_SECONDS, int(time.time()))
+        sid = storage.create_owner_session(owner, snd.SESSION_TTL_SECONDS, int(time.time()), hd=hd)
         write_audit(storage, owner, "send_auth", alias, "session created", True)
         # No redirect: a SameSite=Strict cookie isn't sent on a redirect chain that
         # started at Google. The user clicks a same-origin link instead.
@@ -1620,7 +1691,8 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
         try:
             payload, acct, data = load_action(token, snd.PURPOSE_SEND)
             owner, alias = acct.owner, acct.alias
-            if not session_for(request, owner):
+            session = session_for(request, owner)
+            if not session:
                 raise snd.ActionError(f"sign in as {owner} first: open the link again")
 
             def burn(now: int) -> None:
@@ -1632,7 +1704,7 @@ def register_send_routes(mcp: FastMCP, config: Config, storage: Storage, make_se
             def work():
                 return commit_confirmed_send(
                     config, storage, make_service, owner=owner, alias=alias, email=payload["e"],
-                    draft_id=data["draft_id"], message_id=data["message_id"],
+                    draft_id=data["draft_id"], message_id=data["message_id"], hd=session[2],
                     changed_error="the draft was edited after this link was created; nothing "
                                   "was sent. Ask Claude for a new link.",
                     before_send=burn,

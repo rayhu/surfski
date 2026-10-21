@@ -215,10 +215,10 @@ async def reauth_email(
     code_verifier: str,
     nonce: str,
     now: float | None = None,
-) -> str:
+) -> tuple[str, str | None]:
     """Exchange the code, verify the id_token with Google's tokeninfo endpoint
     (signature checked by Google; we check aud, iss, exp, iat, nonce, email_verified
-    and auth_time if present) and return the lowercased email."""
+    and auth_time if present) and return (lowercased email, hosted domain `hd` or None)."""
     resp = await http.post(
         TOKEN_ENDPOINT,
         data={
@@ -254,9 +254,10 @@ async def reauth_email(
     email = str(claims.get("email") or "").strip().lower()
     if not email or str(claims.get("email_verified")).lower() != "true":
         raise ActionError("your Google email is not verified")
+    hd = str(claims.get("hd") or "").strip().lower() or None
     if tokens.get("access_token"):
         try:  # best effort: we only needed the identity
             await http.post("https://oauth2.googleapis.com/revoke", data={"token": tokens["access_token"]})
         except httpx.HTTPError:
             pass
-    return email
+    return email, hd

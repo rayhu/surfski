@@ -9,6 +9,7 @@ import re
 import secrets
 import sqlite3
 import threading
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -79,6 +80,8 @@ CREATE TABLE IF NOT EXISTS address_labels (
 MIGRATIONS = [
     ("accounts", "default_from", "TEXT"),
     ("accounts", "send_policy", "TEXT NOT NULL DEFAULT 'off'"),
+    # Google hosted domain verified at sign-in (#6): domain-allowlisted sessions need it.
+    ("owner_sessions", "hd", "TEXT"),
 ]
 
 ACCOUNT_COLS = "owner, alias, email, scopes, created_at, last_used_at, default_from, send_policy"
@@ -429,15 +432,17 @@ class Storage:
             cur = c.execute("UPDATE action_tokens SET used = 1 WHERE nonce = ? AND used = 0", (nonce,))
             return row["data"] if cur.rowcount == 1 else None
 
-    def create_owner_session(self, owner: str, ttl: int, now: int) -> str:
+    def create_owner_session(self, owner: str, ttl: int, now: int, hd: str | None = None) -> str:
         """New browser session for /send pages. Returns the raw id (cookie value);
-        only its sha256 is stored."""
+        only its sha256 is stored, with the Google hosted domain (`hd`) verified at
+        sign-in, if any."""
         raw = secrets.token_urlsafe(32)
         with self._tx() as c:
             c.execute("DELETE FROM owner_sessions WHERE exp < ?", (now,))
             c.execute(
-                "INSERT INTO owner_sessions (id_hash, owner, created_at, exp) VALUES (?, ?, ?, ?)",
-                (hashlib.sha256(raw.encode()).hexdigest(), owner.lower(), now, now + ttl),
+                "INSERT INTO owner_sessions (id_hash, owner, created_at, exp, hd) VALUES (?, ?, ?, ?, ?)",
+                (hashlib.sha256(raw.encode()).hexdigest(), owner.lower(), now, now + ttl,
+                 (hd or "").strip().lower() or None),
             )
         return raw
 
@@ -450,26 +455,26 @@ class Storage:
             )
         return cur.rowcount > 0
 
-    def prune_owner_sessions(self, allowed_owners: frozenset[str] | set[str], now: int) -> int:
-        """Drop expired sessions and those of owners no longer allowed."""
+    def prune_owner_sessions(self, is_allowed: Callable[[str, str | None], bool], now: int) -> int:
+        """Drop expired sessions and those whose (owner, hd) is no longer allowed."""
         with self._tx() as c:
-            rows = c.execute("SELECT DISTINCT owner FROM owner_sessions").fetchall()
-            gone = [r["owner"] for r in rows if r["owner"] not in allowed_owners]
             n = c.execute("DELETE FROM owner_sessions WHERE exp < ?", (now,)).rowcount
-            for o in gone:
-                n += c.execute("DELETE FROM owner_sessions WHERE owner = ?", (o,)).rowcount
+            rows = c.execute("SELECT id_hash, owner, hd FROM owner_sessions").fetchall()
+            for r in rows:
+                if not is_allowed(r["owner"], r["hd"]):
+                    n += c.execute("DELETE FROM owner_sessions WHERE id_hash = ?", (r["id_hash"],)).rowcount
         return n
 
-    def get_owner_session(self, raw: str | None, now: int) -> tuple[str, int] | None:
-        """(owner, created_at) for a live session, else None."""
+    def get_owner_session(self, raw: str | None, now: int) -> tuple[str, int, str | None] | None:
+        """(owner, created_at, hd) for a live session, else None."""
         if not raw:
             return None
         with self._tx() as c:
             row = c.execute(
-                "SELECT owner, created_at FROM owner_sessions WHERE id_hash = ? AND exp >= ?",
+                "SELECT owner, created_at, hd FROM owner_sessions WHERE id_hash = ? AND exp >= ?",
                 (hashlib.sha256(raw.encode()).hexdigest(), now),
             ).fetchone()
-        return (row["owner"], row["created_at"]) if row else None
+        return (row["owner"], row["created_at"], row["hd"]) if row else None
 
     def reserve_send(self, owner: str, alias: str, cap: int, now: int) -> int | None:
         """Atomically count sends in the rolling 24 h and, if under cap, record one.

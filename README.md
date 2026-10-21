@@ -57,7 +57,7 @@ There are two separate OAuth layers, and both use the same Google OAuth client:
 
 | Layer | Proves | Scopes | Redirect URI |
 |---|---|---|---|
-| A. MCP login | *which Claude user* is calling, checked against `ALLOWED_USERS` | `openid`, `userinfo.email` | `https://<host>/auth/callback` |
+| A. MCP login | *which Claude user* is calling, checked against `ALLOWED_USERS` / `ALLOWED_DOMAINS` | `openid`, `userinfo.email` | `https://<host>/auth/callback` |
 | B. Mailbox link | access to *one mailbox* | `gmail.readonly`, `gmail.compose` | `https://<host>/gmail/callback` |
 
 ## Quickstart (self-host)
@@ -98,11 +98,13 @@ python3 scripts/gen_secrets.py
 ```
 
 Paste the four generated secrets into `/etc/surfski/env`, then fill in `BASE_URL`,
-`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and `ALLOWED_USERS`. The server **refuses to start**
-if any secret is missing or malformed.
+`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and `ALLOWED_USERS` (and/or `ALLOWED_DOMAINS` to allow
+a whole Workspace domain). The server **refuses to start** if any secret is missing or malformed, or
+if both allowlists are empty.
 
 > **Aliases:** Google sign-in reports a user's **primary** address. If your Workspace uses alias
-> domains, put the primary addresses in `ALLOWED_USERS`. Linking an alias address links the
+> domains, put the primary addresses in `ALLOWED_USERS`, or the Workspace primary domain in
+> `ALLOWED_DOMAINS` (an alias domain never matches; Google's `hd` claim must equal the primary domain). Linking an alias address links the
 > primary mailbox behind it.
 
 ### 3. Run
@@ -183,7 +185,8 @@ keys, users simply relink their mailboxes.
 |---|---|---|
 | `BASE_URL` | yes | Public URL, e.g. `https://mcp.example.com`. Must be https unless it is localhost. |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | yes | Web OAuth client |
-| `ALLOWED_USERS` | yes | Comma-separated primary Google addresses allowed to use the server |
+| `ALLOWED_USERS` | one of these two | Comma-separated primary Google addresses allowed to use the server |
+| `ALLOWED_DOMAINS` | one of these two | Comma-separated Google Workspace domains (e.g. `example.com`, no `@`) whose users may use the server. List the Workspace org's **primary** domain. A user matches only if the domain of their **primary** address equals it exactly (subdomains and alias domains never match) **and** Google's hosted-domain claim `hd` equals it too, with a verified email. So only accounts managed by that Workspace org get in: a personal Google account registered on a company address has no `hd` and is rejected by design (add it to `ALLOWED_USERS` if you really want it). Public mail providers (gmail.com, outlook.com, yahoo.com, icloud.com, …) are refused at startup: list those users in `ALLOWED_USERS` |
 | `JWT_SIGNING_KEY` | yes | Signs FastMCP session tokens (≥32 chars) |
 | `STORAGE_ENCRYPTION_KEY` | yes | Fernet key for the OAuth client store |
 | `TOKEN_ENCRYPTION_KEY` | yes | Fernet key for stored Gmail refresh tokens |
@@ -324,7 +327,7 @@ alias, short detail, never bodies or email addresses). Message content is never 
   `DATA_DIR/oauth`) expire on their own; remove the connector in Claude to end them at once.
   Backups you made earlier still contain the old data.
 - On the sending pages, **Sign out** ends the browser session; sessions of users removed from
-  `ALLOWED_USERS` stop working at once and are deleted at startup.
+  `ALLOWED_USERS` (or whose domain leaves `ALLOWED_DOMAINS`) stop working at once and are deleted at startup.
 
 ## Hosting this for the public
 

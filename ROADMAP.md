@@ -79,7 +79,8 @@ See [Calendar module](#calendar-module).
 
 ## Phase 2: self-host polish
 
-- `ALLOWED_DOMAINS`: allow a whole Workspace domain as well as individual addresses.
+- ✅ `ALLOWED_DOMAINS`: allow a whole Workspace domain as well as individual addresses (#6). Exact
+  domain match on the primary address; public mail providers are refused.
 - **Admin CLI** (`surfski admin …`): list owners and aliases, force-unlink, rotate
   `TOKEN_ENCRYPTION_KEY` by re-encrypting existing rows.
 - **Mailbox triage, opt-in**: `mark_read`, `star`, `archive`, `apply_label`. It needs `gmail.modify`,
