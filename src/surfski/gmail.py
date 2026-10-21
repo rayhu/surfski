@@ -13,6 +13,7 @@ import mimetypes
 import re
 import threading
 import time
+from dataclasses import dataclass
 from email.headerregistry import Address
 from email.message import EmailMessage
 from email.utils import formataddr, getaddresses, parseaddr
@@ -589,8 +590,15 @@ def op_create_draft(
     bcc: str | None,
     reply_to_message_id: str | None,
     include_signature: bool = False,
+    attachments: list[dict] | None = None,
+    max_attachment_bytes: int = 0,
 ) -> dict:
-    """choose_from(reply_recipient_addresses) picks the sending identity."""
+    """choose_from(reply_recipient_addresses) picks the sending identity. `attachments`
+    ([{message_id, part_id}]) are copied from messages in this mailbox."""
+    max_attachment_bytes = max_attachment_bytes or FORWARD_MAX_ATTACHMENT_BYTES
+    pending = resolve_attachment_refs(svc, attachments)
+    check_attachment_total(pending, max_attachment_bytes, "attachment",
+                           "Attach fewer files, or add them in Gmail.")
     users = svc.users()
     thread_id = in_reply_to = references = None
     recipients: list[str] = []
@@ -622,16 +630,19 @@ def op_create_draft(
         in_reply_to=in_reply_to,
         references=references,
     )
-    message: dict[str, Any] = {"raw": encode_raw(mime)}
-    if thread_id:
-        message["threadId"] = thread_id
-    draft = users.drafts().create(userId="me", body={"message": message}).execute()
-    return {
+    attached, skipped, total = attach_parts(svc, mime, pending, max_attachment_bytes)
+    draft = save_draft(svc, mime, thread_id=thread_id)
+    out: dict[str, Any] = {
         "draft_id": draft.get("id"),
         "thread_id": thread_id,
         "from": identity["address"],
         "from_source": source,
     }
+    if pending:
+        out.update(attachments=attached, attachment_bytes=total)
+    if skipped:
+        out["skipped"] = skipped
+    return out
 
 
 def op_list_drafts(svc, max_results: int, page_token: str | None) -> dict:
@@ -681,21 +692,40 @@ def op_update_draft(
     body: str | None,
     cc: str | None,
     bcc: str | None,
+    add_attachments: list[dict] | None = None,
+    remove_attachments: list[str] | None = None,
+    max_attachment_bytes: int = 0,
 ) -> dict:
     """Rebuild a draft's MIME. None keeps the current value; "" clears cc/bcc.
     threadId, In-Reply-To and References are always preserved. From is kept unless
-    choose_from(current_from_address) returns an identity."""
-    drafts = svc.users().drafts()
-    current = drafts.get(userId="me", id=draft_id, format="full").execute()
+    choose_from(current_from_address) returns an identity.
+
+    Attachments (#16): the draft's current attachments are kept (inline images become
+    regular attachments), minus `remove_attachments` (exact filename, as listed by
+    get_draft, or part_id; a name removes every attachment with that name), plus
+    `add_attachments` ([{message_id, part_id}] from this mailbox). The total of what
+    is kept and added must fit the attachment limit, checked before any download."""
+    max_attachment_bytes = max_attachment_bytes or FORWARD_MAX_ATTACHMENT_BYTES
+    current = svc.users().drafts().get(userId="me", id=draft_id, format="full").execute()
     msg = current.get("message") or {}
     payload = msg.get("payload") or {}
-    if extract_attachments(payload):
-        raise GmailError(
-            "this draft has attachments, which update_draft would drop; edit it in Gmail instead"
-        )
+    kept = message_attachments(msg.get("id") or "", payload)
+    removed: list[str] = []
+    for ref in dict.fromkeys(r.strip() for r in (remove_attachments or []) if r.strip()):
+        hit = [p for p in kept if p.part_id == ref or p.name == ref]
+        if not hit:
+            listing = "; ".join(f"{p.name} [part_id {p.part_id}]" for p in kept) or "none"
+            raise GmailError(f"no attachment '{ref}' on this draft. Attachments: {listing}")
+        removed += [p.name for p in hit]
+        kept = [p for p in kept if all(p is not x for x in hit)]
+    added = resolve_attachment_refs(svc, add_attachments, start=len(kept) + 1,
+                                    seen={(p.message_id, p.part_id) for p in kept})
+    pending = kept + added
+    check_attachment_total(pending, max_attachment_bytes, "attachment",
+                           "Remove some attachments, or edit the draft in Gmail.")
     parts = list(_walk(payload))
     if body is None and any(
-        (p.get("mimeType") or "").lower().startswith("text/")
+        not _is_attachment(p) and (p.get("mimeType") or "").lower().startswith("text/")
         and (p.get("body") or {}).get("attachmentId")
         and not (p.get("body") or {}).get("data")
         for p in parts
@@ -740,12 +770,16 @@ def op_update_draft(
         in_reply_to=h.get("in-reply-to") or None,
         references=h.get("references") or None,
     )
-    message: dict[str, Any] = {"raw": encode_raw(mime)}
-    if msg.get("threadId"):
-        # Without threadId Gmail silently detaches the draft from its thread.
-        message["threadId"] = msg["threadId"]
-    updated = drafts.update(userId="me", id=draft_id, body={"id": draft_id, "message": message}).execute()
+    attached, skipped, total = attach_parts(svc, mime, pending, max_attachment_bytes)
+    # Without threadId Gmail silently detaches the draft from its thread.
+    updated = save_draft(svc, mime, thread_id=msg.get("threadId"), draft_id=draft_id)
     out: dict[str, Any] = {"draft_id": updated.get("id", draft_id)}
+    if pending or removed:
+        out.update(attachments=attached, attachment_bytes=total)
+    if removed:
+        out["removed_attachments"] = removed
+    if skipped:
+        out["skipped"] = skipped
     if chosen:
         out["from"], out["from_source"] = chosen[0]["address"], chosen[1]
     if signature_replaced is not None:
@@ -792,6 +826,147 @@ def _attachment_name(part: dict, index: int) -> str:
     return f"inline-{index}{ext}"
 
 
+# ---------------------------------------------------------------- attachments (#15, #16)
+# Attachments always come from messages in the same mailbox: the same `svc` (one
+# owner + alias) reads the source message and writes the draft.
+
+MAX_ATTACHMENT_REFS = 20
+
+
+@dataclass
+class PendingAttachment:
+    """An attachment part to copy into a draft: where it lives, its name and its
+    declared size (body.size). Nothing is downloaded until add_attachments."""
+
+    message_id: str
+    part: dict
+    name: str
+    size: int
+
+    @property
+    def part_id(self) -> str | None:
+        return self.part.get("partId")
+
+
+def _source_message(users, message_id: str, cache: dict[str, dict]) -> dict:
+    if message_id not in cache:
+        try:
+            cache[message_id] = users.messages().get(userId="me", id=message_id, format="full").execute()
+        except HttpError as e:
+            if getattr(e.resp, "status", None) in (400, 404):
+                raise GmailError(
+                    f"attachment source message '{message_id}' isn't in this mailbox: attachments "
+                    "can only come from messages in the same mailbox (alias)"
+                ) from None
+            raise
+    return cache[message_id]
+
+
+def message_attachments(message_id: str, payload: dict, start: int = 1) -> list[PendingAttachment]:
+    """Every attachment part of a message (inline images included, as regular attachments)."""
+    parts = [p for p in _walk(payload) if _is_attachment(p)]
+    return [PendingAttachment(message_id, p, _attachment_name(p, i), int((p.get("body") or {}).get("size") or 0))
+            for i, p in enumerate(parts, start)]
+
+
+def resolve_attachment_refs(
+    svc,
+    refs: list[dict] | None,
+    *,
+    start: int = 1,
+    seen: set[tuple[str, str | None]] | None = None,
+    cache: dict[str, dict] | None = None,
+) -> list[PendingAttachment]:
+    """Resolve [{message_id, part_id}] in this mailbox (metadata only). Identical
+    (message_id, part_id) pairs, and pairs already in `seen`, are skipped."""
+    refs = refs or []
+    if len(refs) > MAX_ATTACHMENT_REFS:
+        raise GmailError(f"at most {MAX_ATTACHMENT_REFS} attachments per call")
+    users = svc.users()
+    seen = set() if seen is None else seen
+    cache = {} if cache is None else cache
+    out: list[PendingAttachment] = []
+    for r in refs:
+        mid, pid = str(r.get("message_id") or "").strip(), str(r.get("part_id") or "").strip()
+        if not mid or not pid:
+            raise GmailError("each attachment needs a message_id and a part_id (from get_message)")
+        if (mid, pid) in seen:
+            continue
+        msg = _source_message(users, mid, cache)
+        part = find_attachment(msg.get("payload") or {}, pid)
+        key = (mid, part.get("partId"))
+        seen.update({(mid, pid), key})
+        if key in {(p.message_id, p.part_id) for p in out}:
+            continue
+        out.append(PendingAttachment(mid, part, _attachment_name(part, start + len(out)),
+                                     int((part.get("body") or {}).get("size") or 0)))
+    return out
+
+
+def check_attachment_total(pending: list[PendingAttachment], limit: int, label: str, advice: str) -> int:
+    """Total declared size, checked before anything is downloaded."""
+    total = sum(p.size for p in pending)
+    if total > limit:
+        listing = ", ".join(f"{p.name} ({_mb(p.size)})" for p in pending)
+        raise GmailError(f"attachments total {_mb(total)}, over the {_mb(limit)} {label} limit: "
+                         f"{listing}. {advice}")
+    return total
+
+
+def attach_parts(svc, mime: EmailMessage, pending: list[PendingAttachment],
+                    limit: int) -> tuple[list[str], list[dict], int]:
+    """Download and attach each part: (attached names, skipped, bytes attached)."""
+    users = svc.users()
+    attached: list[str] = []
+    skipped: list[dict] = []
+    total = 0
+    for p in pending:
+        pbody = p.part.get("body") or {}
+        data = pbody.get("data")
+        if not data and pbody.get("attachmentId"):
+            data = (
+                users.messages().attachments()
+                .get(userId="me", messageId=p.message_id, id=pbody["attachmentId"])
+                .execute()
+                .get("data")
+            )
+        if not data:
+            skipped.append({"filename": p.name, "reason": "no content available"})
+            continue
+        raw = _decode_b64(data)
+        total += len(raw)
+        if total > limit:  # body.size understated the content
+            raise GmailError(f"attachments are over the {_mb(limit)} limit; nothing was saved")
+        mime_type = (p.part.get("mimeType") or "application/octet-stream").lower()
+        maintype, _, subtype = mime_type.partition("/")
+        # An attached email goes out as an opaque .eml (octet-stream): the email
+        # package is strict about transfer encodings inside message/rfc822.
+        if maintype in ("multipart", "message") or not subtype:
+            maintype, subtype = "application", "octet-stream"
+        mime.add_attachment(raw, maintype=maintype, subtype=subtype, filename=p.name)
+        attached.append(p.name)
+    return attached, skipped, total
+
+
+def save_draft(svc, mime: EmailMessage, *, thread_id: str | None = None,
+               draft_id: str | None = None) -> dict:
+    """Create (or, with draft_id, replace) a draft. Large messages go up as
+    message/rfc822 media instead of a JSON 'raw' field."""
+    drafts = svc.users().drafts()
+    raw_bytes = mime.as_bytes()
+    message: dict[str, Any] = {"threadId": thread_id} if thread_id else {}
+    kwargs: dict[str, Any] = {}
+    if len(raw_bytes) * 4 // 3 > RAW_JSON_LIMIT:
+        kwargs["media_body"] = MediaIoBaseUpload(io.BytesIO(raw_bytes), mimetype="message/rfc822",
+                                                 resumable=True)
+    else:
+        message["raw"] = base64.urlsafe_b64encode(raw_bytes).decode()
+    if draft_id:
+        return drafts.update(userId="me", id=draft_id, body={"id": draft_id, "message": message},
+                             **kwargs).execute()
+    return drafts.create(userId="me", body={"message": message}, **kwargs).execute()
+
+
 def op_forward_message(
     svc,
     *,
@@ -803,22 +978,18 @@ def op_forward_message(
     bcc: str | None,
     include_signature: bool = False,
     max_attachment_bytes: int = FORWARD_MAX_ATTACHMENT_BYTES,
+    attachments: list[dict] | None = None,
 ) -> dict:
     """Save a forward of message_id as a new draft (new thread), re-attaching the
-    original's attachments."""
-    users = svc.users()
-    orig = users.messages().get(userId="me", id=message_id, format="full").execute()
+    original's attachments, plus any extra `attachments` from this mailbox."""
+    orig = svc.users().messages().get(userId="me", id=message_id, format="full").execute()
     payload = orig.get("payload") or {}
     h = headers_map(payload)
-    parts = [p for p in _walk(payload) if _is_attachment(p)]
-    sizes = [(_attachment_name(p, i), int((p.get("body") or {}).get("size") or 0)) for i, p in enumerate(parts, 1)]
-    total = sum(n for _, n in sizes)
-    if total > max_attachment_bytes:
-        listing = ", ".join(f"{name} ({_mb(n)})" for name, n in sizes)
-        raise GmailError(
-            f"attachments total {_mb(total)}, over the {_mb(max_attachment_bytes)} forward limit: "
-            f"{listing}. Forward it from Gmail instead."
-        )
+    pending = message_attachments(message_id, payload)
+    pending += resolve_attachment_refs(
+        svc, attachments, start=len(pending) + 1,
+        seen={(p.message_id, p.part_id) for p in pending}, cache={message_id: orig})
+    check_attachment_total(pending, max_attachment_bytes, "forward", "Forward it from Gmail instead.")
 
     identity, source = choose_from(recipient_addresses(h))
     intro = (note or "").strip()
@@ -835,42 +1006,14 @@ def op_forward_message(
         cc=cc,
         bcc=bcc,
     )
-    attached, skipped = [], []
-    for (name, _), part in zip(sizes, parts):
-        pbody = part.get("body") or {}
-        data = pbody.get("data")
-        if not data and pbody.get("attachmentId"):
-            data = (
-                users.messages().attachments()
-                .get(userId="me", messageId=message_id, id=pbody["attachmentId"])
-                .execute()
-                .get("data")
-            )
-        if not data:
-            skipped.append({"filename": name, "reason": "no content available"})
-            continue
-        mime_type = (part.get("mimeType") or "application/octet-stream").lower()
-        maintype, _, subtype = mime_type.partition("/")
-        # An attached email goes out as an opaque .eml (octet-stream): the email
-        # package is strict about transfer encodings inside message/rfc822.
-        if maintype in ("multipart", "message") or not subtype:
-            maintype, subtype = "application", "octet-stream"
-        mime.add_attachment(_decode_b64(data), maintype=maintype, subtype=subtype, filename=name)
-        attached.append(name)
-
-    raw_bytes = mime.as_bytes()
-    drafts = users.drafts()
-    if len(raw_bytes) * 4 // 3 > RAW_JSON_LIMIT:
-        media = MediaIoBaseUpload(io.BytesIO(raw_bytes), mimetype="message/rfc822", resumable=True)
-        draft = drafts.create(userId="me", body={"message": {}}, media_body=media).execute()
-    else:
-        raw = base64.urlsafe_b64encode(raw_bytes).decode()
-        draft = drafts.create(userId="me", body={"message": {"raw": raw}}).execute()
+    attached, skipped, total = attach_parts(svc, mime, pending, max_attachment_bytes)
+    draft = save_draft(svc, mime)
     out: dict[str, Any] = {
         "draft_id": draft.get("id"),
         "from": identity["address"],
         "from_source": source,
         "attachments": attached,
+        "attachment_bytes": total,
     }
     if skipped:
         out["skipped"] = skipped

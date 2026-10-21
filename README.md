@@ -44,6 +44,16 @@ address or a label set with `set_address_label`) and `include_signature`. Replie
 the original was sent to; new drafts use `set_default_from`, then Gmail's default. New addresses are added in
 Gmail → Settings → Accounts → Send mail as.
 
+**Attach files from your mail.** `create_draft`, `send_email` and `forward_message` take `attachments`, and
+`update_draft` takes `add_attachments`. Each entry is `{message_id, part_id}`, using the `part_id` that
+`get_message` / `get_thread` list. Files can only come from messages in the **same** mailbox; a message id
+from another alias fails with a clear error. There are no local or arbitrary uploads. Duplicate entries
+are attached once. The total is limited to 20 MB, checked from the declared sizes before anything is
+downloaded, and large drafts go up as media uploads. `update_draft` keeps the draft's current
+attachments. Inline images are kept as regular attachments, as in `forward_message`. Pass
+`remove_attachments` (a filename as `get_draft` lists it, which removes every attachment with that
+name, or a `part_id`) to drop some. The audit log records only the attachment count and total bytes.
+
 ## Why self-host?
 
 Gmail's read scopes are **restricted** scopes. To offer them to the public, an app needs Google
@@ -277,9 +287,9 @@ set -a; source ./local.env; set +a; uv run surfski
   the zip with defusedxml; DTDs and entities refused; zip-bomb limits on entries, sizes and
   compression ratio). Other types return metadata only; binary is never passed through. Audit rows
   record message id, size and method, not the filename.
-- `forward_message` holds the original's attachments in memory while it builds the draft (up to the
-  20 MB limit, roughly 3× that at peak with the MIME encoding), so give the container ~150 MB of headroom
-  per concurrent forward.
+- `forward_message`, and drafts with `attachments`, hold the attachments in memory while the draft is
+  built (up to the 20 MB limit, roughly 3× that at peak with the MIME encoding). Give the container
+  ~150 MB of headroom per concurrent call.
 - See [SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ### Sending (opt-in)

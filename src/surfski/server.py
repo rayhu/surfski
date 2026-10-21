@@ -502,6 +502,30 @@ def build_auth(config: Config):
     )
 
 
+class AttachmentRef(BaseModel):
+    """An attachment of a message in the same mailbox (part_id from get_message/get_thread)."""
+
+    message_id: str = Field(max_length=200)
+    part_id: str = Field(max_length=200, description="part_id from get_message / get_thread")
+
+
+AttachmentList = Annotated[list[AttachmentRef] | None, Field(
+    max_length=g.MAX_ATTACHMENT_REFS,
+    description="Files to attach, copied from messages in the SAME mailbox: "
+                "[{message_id, part_id}] (part_id as listed by get_message/get_thread). 20 MB total.")]
+
+
+def refs(attachments: list[AttachmentRef] | None) -> list[dict] | None:
+    return [a.model_dump() for a in attachments] if attachments else None
+
+
+def attachment_detail(r: dict) -> str:
+    """Audit suffix: counts and total size only, never names."""
+    if "attachments" not in r:
+        return ""
+    return f"attachments={len(r['attachments'])} bytes={r.get('attachment_bytes', 0)}"
+
+
 # ---------------------------------------------------------------- app factory
 
 
@@ -1219,6 +1243,7 @@ def create_app(
         include_signature: Annotated[
             bool, Field(description="Append the From identity's Gmail signature as plain text")
         ] = False,
+        attachments: AttachmentList = None,
     ) -> dict:
         """Create a Gmail draft (new or reply) in one linked account. This does NOT
         send: the user reviews and sends it from Gmail. Call list_accounts first if the
@@ -1243,6 +1268,7 @@ def create_app(
                 cc=cc,
                 bcc=bcc,
                 reply_to_message_id=reply_to_message_id,
+                attachments=refs(attachments),
             )
             r["gmail_url"] = g.gmail_drafts_url(acct.email)
             return r
@@ -1250,7 +1276,7 @@ def create_app(
         detail = "reply" if reply_to_message_id else "new"
         if from_address:
             detail += " from=explicit"
-        return await gmail_call(owner, alias, "create_draft", detail, fn)
+        return await gmail_call(owner, alias, "create_draft", detail, fn, result_detail=attachment_detail)
 
     @mcp.tool(annotations={"readOnlyHint": True})
     async def list_drafts(
@@ -1294,13 +1320,20 @@ def create_app(
         include_signature: Annotated[
             bool, Field(description="Append the From identity's Gmail signature (once)")
         ] = False,
+        add_attachments: AttachmentList = None,
+        remove_attachments: Annotated[list[str] | None, Field(
+            max_length=50,
+            description="Attachments to drop from the draft: exact filename (as get_draft lists it; "
+                        "removes every attachment with that name) or part_id")] = None,
     ) -> dict:
         """Revise an existing draft. Omitted fields keep their current values; the
         sender and reply threading are preserved. The draft is saved as plain text:
         if the result has flattened_html=true, the draft had HTML formatting that is
         now gone, so tell the user. If signature_replaced=false, the sender changed but
         the old signature wasn't recognised (e.g. edited since), so warn the user it may
-        still be in the body. Drafts with attachments are refused. This does NOT send."""
+        still be in the body. The draft's attachments are kept (inline images become regular
+        attachments), minus remove_attachments, plus add_attachments copied from messages in
+        the same mailbox; 20 MB total. This does NOT send."""
         owner = require_owner("update_draft")
 
         def fn(svc, acct):
@@ -1329,19 +1362,23 @@ def create_app(
                 svc, draft_id=draft_id, default_from=acct.email,
                 choose_from=choose, include_signature=include_signature, known_identities=ids,
                 to=to, subject=subject, body=body, cc=cc, bcc=bcc,
+                add_attachments=refs(add_attachments), remove_attachments=remove_attachments,
             )
             r["gmail_url"] = g.gmail_drafts_url(acct.email)
             return r
 
         fields = ",".join(
             k for k, v in (("to", to), ("subject", subject), ("body", body), ("cc", cc), ("bcc", bcc),
-                           ("from", from_address), ("signature", include_signature or None))
+                           ("from", from_address), ("signature", include_signature or None),
+                           ("add_attachments", add_attachments or None),
+                           ("remove_attachments", remove_attachments or None))
             if v is not None
         )
-        return await gmail_call(owner, alias, "update_draft", f"draft={draft_id} fields={fields}", fn)
+        return await gmail_call(owner, alias, "update_draft", f"draft={draft_id} fields={fields}", fn,
+                                result_detail=attachment_detail)
 
     async def _forward(owner, alias, message_id, to, note, cc, bcc, from_address,
-                       include_signature, send: bool) -> dict:
+                       include_signature, send: bool, attachments=None) -> dict:
         def fn(svc, acct):
             if send:
                 require_sending(owner, acct)
@@ -1353,6 +1390,7 @@ def create_app(
                     strict=bool(from_address or include_signature or acct.default_from),
                 ),
                 to=to, note=note, cc=cc, bcc=bcc, include_signature=include_signature,
+                attachments=refs(attachments),
             )
             r["gmail_url"] = g.gmail_drafts_url(acct.email)
             if send:
@@ -1361,12 +1399,13 @@ def create_app(
 
         detail = f"message={message_id}" + (" from=explicit" if from_address else "")
         detail += " send" if send else ""
-        return await finish_send(owner, await gmail_call(owner, alias, "forward_message", detail, fn))
+        return await finish_send(owner, await gmail_call(owner, alias, "forward_message", detail, fn,
+                                                         result_detail=attachment_detail))
 
     FORWARD_DOC = """Forward a message: saves a DRAFT (new thread) with the note, the standard
         'Forwarded message' header block, the original plain-text body and the
-        original attachments (inline images become regular attachments; 20 MB total
-        limit). Without from_address it is sent from the address the original was
+        original attachments (inline images become regular attachments), plus any extra
+        `attachments` from messages in the same mailbox; 20 MB total limit. Without from_address it is sent from the address the original was
         sent to, else the mailbox default."""
 
     if config.sending_enabled:
@@ -1393,10 +1432,11 @@ def create_app(
             send: Annotated[
                 bool, Field(description="Also send it, following the mailbox's send_policy")
             ] = False,
+            attachments: AttachmentList = None,
         ) -> dict:
             owner = require_owner("forward_message")
             return await _forward(owner, alias, message_id, to, note, cc, bcc, from_address,
-                                  include_signature, send)
+                                  include_signature, send, attachments)
     else:
         @mcp.tool(description=FORWARD_DOC + " Sending is not enabled on this server: the user "
                   "sends it from Gmail.")
@@ -1413,10 +1453,11 @@ def create_app(
             include_signature: Annotated[
                 bool, Field(description="Append the From identity's Gmail signature after the note")
             ] = False,
+            attachments: AttachmentList = None,
         ) -> dict:
             owner = require_owner("forward_message")
             return await _forward(owner, alias, message_id, to, note, cc, bcc, from_address,
-                                  include_signature, False)
+                                  include_signature, False, attachments)
 
     if config.sending_enabled:
         SEND_ANN = {"destructiveHint": True, "openWorldHint": True}
@@ -1462,6 +1503,7 @@ def create_app(
                 str | None, Field(description="Send-as address or label (see list_addresses)")
             ] = None,
             include_signature: bool = False,
+            attachments: AttachmentList = None,
         ) -> dict:
             owner = require_owner("send_email")
 
@@ -1476,13 +1518,15 @@ def create_app(
                     include_signature=include_signature,
                     to=to, subject=subject, body=body, cc=cc, bcc=bcc,
                     reply_to_message_id=reply_to_message_id,
+                    attachments=refs(attachments),
                 )
                 r["gmail_url"] = g.gmail_drafts_url(acct.email)
                 r.update(send_kept_draft(owner, acct, svc, r["draft_id"], "send_email"))
                 return r
 
             detail = "reply" if reply_to_message_id else "new"
-            return await finish_send(owner, await gmail_call(owner, alias, "send_email", detail, fn))
+            return await finish_send(owner, await gmail_call(owner, alias, "send_email", detail, fn,
+                                                             result_detail=attachment_detail))
 
         @mcp.tool(
             description=(

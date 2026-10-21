@@ -148,7 +148,7 @@ async def _vet(url: str, allowed_ports: frozenset[int], resolve: Resolver) -> tu
         ips = [host]
     except ValueError:
         try:
-            ips = await resolve(host, port)
+            ips = await resolve(u.raw_host.decode("ascii"), port)
         except (OSError, UnicodeError):
             raise UnsubscribeError("couldn't resolve the unsubscribe host") from None
     if not ips:
@@ -166,7 +166,8 @@ def _pinned(u: httpx.URL, ip: str, method: str, body: bytes | None) -> httpx.Req
     if body is not None:
         headers["Content-Type"] = "application/x-www-form-urlencoded"
     return httpx.Request(method, target, headers=headers, content=body,
-                         extensions={"sni_hostname": u.host})
+                         # raw_host is the IDNA (punycode) form, which TLS SNI requires.
+                         extensions={"sni_hostname": u.raw_host.decode("ascii")})
 
 
 async def one_click_post(
@@ -184,6 +185,9 @@ async def one_click_post(
         with anyio.fail_after(DEADLINE_SECONDS):
             async with httpx.AsyncClient(transport=transport, trust_env=False, follow_redirects=False,
                                          timeout=TIMEOUT_SECONDS,
+                                         # Load-bearing for the pinned-IP check: the pool is keyed by
+                                         # the IP, so a kept-alive connection could carry a later hop
+                                         # for another hostname over the earlier TLS session/SNI.
                                          limits=httpx.Limits(max_keepalive_connections=0)) as client:
                 while True:
                     u, ip = await _vet(url, allowed_ports, resolve)
