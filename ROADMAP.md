@@ -31,6 +31,10 @@ once it goes public.
 4. **Public self-serve hosting** on the shared client. Do this only once revenue covers it, because
    it requires Google OAuth verification plus an annual CASA assessment.
 
+Alongside steps 2–4, a **calendar-only hosted offering** can launch earlier as a lower-cost entry
+point. Calendar scopes are sensitive, not restricted, so it needs Google verification but no CASA.
+See [Calendar module](#calendar-module).
+
 ### Infrastructure
 
 - **surfski.io** is a static marketing and docs site on Cloudflare Pages (Astro + Starlight, i18n),
@@ -56,6 +60,13 @@ once it goes public.
   results.
 - **Address aliases and "send from"**: see the [design below](#address-aliases-and-send-from).
 - **Opt-in sending**: see the [design below](#opt-in-sending-design).
+- **Draft management**: `list_drafts`, `get_draft`, `update_draft`, `delete_draft`. Today Claude can
+  create a draft but can't revise one, and "fix the draft you just wrote" is a common request. Uses the
+  existing `gmail.compose` scope.
+- **`forward_message`**: forward a message, keeping its original attachments. It saves a draft by
+  default, and sends only when the mailbox's send policy allows it.
+- **`get_attachment`**: read attachment content with size limits. PDF and DOCX are extracted to text,
+  with no binary pass-through by default.
 - **`delete_my_data`**: unlink and revoke every mailbox for the caller, and purge their rows.
 - **Published container image** (GHCR) and **CI** that runs pytest and the image build on every PR.
 - **Backup helper**: a `scripts/backup.sh` that tars the data volume and refuses to include the env file.
@@ -65,10 +76,22 @@ once it goes public.
 - `ALLOWED_DOMAINS`: allow a whole Workspace domain as well as individual addresses.
 - **Admin CLI** (`surfski admin …`): list owners and aliases, force-unlink, rotate
   `TOKEN_ENCRYPTION_KEY` by re-encrypting existing rows.
-- **Labels and archive** (needs `gmail.modify`). This would be opt-in, like sending.
-- **Attachment download** with size limits, text extraction for PDFs and docs, and no binary pass-through by default.
+- **Mailbox triage, opt-in**: `mark_read`, `star`, `archive`, `apply_label`. It needs `gmail.modify`,
+  which is requested by relinking only for mailboxes that turn it on.
+- **Attachments on drafts**: attach files from existing messages when drafting, replying or forwarding.
+- **`unsubscribe`**: parse `List-Unsubscribe` and `List-Unsubscribe-Post` (one-click, RFC 8058), and
+  run it only after confirmation.
+- **Recipient lookup**: resolve "Alice" to an address from the caller's own mail history. It needs no
+  new scope. The People API (`contacts.readonly`, sensitive) is optional later.
+- **Calendar module**: see the [design below](#calendar-module).
 - **Metrics endpoint** (Prometheus) without personal data.
 - Versioned releases and a changelog.
+
+## Not planned
+
+- **Filters, auto-forwarding and vacation auto-replies.** These are standing rules that keep acting
+  after the conversation ends. A prompt-injected email could use one to keep exfiltrating mail, so
+  they stay out of scope and users should set them up in Gmail directly.
 
 ## Phase 3: multi-tenant hosting
 
@@ -87,6 +110,10 @@ Follows the [hosting path](#hosting-path) above.
   Internal consent screen, create a Web client, and paste the credentials.
 - Per-tenant encryption keys (envelope encryption, optional cloud KMS).
 - A data processing agreement (DPA) template.
+
+**Calendar-only hosted offering** (any time after the calendar module ships)
+- A separate Google OAuth client requesting calendar scopes only; Google verification (no CASA).
+- `/calendar/mcp` endpoint with the calendar tool set.
 
 **3c. Public self-serve hosting**
 - Self-signup, quotas, abuse controls and billing.
@@ -208,3 +235,61 @@ or external addresses set up in Gmail. Users want three things:
 - Reply-from defaults to the original recipient alias.
 - Labels are owner-scoped: owner A can't see or use owner B's labels.
 - Chinese display names are RFC 2047-encoded correctly.
+
+---
+
+## Calendar module
+
+Google Calendar support lives in **the same codebase and server, as an optional module**. It is not a
+separate project.
+
+### Why the same server
+
+- Calendars belong to the same Google accounts users already link. One linking flow, one set of
+  account aliases, the same owner isolation and encrypted storage.
+- Cross-tool tasks are common and want one connector: "add the meeting from this email to my
+  calendar", or "check my free time next week and draft a reply with three slots".
+- The tool count stays manageable: about 11 mail tools plus about 7 calendar tools.
+
+### Why a module
+
+- Calendar scopes (`calendar.events`, `calendar.readonly`) are **sensitive, not restricted**. Google
+  verification for them needs **no CASA**. That enables a cheap first hosted product: a
+  **calendar-only hosted offering** on its own Google OAuth client, while mail hosting follows the
+  [hosting path](#hosting-path).
+- Some users only want one of the two.
+
+### Design
+
+- **Features per deployment:** `FEATURES=mail,calendar` (default `mail`). Tools of a disabled module
+  aren't registered.
+- **Per-account capabilities:** at link time the user picks mail, calendar or both, and the server
+  requests only those scopes. Adding calendar to an already linked account uses Google incremental
+  authorization (`include_granted_scopes=true` for that upgrade only). Store granted capabilities per
+  account, and have `list_accounts` show them.
+- **Endpoints:** `/mcp` exposes every enabled module. An optional `/calendar/mcp` exposes calendar
+  only, for a calendar-only connector or hosted product. It's the same code with a different tool set
+  and OAuth client.
+- **Tools:**
+  - `list_calendars(alias)`
+  - `list_events(alias, time_min, time_max, calendar_id?, query?)`
+  - `get_event(alias, event_id)`
+  - `find_free_time(aliases[], window, duration)`, which uses freebusy and works **across accounts**
+    (the multi-account differentiator)
+  - `create_event` and `update_event`, which accept attendees, Meet link and time zone
+  - `respond_to_event(alias, event_id, response)`
+  - `delete_event`
+- **Write policy:** like mail sending. Default `draft` means the tool returns the proposed event and a
+  confirmation link. Mailbox owners can raise it to `auto`, out of band. Events with external
+  attendees send invitations, so treat them like sending email (caps, audit, `openWorldHint`).
+- **Time zones:** always return ISO 8601 with an offset, plus the calendar's IANA zone. Accept
+  natural ranges only after the client resolves them.
+
+### Tests required
+
+- Calendar tools are absent when the module is disabled.
+- A link with only the mail scope can't call calendar tools, and the error says how to add calendar.
+- Incremental authorization keeps existing mail access.
+- `find_free_time` merges several accounts and respects owner isolation.
+- The write policy blocks writes in `draft` mode.
+- Invitations to external attendees go through the confirmation path.
