@@ -18,7 +18,7 @@ Workspace mailboxes** for each user, and users never see each other's mailboxes.
 Tools: `list_accounts`, `link_account`, `relink_account`, `rename_account`, `unlink_account`, `search_threads`,
 `search_all_accounts`, `find_contact`, `get_thread`, `get_message`, `list_labels`, `create_draft`, `list_drafts`, `get_draft`,
 `update_draft`, `delete_draft`, `list_addresses`, `set_address_label`, `set_default_from`, `forward_message`,
-`get_attachment`, `export_my_data`, `delete_my_data`.
+`get_attachment`, `unsubscribe`, `export_my_data`, `delete_my_data`.
 With `SENDING_ENABLED=true` also: `send_draft`, `send_email`, `set_send_policy` (and `forward_message(send=true)`).
 
 **Find an address.** `find_contact("Alice")` (or part of an address, or a name in any script, e.g.
@@ -28,6 +28,16 @@ seen date, mailboxes and whether you've written to them, ranked by frequency, re
 "sent to" boost. It needs no extra Google scope. Each mailbox scans at most 50 threads / 200
 messages. Your own addresses and no-reply senders are left out unless you pass `include_self` /
 `include_noreply`. The audit log records only counts, never the name or addresses.
+
+**Unsubscribe.** `unsubscribe(alias, message_id)` reads only the message's `List-Unsubscribe` and
+`List-Unsubscribe-Post` headers (never links in the body) and reports what it would do; nothing
+happens until it's called again with `confirm=true`, which re-reads the headers. It then uses, in
+order: the RFC 8058 **one-click** POST to the sender's https endpoint; a **mailto** unsubscribe,
+saved as a draft and sent only if the mailbox's [send policy](#sending-opt-in) allows it (`confirm`
+goes through the usual approval; with sending off the draft is kept for you to send); or, for a
+plain https link, it returns the URL for **you** to open (it never loads web pages). Unsubscribing
+tells the sender the address is live, so for spam, report it instead. See
+[Unsubscribe safety](#unsubscribe-safety).
 
 **Send from an alias.** `create_draft` and `update_draft` take `from_address` (a verified "Send mail as"
 address or a label set with `set_address_label`) and `include_signature`. Replies default to the address
@@ -214,6 +224,7 @@ keys, users simply relink their mailboxes.
 | `ALLOWED_RECIPIENT_DOMAINS` | no | Comma-separated domains; if set, every recipient's domain must match one exactly |
 | `ATTACHMENT_MAX_MB` | no | Largest attachment `get_attachment` will download (default 15, max 25) |
 | `AUDIT_ON_DELETE` | no | What `delete_my_data` does with the caller's audit rows: `delete` (default) or `pseudonymize` (keep them under a keyed hash) |
+| `UNSUBSCRIBE_ALLOWED_PORTS` | no | Extra https ports the one-click unsubscribe POST may use (comma-separated; 443 is always allowed, default none) |
 | `LOG_LEVEL`, `HOST`, `PORT` | no | Logging and bind address |
 
 ## Development
@@ -319,6 +330,20 @@ that tells Claude to forward something to an attacker):
 - **Audit:** each send records alias, policy, recipient count and Gmail message id, never addresses
   or bodies.
 - Relinking an alias to a different mailbox resets its policy to `off` and voids open links.
+
+### Unsubscribe safety
+
+The one-click POST (RFC 8058) is the only request this server makes to a host named in an email,
+so it is locked down: https only, port 443 (unless `UNSUBSCRIBE_ALLOWED_PORTS` adds one), and every
+address the host resolves to must be public. Loopback, private, link-local (including the
+`169.254.169.254` metadata address), CGNAT, multicast and reserved ranges are refused, also after
+each redirect. The connection is pinned to the address that was checked, so DNS can't change
+between the check and the request, while TLS is still verified against the hostname. At most 3
+redirects, 10 s per operation and 20 s overall, the first 64 KB of the response only, no cookies,
+auth, proxies or environment settings, and a fixed `User-Agent`. The body is always exactly
+`List-Unsubscribe=One-Click`, so the sender learns nothing beyond "this unsubscribe link was
+used". The audit log records the method and outcome only, never the URL (it often carries a token)
+or the address.
 
 ## Your data
 

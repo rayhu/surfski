@@ -115,7 +115,7 @@ async def test_gmail_query_and_bounds(app, who, boxes):
     r = await call(app, "find_contact", name_or_partial='Wei "(x)" {y}', aliases=["work"])
     svc = boxes["alice@work.com"].svc
     [lst] = svc.calls_to("users.threads.list")
-    assert lst["q"] == "from:(Wei x y) OR to:(Wei x y) OR cc:(Wei x y)"
+    assert lst["q"] == 'from:("Wei" "x" "y") OR to:("Wei" "x" "y") OR cc:("Wei" "x" "y")'
     assert lst["maxResults"] == cts.MAX_THREADS
     gets = svc.calls_to("users.threads.get")
     assert len(gets) == cts.MAX_MESSAGES // 6 + 1 <= cts.MAX_THREADS  # stops at the message cap
@@ -200,3 +200,51 @@ def test_rank_unit():
     assert cts.is_noreply("MAILER-DAEMON@x.com") and cts.is_noreply("wei.noreply@x.com")
     assert cts.is_noreply("bounces+abc@x.com") and not cts.is_noreply("norah@x.com")
     assert not cts.is_noreply("bouncer@x.com") and not cts.is_noreply("replyall@x.com")
+
+
+# ---------------------------------------------------------------- #18 review leftovers
+
+
+@pytest.mark.parametrize("raw,clean,query", [
+    ("x OR in:anywhere", "x in anywhere",
+     'from:("x" "in" "anywhere") OR to:("x" "in" "anywhere") OR cc:("x" "in" "anywhere")'),
+    ("-alice", "alice", 'from:("alice") OR to:("alice") OR cc:("alice")'),
+    ("wei chen", "wei chen", 'from:("wei" "chen") OR to:("wei" "chen") OR cc:("wei" "chen")'),
+    ("a* AND --b -", "a b", 'from:("a" "b") OR to:("a" "b") OR cc:("a" "b")'),
+    ("wei@acme.com", "wei@acme.com",
+     'from:("wei@acme.com") OR to:("wei@acme.com") OR cc:("wei@acme.com")'),
+])
+def test_clean_term_neutralizes_operators(raw, clean, query):
+    assert cts.clean_term(raw) == clean
+    assert cts.gmail_query(cts.clean_term(raw)) == query
+
+
+@pytest.mark.parametrize("raw", ["OR", " - AND * ", ": *", "-"])
+def test_clean_term_operator_only_is_rejected(raw):
+    with pytest.raises(ValueError):
+        cts.clean_term(raw)
+
+
+async def test_operator_terms_do_not_broaden_or_negate(app, who, boxes):
+    for term, words in (("x OR in:anywhere", '"x" "in" "anywhere"'), ("-alice", '"alice"')):
+        await call(app, "find_contact", name_or_partial=term, aliases=["work"])
+        [lst] = boxes["alice@work.com"].svc.calls_to("users.threads.list")
+        assert lst["q"] == f"from:({words}) OR to:({words}) OR cc:({words})"
+        assert " OR in:" not in lst["q"] and "-" not in lst["q"]
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("a@b.com, , <c@d.com>", ["a@b.com", "c@d.com"]),
+    ("Wei <w@x.com> junk, c@d.com", ["w@x.com", "c@d.com"]),  # strict gives up; lenient retry
+    ("<a@b.com> <c@d.com>", ["a@b.com", "c@d.com"]),
+])
+def test_parse_addresses_lenient_retry(value, expected):
+    got = [a for _, a in cts.parse_addresses(value) if "@" in a]
+    assert got == expected
+
+
+def test_collect_uses_lenient_retry():
+    acc: dict = {}
+    m = {"headers": [{"name": "To", "value": "Wei <wei@acme.com> junk, c@d.com"}], "internal_date": 1}
+    cts.collect([m], "wei", "work", acc)
+    assert "wei@acme.com" in acc

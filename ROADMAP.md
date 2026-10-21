@@ -86,8 +86,9 @@ See [Calendar module](#calendar-module).
 - **Mailbox triage, opt-in**: `mark_read`, `star`, `archive`, `apply_label`. It needs `gmail.modify`,
   which is requested by relinking only for mailboxes that turn it on.
 - **Attachments on drafts**: attach files from existing messages when drafting, replying or forwarding.
-- **`unsubscribe`**: parse `List-Unsubscribe` and `List-Unsubscribe-Post` (one-click, RFC 8058), and
-  run it only after confirmation.
+- ✅ **`unsubscribe`** (#17): parse `List-Unsubscribe` and `List-Unsubscribe-Post` (one-click, RFC 8058),
+  and run it only after confirmation. The one-click POST is SSRF-hardened; mailto goes through the send
+  policy; plain web links are returned, never opened.
 - ✅ **Recipient lookup** (`find_contact`, #18): resolve "Alice" to an address from the caller's own mail
   history. It needs no new scope. The People API (`contacts.readonly`, sensitive) is optional later.
 - **Calendar module**: see the [design below](#calendar-module).
