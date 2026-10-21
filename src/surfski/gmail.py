@@ -78,7 +78,11 @@ def build_service(
     cache: AccessTokenCache,
     owner: str,
     alias: str,
+    api: tuple[str, str] = ("gmail", "v1"),
 ):
+    """A googleapiclient service for one mailbox. `cache` must be specific to the scope
+    set: the calendar module (#19) uses its own cache, so a Gmail-only access token is
+    never used for Calendar (or the other way round)."""
     creds = Credentials(
         token=cache.get(owner, alias),
         refresh_token=refresh_token,
@@ -96,7 +100,7 @@ def build_service(
             calendar.timegm(creds.expiry.utctimetuple()) if creds.expiry else time.time() + 3000
         )
         cache.put(owner, alias, creds.token, expiry)
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+    return build(api[0], api[1], credentials=creds, cache_discovery=False)
 
 
 def map_google_error(exc: Exception, alias: str) -> GmailError:

@@ -31,6 +31,8 @@ ATTACHMENT_OUTCOMES = frozenset({"ok", "metadata_only", "error"})
 UNSUB_METHODS = frozenset({"one_click", "mailto", "manual", "none"})
 UNSUB_OUTCOMES = frozenset({"preview", "ok", "failed", "manual", "not_available", "draft_created",
                             "sent", "confirmation_required", "declined"})
+CAL_ACTIONS = frozenset({"create", "update", "respond", "delete"})
+CAL_OUTCOMES = frozenset({"written", "failed", "declined", "link_issued"})
 
 
 def _bucket(value: str, allowed: Iterable[str]) -> str:
@@ -126,6 +128,9 @@ class Metrics:
     def unsubscribe(self, method: str, outcome: str) -> None:
         self._inc("unsubscribe", (_bucket(method, UNSUB_METHODS), _bucket(outcome, UNSUB_OUTCOMES)))
 
+    def calendar_write(self, action: str, outcome: str) -> None:
+        self._inc("calendar_writes", (_bucket(action, CAL_ACTIONS), _bucket(outcome, CAL_OUTCOMES)))
+
     def rate_limited(self) -> None:
         self._inc("rate_limited")
 
@@ -142,6 +147,8 @@ class Metrics:
          "Attachment text extractions by method and outcome.", ("method", "outcome")),
         ("unsubscribe", "surfski_unsubscribe_total", "Unsubscribe calls by method and outcome.",
          ("method", "outcome")),
+        ("calendar_writes", "surfski_calendar_writes_total",
+         "Calendar write attempts by action and outcome.", ("action", "outcome")),
         ("rate_limited", "surfski_rate_limit_rejections_total", "Tool calls rejected by the rate limit.", ()),
     )
 

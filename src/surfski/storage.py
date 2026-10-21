@@ -73,6 +73,11 @@ CREATE TABLE IF NOT EXISTS modifications (
   ts INTEGER NOT NULL,
   n INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS calendar_invites (
+  owner TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  ts INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS address_labels (
   owner TEXT NOT NULL,
   alias TEXT NOT NULL,
@@ -91,10 +96,19 @@ MIGRATIONS = [
     ("owner_sessions", "hd", "TEXT"),
     # Opt-in mailbox triage (#8): 'on' only after the owner granted gmail.modify for it.
     ("accounts", "triage", "TEXT NOT NULL DEFAULT 'off'"),
+    # Calendar module (#19): 'on' only after the owner granted the calendar scopes for it.
+    ("accounts", "calendar", "TEXT NOT NULL DEFAULT 'off'"),
+    ("accounts", "calendar_policy", "TEXT NOT NULL DEFAULT 'draft'"),
 ]
 
-ACCOUNT_COLS = "owner, alias, email, scopes, created_at, last_used_at, default_from, send_policy, triage"
+ACCOUNT_COLS = ("owner, alias, email, scopes, created_at, last_used_at, default_from, send_policy, triage, "
+                "calendar, calendar_policy")
 GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+CALENDAR_SCOPES = (
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
+)
+CALENDAR_POLICIES = ("draft", "auto")  # ordered from least to most permissive
 SEND_POLICIES = ("off", "confirm", "auto")  # ordered from least to most permissive
 
 
@@ -135,6 +149,14 @@ class Account:
     default_from: str | None = None
     send_policy: str = "off"
     triage: str = "off"
+    calendar: str = "off"
+    calendar_policy: str = "draft"
+
+    @property
+    def calendar_active(self) -> bool:
+        """Calendar was enabled by the owner AND Google granted both calendar scopes."""
+        granted = self.scopes.split()
+        return self.calendar == "on" and all(s in granted for s in CALENDAR_SCOPES)
 
     @property
     def triage_active(self) -> bool:
@@ -282,7 +304,8 @@ class Storage:
                 # send policy don't apply, and pending action links must die with it.
                 c.execute("DELETE FROM address_labels WHERE owner = ? AND alias = ?", (owner, alias))
                 c.execute(
-                    "UPDATE accounts SET default_from = NULL, send_policy = 'off', triage = 'off' "
+                    "UPDATE accounts SET default_from = NULL, send_policy = 'off', triage = 'off', "
+                    "calendar = 'off', calendar_policy = 'draft' "
                     "WHERE owner = ? AND alias = ?",
                     (owner, alias),
                 )
@@ -390,9 +413,10 @@ class Storage:
                 "UPDATE address_labels SET alias = ? WHERE owner = ? AND alias = ?",
                 (new_alias, owner, old_alias),
             )
-            c.execute(
-                "UPDATE sends SET alias = ? WHERE owner = ? AND alias = ?", (new_alias, owner, old_alias)
-            )
+            for table in ("sends", "calendar_invites"):
+                c.execute(
+                    f"UPDATE {table} SET alias = ? WHERE owner = ? AND alias = ?", (new_alias, owner, old_alias)
+                )
             # Links name the old alias; kill them rather than let them dangle.
             c.execute(
                 "UPDATE action_tokens SET used = 1 WHERE owner = ? AND alias = ?", (owner, old_alias)
@@ -491,6 +515,48 @@ class Storage:
                 (owner.lower(), alias, now - 86400),
             ).fetchone()
         return used
+
+    # ---- calendar (#19) ----
+
+    def set_calendar(self, owner: str, alias: str, on: bool) -> None:
+        owner, alias = owner.lower(), validate_alias(alias)
+        with self._tx() as c:
+            self._require_account(c, owner, alias)
+            c.execute("UPDATE accounts SET calendar = ? WHERE owner = ? AND alias = ?",
+                      ("on" if on else "off", owner, alias))
+
+    def set_calendar_policy(self, owner: str, alias: str, policy: str) -> None:
+        if policy not in CALENDAR_POLICIES:
+            raise ValueError(f"calendar policy must be one of {', '.join(CALENDAR_POLICIES)}")
+        owner, alias = owner.lower(), validate_alias(alias)
+        with self._tx() as c:
+            self._require_account(c, owner, alias)
+            c.execute("UPDATE accounts SET calendar_policy = ? WHERE owner = ? AND alias = ?",
+                      (policy, owner, alias))
+
+    def reserve_invite(self, owner: str, alias: str, cap: int, now: int) -> int | None:
+        """Like reserve_send, for calendar writes that email external attendees."""
+        with self._tx() as c:
+            (n,) = c.execute(
+                "SELECT COUNT(*) FROM calendar_invites WHERE owner = ? AND alias = ? AND ts > ?",
+                (owner.lower(), alias, now - 86400),
+            ).fetchone()
+            if n >= cap:
+                return None
+            return c.execute("INSERT INTO calendar_invites (owner, alias, ts) VALUES (?, ?, ?)",
+                             (owner.lower(), alias, now)).lastrowid
+
+    def release_invite(self, rowid: int) -> None:
+        with self._tx() as c:
+            c.execute("DELETE FROM calendar_invites WHERE rowid = ?", (rowid,))
+
+    def invites_today(self, owner: str, alias: str, now: int) -> int:
+        with self._tx() as c:
+            (n,) = c.execute(
+                "SELECT COUNT(*) FROM calendar_invites WHERE owner = ? AND alias = ? AND ts > ?",
+                (owner.lower(), alias, now - 86400),
+            ).fetchone()
+        return n
 
     # ---- sending (#2) ----
 
@@ -617,7 +683,7 @@ class Storage:
     # That guard only works if the column is literally named `owner`: any new table
     # holding per-user data must use that name (see CONTRIBUTING.md).
     OWNER_TABLES = ("accounts", "address_labels", "pending_links", "action_tokens",
-                    "owner_sessions", "sends", "modifications", "audit_log")
+                    "owner_sessions", "sends", "modifications", "calendar_invites", "audit_log")
 
     def purge_owner(
         self, owner: str, audit_pseudonym: str | None = None
