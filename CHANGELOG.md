@@ -7,7 +7,9 @@ All notable changes to Surfski are documented here. The format follows
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+
+- ROADMAP: a "Phase 2b: from user research" section with six new issues (#53–#58).
 
 ## [0.1.0] - 2026-10-21
 

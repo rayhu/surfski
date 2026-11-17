@@ -105,6 +105,25 @@ See [Calendar module](#calendar-module).
   server info, `surfski_build_info`), `CHANGELOG.md`, and a tag-triggered workflow that checks the
   version, publishes the GHCR image and creates the GitHub Release from the changelog.
 
+## Phase 2b: from user research
+
+Ideas from the October 2026 review of public feature requests for multi-account mail in AI assistants
+(about 300 comments). Each is a GitHub issue.
+
+- **Never a silent empty result** (#53): every search says which mailboxes it covered and, on zero
+  results, names the linked mailboxes it didn't search.
+- **Write-identity safeguards** (#54): writes always need an explicit mailbox and never fall back to a
+  default; the target mailbox and From are shown first in every confirmation; warn when replying from a
+  different identity than the original was sent to.
+- **Account groups per client or project** (#55): owner-scoped groups that limit cross-account tools,
+  with an optional default for reads only.
+- **Read-only mailboxes** (#56): link with `gmail.readonly` only; every write tool refuses for that
+  mailbox.
+- **Cross-account digest for scheduled routines** (#57): a cursor-based `digest` tool so scheduled
+  tasks summarize new mail across mailboxes reliably.
+- **Outlook / Microsoft 365** (#58): design a provider abstraction for Microsoft Graph first, then
+  split the implementation into follow-up issues.
+
 ## Not planned
 
 - **Filters, auto-forwarding and vacation auto-replies.** These are standing rules that keep acting
